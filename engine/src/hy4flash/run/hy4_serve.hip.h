@@ -60,6 +60,7 @@ struct ServeOpts {
     std::vector<int> peer_devs;
     double vram_experts_gb = -1.0;
     double ram_experts_gb = -1.0;
+    std::string layer_split;
 #ifdef STRATA_HY4_DISTRIBUTED
     RemoteExperts* remote_experts = nullptr;
 #endif
@@ -267,8 +268,10 @@ inline int hy4_serve_main(const ServeOpts& o) {
     GpuModel g;
     g.primary_gpu = o.primary_gpu;
     g.has_vision = !o.vision.empty();
+    g.draft_enabled = (o.draft != "off");
     g.vram_experts_gb_cap = o.vram_experts_gb;
     g.ram_experts_gb_cap = o.ram_experts_gb;
+    g.layer_split_spec = o.layer_split;
     g.peer_devs = o.peer_devs;
     bool expert_split = !o.peer_devs.empty();
     size_t min_peer_tot = 0;
@@ -285,7 +288,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
         expert_split = true;
     }
 #endif
-    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model, expert_split, !o.vision.empty(), (int)o.peer_devs.size(), min_peer_tot);
+    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model, expert_split, !o.vision.empty(), (int)o.peer_devs.size(), min_peer_tot, fr, o.draft != "off");
     g.planned_chunk = serve_chunk;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
@@ -317,13 +320,21 @@ inline int hy4_serve_main(const ServeOpts& o) {
     bool use_spec = false;
     if (o.draft != "off") {
         if (r.Tc < 8) {
-            if (o.draft == "dfly2") { proto("ERR --draft dfly2 needs --chunk >= 8"); return 2; }
-        } else if (df.init(err)) {
-            use_spec = true;
-            r.det_mix = true;
-        } else if (o.draft == "dfly2") {
-            proto("ERR --draft dfly2: %s", err.c_str());
-            return 2;
+            if (o.draft == "dfly2") {
+                fprintf(stderr, "[dfly2] chunk %d < 8; starting without drafter\n", r.Tc);
+            }
+        } else {
+            size_t df_fr = 0, df_tot = 0;
+            HCK(hipMemGetInfo(&df_fr, &df_tot));
+            const size_t df_need = (size_t)512 << 20;
+            if (df_fr < df_need && r.vcache_nslots > 0) r.vcache_release_vram(df_need);
+            if (df.init(err)) {
+                use_spec = true;
+                r.det_mix = true;
+            } else {
+                fprintf(stderr, "[dfly2] drafter unavailable (%s); continuing without drafter\n", err.c_str());
+                err.clear();
+            }
         }
     }
     std::unique_ptr<Spec> spec;
@@ -423,6 +434,7 @@ inline int hy4_serve_main(const ServeOpts& o) {
             venc.cancel = &in.stop;
             r.vcache_release_vram(1280ull << 20);  // reclaim ~1.25 GiB from tail vcache slabs for vision weights + encode scratch
             if (!venc.load(o.vision, ierr) || !vctx.setup(venc, r.st, q.ids, recs, r.Tc, ierr)) {
+                venc.unload();
                 if (in.stop.load()) {
                     proto("DONE 0 %d %.1f 0.0 cancel", T0, (now_s() - t_req) * 1000.0);
                     continue;
@@ -430,11 +442,12 @@ inline int hy4_serve_main(const ServeOpts& o) {
                 proto("ERR image: %s", ierr.c_str());
                 continue;
             }
-            fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s\n", recs.size(), vctx.n_rows, vctx.t_encode);
-            // keep the 0.93 GB of weights resident only when the card has room to spare (a 12 GB card does not): the next picture request then skips the load
+            fprintf(stderr, "[vision] %zu picture(s), %d image rows, encoded in %.2f s%s\n", recs.size(), vctx.n_rows, vctx.t_encode, venc.cpu_mode ? " (CPU)" : "");
+            // On <= 12 GB GPUs (or whenever free VRAM < 4 GiB, or CPU fallback), always unload Vision weights immediately after encoding
+            // so hot MoE experts and elastic KV keep full VRAM headroom (#6528).
             size_t vf = 0, vt = 0;
             HCK(hipMemGetInfo(&vf, &vt));
-            if (vf < ((size_t)4 << 30)) venc.unload();
+            if (venc.cpu_mode || vt < ((size_t)15 << 30) || vf < ((size_t)4 << 30)) venc.unload();
             r.vis = &vctx;
         }
         // KV reuse: pure extension, resident rewind (live or prompt-end ring copy), or parked SSD sequence

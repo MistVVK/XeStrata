@@ -472,6 +472,15 @@ struct DFly2 {
             err = "this .strata has no DFly2 drafter tensors";
             return false;
         }
+        size_t fr = 0, tot = 0;
+        if (hipMemGetInfo(&fr, &tot) == hipSuccess) {
+            // DFly2 runtime scratch + KV capture lists need ~96 MiB plus safety margin; avoid HCK exit(3) on OOM!
+            const size_t min_need = (size_t)192 << 20;
+            if (fr < min_need) {
+                err = "insufficient free VRAM for DFly2 drafter (" + std::to_string(fr / 1048576) + " MiB free)";
+                return false;
+            }
+        }
         r.dfly_capture_alloc();
         const size_t B = DFLY_BMAX;
         H = al<float>(B * HID);

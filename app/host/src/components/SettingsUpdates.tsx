@@ -8,7 +8,7 @@ import { nativeAction, useNative, type NativeJob } from '../lib/native';
 import { NativeProgress } from './NativeModels';
 import { EngineUpdateDialog } from './EngineUpdateDialog';
 import { currentUpdateFailure, jobErrorText, updateFinishedAfter } from '../lib/native-job-diagnostics';
-import { appVersionLabel } from '../lib/app-version';
+import { appVersionLabel, releaseVersionBadge } from '../lib/app-version';
 import { fetchUpdateCheck, publishUpdateCheck, useInstalledVersions, useLastUpdateCheck } from '../lib/update-check';
 import { shownEngineVersion } from '../lib/engine-version';
 /** A check from an earlier day shows its date too, because the result is kept between visits. */
@@ -20,7 +20,7 @@ function checkedLabel(at: string) {
 export function SettingsUpdates() {
     const native = useNative();
     const [confirm, setConfirm] = useState('');
-    const appVersion = appVersionLabel(useStore(s => s.setup?.app.version), native?.version);
+    const appVersion = releaseVersionBadge(appVersionLabel(useStore(s => s.setup?.app.version), native?.version));
     const engineVersion = useStore(s => s.engine?.engine.version);
     const [checking, setChecking] = useState(false);
     // Opening Settings shows the last check kept on this computer. The network is touched only when "Check for updates" is pressed.
@@ -94,7 +94,7 @@ export function SettingsUpdates() {
 /** "Strata 0.2.19 · Engine 0.1.65": the app's own version first, the engine's beside it (About). */
 export function AboutVersions() {
     const native = useNative();
-    const app = appVersionLabel(useStore(s => s.setup?.app.version), native?.version);
+    const app = releaseVersionBadge(appVersionLabel(useStore(s => s.setup?.app.version), native?.version));
     const engineVersion = useStore(s => s.engine?.engine.version);
     const engine = shownEngineVersion(native, engineVersion);
     return <p className="settings-about-version"><strong>{tr("Strata")} {app ?? ''}</strong>{engine ? <span className="muted"> · {tr("Engine")} {engine}</span> : null}</p>;

@@ -39,6 +39,12 @@ def is_hy4_exe(exe) -> bool:
     return _base(exe).startswith(EXE_PREFIX)
 
 
+def is_hy4_model_path(path) -> bool:
+    """True when a model path names a Tencent Hy4-Flash `.strata` file (even if the run config's arch/exe was miswritten)."""
+    name = _base(path)
+    return name.startswith("hy4-flash") and name.endswith(".strata")
+
+
 NO_DRAFTER_NOTE = "Hy4-Flash: this engine has no drafter (DFly2) yet, so it starts without it"
 NO_IMAGES_NOTE = "Hy4-Flash: this engine does not read images yet, so it starts without the image reader"
 NO_IMAGES_REPLY = ("this Hy4-Flash engine does not read images yet; send the text of the picture, or update Strata (an engine that reads images says images=1 at its start)")
@@ -130,6 +136,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     if n_gpus >= 2 and "--gpus" not in args:
         local_order = [str(n_gpus - 1)] + [str(i) for i in range(n_gpus - 1)]
         args += ["--gpus", ",".join(local_order)]
+    if n_gpus >= 2 and "--layer-split" not in args and cfg.get("layer_split"):
+        args += ["--layer-split", str(cfg["layer_split"])]
     if "--session-reuse" not in args:            # the engine keeps the longest common prefix of a conversation: on unless the config says 0
         args += ["--session-reuse", "1"]
     wants_images = "--vision" in args

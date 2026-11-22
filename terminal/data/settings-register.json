@@ -4106,13 +4106,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1833,
+     "line": 1859,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1562,
+     "line": 1575,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4145,7 +4145,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2701,
+     "line": 2727,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4187,7 +4187,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2704,
+     "line": 2730,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -4204,7 +4204,7 @@
    "engine_sets": [
     {
      "file": "engine/src/hy4flash/run/hy4_main.hip.cpp",
-     "line": 463
+     "line": 465
     },
     {
      "file": "engine/src/hy4flash/sycl/sy_graph.h",
@@ -4235,7 +4235,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2703,
+     "line": 2729,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4268,7 +4268,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1779,
+     "line": 1805,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4301,13 +4301,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1800,
+     "line": 1826,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1819,
+     "line": 1845,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4340,7 +4340,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2036,
+     "line": 2062,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4373,13 +4373,13 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1881,
+     "line": 1907,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2048,
+     "line": 2074,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4412,7 +4412,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2034,
+     "line": 2060,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -4445,7 +4445,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2045,
+     "line": 2071,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -5312,7 +5312,7 @@
    "launch_reads": [
     {
      "file": "terminal/setup.py",
-     "line": 8852
+     "line": 8855
     }
    ],
    "doc_mentions": [
@@ -15303,7 +15303,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_gpu_model.hip.h",
-     "line": 772,
+     "line": 797,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15314,11 +15314,11 @@
    "engine_sets": [
     {
      "file": "engine/src/hy4flash/run/hy4_main.hip.cpp",
-     "line": 456
+     "line": 458
     },
     {
      "file": "engine/src/hy4flash/run/hy4_main.hip.cpp",
-     "line": 462
+     "line": 464
     }
    ],
    "engine_defaults": [],
@@ -15345,7 +15345,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_graph.hip.h",
-     "line": 1570,
+     "line": 1583,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15378,7 +15378,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_gpu_model.hip.h",
-     "line": 1225,
+     "line": 1403,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -19056,7 +19056,7 @@
    "reads": [
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 2046,
+     "line": 2072,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -22350,7 +22350,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 10921,
+     "line": 11053,
      "value": "\"1\" if stream else \"0\""
     }
    ],
@@ -26001,7 +26001,7 @@
     },
     {
      "file": "engine/src/hy4flash/run/hy4_cpu_experts.cpp",
-     "line": 1737,
+     "line": 1763,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26403,7 +26403,7 @@
    "launch_reads": [
     {
      "file": "terminal/setup.py",
-     "line": 8851
+     "line": 8854
     }
    ],
    "doc_mentions": [
@@ -39962,7 +39962,7 @@
    "launch_sets": [
     {
      "file": "terminal/setup.py",
-     "line": 8826,
+     "line": 8829,
      "value": "6"
     },
     {

@@ -381,6 +381,8 @@ public:
     double dec_pcie_share = -1.0;  // -1 = auto bandwidth-calibrated L/(L+kR), 0 = off, (0..1] = fixed share of missed experts to GPU over PCIe
     double dec_pcie_auto_pinned[9] = {0.0, 0.30, 0.30, 0.32, 0.32, 0.35, 0.35, 0.35, 0.35};
     double dec_pcie_auto_bounce[9] = {0.0, 0.20, 0.28, 0.32, 0.35, 0.38, 0.40, 0.40, 0.40};
+    double dec_pcie_gbps_ema = 18.0;
+    double dec_cpu_gbps_ema = 14.0;
     struct DecCal {
         double gpu_ms_acc = 0.0, cpu_ms_acc = 0.0;
         uint64_t gpu_exp_acc = 0, cpu_exp_acc = 0;
@@ -693,11 +695,12 @@ public:
         bool inflight = false;
         int slot = -1, layer = -1, expert = -1;
     };
-    static constexpr int VPROM_RING = 8;
+    static constexpr int VPROM_RING = 32;
     int vcache_nslots = 0;
     size_t vcache_slot_bytes = 0;
     double vcache_decay = 0.965;
-    int vcache_max_swaps = 4;
+    int vcache_max_swaps = 8;
+    uint64_t vcache_steps = 0;
     std::vector<VSlot> vslots;
     std::vector<int> vslot_of;        // [41*512]: slot index in [0, vcache_nslots) or -1
     std::vector<double> vscore;       // [41*512]: decayed routing score (scaled by vcache_inv_scale)
@@ -728,7 +731,7 @@ public:
         v_use_buf.assign((size_t)Tc * 16, 0);
         for (int i = 0; i < 41 * 512; ++i) {
             const int r = i < (int)g.expert_rank.size() ? g.expert_rank[i] : 511;
-            vscore[i] = 0.5 / (1.0 + 0.05 * (double)r);  // soft rank prior so session hits rapidly adapt
+            vscore[i] = 2.0 / (1.0 + 0.12 * (double)r);  // sharper Zipfian rank prior so initial slots hold real hot set
         }
         if (!st2) HCK(hipStreamCreate(&st2));
         if (!st_vprom) HCK(hipStreamCreate(&st_vprom));
@@ -858,13 +861,14 @@ public:
     // Online decode update: record routing hits for layer l (0..40) and promote up to vcache_max_swaps hottest misses:
     //  - If a miss was already DMA'd into `gpu_scratch` by PCIe miss-sharing (`gpu_e_off[e] != UINT32_MAX`), promote via FREE 1.4 us GPU D2D copy on `st` (ZERO memcpy, ZERO PCIe, instant commit!).
     //  - Otherwise promote asynchronously on dedicated `st_vprom` (never blocking `st2` PCIe miss-sharing!), using zero-copy DMA directly from pinned `vw.body` when `!pf_bounce`.
-    void vcache_note_decode(int l, int T, const int32_t* idx_arr, const uint8_t* gpu_scratch = nullptr, const uint32_t* gpu_e_off = nullptr) {
-        if (vcache_nslots <= 1) return;
+    void vcache_note_decode(int l, int T, const int32_t* idx_arr, const uint8_t* gpu_scratch = nullptr, const uint32_t* gpu_e_off = nullptr, const float* w_arr = nullptr) {
+        if (vcache_nslots <= 0) return;
         const size_t n = (size_t)T * 16;
         int cand_idx[VPROM_RING];
         double cand_sc[VPROM_RING];
         for (int k = 0; k < VPROM_RING; ++k) { cand_idx[k] = -1; cand_sc[k] = 0.0; }
-        const int max_c = std::min(vcache_max_swaps, VPROM_RING);
+        const bool in_warmup = (vcache_steps < 32);
+        const int max_c = std::min(in_warmup ? std::max(vcache_max_swaps, 32) : vcache_max_swaps, VPROM_RING);
         for (size_t i = 0; i < n; ++i) {
             const int e = idx_arr[i];
             if (e < 0 || e >= 512) continue;
@@ -872,7 +876,8 @@ public:
             if (vram_flag[gi]) ++vc_hits;
             else ++vc_misses;
             if (!vcache_frozen) {
-                vscore[gi] += vcache_inv_scale;
+                const double rw = w_arr ? (0.5 + 4.0 * std::max(0.0f, w_arr[i])) : 1.0;
+                vscore[gi] += rw * vcache_inv_scale;
                 if (max_c > 0 && g.experts[gi].tier == 2 && !vram_flag[gi] && cpu.resident(l, e)) {
                     // Check not already inflight
                     bool infl = false;
@@ -906,7 +911,8 @@ public:
             if (!vprom[p].inflight) free_rp[n_free_rp++] = p;
         // Count how many candidates can use FREE D2D vs H2D
         int want_v = 0;
-        int h2d_cap = (gpu_scratch && gpu_e_off) ? 1 : n_free_rp;  // when PCIe miss-sharing is active, cap extra H2D vprom traffic to 1/layer (D2D is free!)
+        const int h2d_limit = in_warmup ? 8 : 4;
+        int h2d_cap = (gpu_scratch && gpu_e_off) ? std::min(h2d_limit, n_free_rp) : std::min(h2d_limit, n_free_rp);
         int h2d_want = 0;
         for (int ci = 0; ci < n_cands; ++ci) {
             const int ne = cand_idx[ci] % 512;
@@ -946,8 +952,9 @@ public:
             const int best_miss = cand_idx[ci];
             const int nl = best_miss / 512, ne = best_miss % 512;
             const bool is_d2d = gpu_scratch && gpu_e_off && gpu_e_off[ne] != UINT32_MAX;
-            const double hyst = small_vc ? (is_d2d ? 1.35 : 1.65) : (is_d2d ? 1.12 : 1.25);
-            if (small_vc && vic_score[vi] >= 0.0 && cand_sc[ci] < 2.0 * vcache_inv_scale) continue;
+            const double hyst = in_warmup ? (is_d2d ? 1.02 : 1.05)
+                                          : (small_vc ? (is_d2d ? 1.35 : 1.65) : (is_d2d ? 1.08 : 1.12));
+            if (!in_warmup && small_vc && vic_score[vi] >= 0.0 && cand_sc[ci] < 2.0 * vcache_inv_scale) continue;
             if (cand_sc[ci] <= vic_score[vi] * hyst) continue;
             if (!is_d2d && (h2d_used >= h2d_cap || rpi >= n_free_rp)) continue;
             CpuExpertView vw = cpu.view(nl, ne);
@@ -996,7 +1003,8 @@ public:
         }
     }
     void vcache_decay_step(int T = 1) {
-        if (vcache_nslots <= 1 || vcache_frozen) return;
+        if (vcache_nslots <= 0 || vcache_frozen) return;
+        ++vcache_steps;
         const double step = std::pow(vcache_decay, (double)std::max(1, std::min(T, 4)));
         vcache_inv_scale /= step;
         if (vcache_inv_scale > 1e12) {
@@ -1005,16 +1013,16 @@ public:
             vcache_inv_scale = 1.0;
         }
     }
-    // Reclaim tail vcache slabs back to the GPU allocator so sparse KV + IndexPool can grow up to 128K 100% in VRAM without spilling to host!
+    // Reclaim tail vcache slabs back to the GPU allocator (down to 0 slabs if needed) for KV growth, DFly2, or on-demand Vision!
     bool vcache_release_vram(size_t need_free) {
-        if (g.vcache_slabs.size() <= 1 || g.vcache_slots_per_slab <= 0) return false;
+        if (g.vcache_slabs.empty() || g.vcache_slots_per_slab <= 0) return false;
         vcache_flush();
         HCK(hipDeviceSynchronize());
         int freed_slabs = 0;
         size_t freed_bytes = 0;
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
-        while (fr < need_free && g.vcache_slabs.size() > 1) {
+        while (fr < need_free && !g.vcache_slabs.empty()) {
             const int cut = (int)(g.vcache_slabs.size() - 1) * g.vcache_slots_per_slab;
             const int take = vcache_nslots - cut;
             for (int s = cut; s < vcache_nslots; ++s) {
@@ -1038,7 +1046,7 @@ public:
         if (freed_slabs > 0) {
             HCK(hipMemcpy(d_experts, h_experts, (size_t)41 * 512 * sizeof(ExpertDev), hipMemcpyHostToDevice));
             ++vcache_ver;
-            fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) for VRAM KV growth -> %d adaptive slots (%.2f GB) remain\n",
+            fprintf(stderr, "[vcache] released %d slab(s) (%.2f GB) -> %d adaptive slots (%.2f GB) remain\n",
                     freed_slabs, freed_bytes / 1e9, vcache_nslots, (vcache_nslots * (double)vcache_slot_bytes) / 1e9);
         }
         return fr >= need_free;
@@ -1050,6 +1058,7 @@ public:
         int dev = 0;
         size_t peer_idx = 0;
         bool can_p2p = false;
+        uint8_t has_layer[41] = {};  // 1 iff peer holds >= 1 expert for MoE layer ml (skips empty peer transfers under --layer-split!)
         hipStream_t st = nullptr;
         hipEvent_t ev_in = nullptr, ev_out = nullptr;
         ExpertDev* d_experts = nullptr;
@@ -1114,6 +1123,7 @@ public:
         const size_t nz = (size_t)T * 1536;
         for (size_t p = 0; p < peer_runs.size(); ++p) {
             PeerRun& pr = peer_runs[p];
+            if (!pr.has_layer[il - 1]) continue;
             if (!pr.can_p2p) {
                 HCK(hipMemcpyAsync(pr.h_z, z_h, nz * 2, hipMemcpyDeviceToHost, st));
                 HCK(hipMemcpyAsync(pr.h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
@@ -1155,6 +1165,7 @@ public:
         }
 #endif
         for (auto& pr : peer_runs) {
+            if (!pr.has_layer[il - 1]) continue;
             HCK(hipStreamWaitEvent(st, pr.ev_out, 0));
             if (!pr.can_p2p) {
                 HCK(hipMemcpyAsync(pr.d_zpeer0, pr.h_zout, nz * 4, hipMemcpyHostToDevice, st));
@@ -1508,6 +1519,7 @@ public:
                 HCK(hipStreamCreate(&pr.st));
                 HCK(hipEventCreateWithFlags(&pr.ev_out, hipEventDisableTiming));
                 std::vector<ExpertDev> ph(41 * 512);
+                std::memset(pr.has_layer, 0, sizeof(pr.has_layer));
                 for (int i = 0; i < 41 * 512; ++i) {
                     const ExpertRef& e = g.peers[p].experts[i];
                     ph[i].body_off = e.body_off;
@@ -1515,6 +1527,7 @@ public:
                     ph[i].gu_code = e.gu_code;
                     ph[i].dn_code = e.dn_code;
                     ph[i].pad = (e.tier != 0) ? 1 : 0;
+                    if (e.tier == 0) pr.has_layer[i / 512] = 1;
                 }
                 HCK(hipMalloc((void**)&pr.d_experts, ph.size() * sizeof(ExpertDev)));
                 HCK(hipMemcpy(pr.d_experts, ph.data(), ph.size() * sizeof(ExpertDev), hipMemcpyHostToDevice));
@@ -1641,12 +1654,19 @@ public:
         // engram
         if (!load_engram_meta_file(g.path, emeta, err)) return false;
         if (!engram_path.empty()) {
-            // seed bound to the shard: pass the Section 2 bytes
+            // seed bound to the shard: pass the Section 2 bytes; scale default LRU cache down on tight RAM hosts
             size_t lru_rows = ENGRAM_DEFAULT_LRU_ROWS;
             if (const char* ecm = getenv("HY4_ENGRAM_CACHE_MIB")) {
                 const double mib = std::max(0.0, atof(ecm));
                 lru_rows = (size_t)(mib * 1048576.0 / 116.0);
                 fprintf(stderr, "[engram] cache budget %.0f MiB -> %zu LRU rows\n", mib, lru_rows);
+            } else {
+                const double rlim = ram_limit_gb();
+                if (rlim <= 20.0) lru_rows = (size_t)(128.0 * 1048576.0 / 116.0);
+                else if (rlim <= 40.0) lru_rows = (size_t)(256.0 * 1048576.0 / 116.0);
+                else if (rlim <= 72.0) lru_rows = (size_t)(512.0 * 1048576.0 / 116.0);
+                fprintf(stderr, "[engram] auto cache %.0f MiB (RAM %.0f GiB) -> %zu LRU rows\n",
+                        lru_rows * 116.0 / 1048576.0, rlim, lru_rows);
             }
             if (!eio.open(engram_path, g.seed.data(), g.seed.size(), lru_rows, 16, 8, err)) return false;
             engram_ready = true;
@@ -2229,9 +2249,17 @@ public:
             }
             cal_ev_inflight = false;
         }
-        // Decide how many highest-multiplicity missed experts to stream over PCIe into GPU concurrently with CPU.
-        // Sort by multiplicity descending (high-cnt experts belong on GPU Tensor Cores) and split by EXPERT COUNT (bytes),
-        // calibrated automatically to measured PCIe H2D+GEMM rate vs CPU pool rate (`L / (L + k R)`).
+        // Zero-cliff fast path when 0 host/cold misses occur on this layer (e.g. 90-99% VRAM partial spill!)
+        if (nc == 0 && !has_cold_miss) {
+            if (vcache_nslots > 0) vcache_note_decode(ml, T, hidx_p, nullptr, nullptr, hw_p);
+            if (d_zcpu_dirty) {
+                HCK(hipMemsetAsync(d_zcpu, 0, nz * 4, st));
+                d_zcpu_dirty = false;
+            }
+            return;
+        }
+        // Decide how many highest-multiplicity missed experts to stream over PCIe into GPU concurrently with CPU:
+        // hardware-calibrated L / (L + k * R) split, with 100% GPU PCIe streaming for tiny partial spills (nc <= 8, zero TPS cliff!).
         uint8_t gpu_shared[512] = {};
         uint32_t gpu_e_off[512];
         for (int e = 0; e < 512; ++e) gpu_e_off[e] = UINT32_MAX;
@@ -2240,8 +2268,14 @@ public:
         const int tc = std::min(T, 8);
         const int cal_bkt = (T == 1) ? 0 : 1;
         const double base_share = !pf_bounce ? dec_pcie_auto_pinned[tc] : dec_pcie_auto_bounce[tc];
-        const double share_frac = (dec_pcie_share >= 0.0) ? dec_pcie_share
-                                : (dec_cal[cal_bkt].share >= 0.0 ? dec_cal[cal_bkt].share : base_share);
+        double share_frac = 0.0;
+        if (dec_pcie_share >= 0.0) {
+            share_frac = dec_pcie_share;
+        } else if (nc <= 8 && !has_cold_miss && pcie_ok) {
+            share_frac = 1.0;  // tiny partial spill (<= 8 misses): stream all over async PCIe DMA (< 0.15 ms) -> zero TPS cliff!
+        } else {
+            share_frac = (dec_cal[cal_bkt].share >= 0.0) ? dec_cal[cal_bkt].share : base_share;
+        }
         int gpu_e[128];
         int n_gpu_e = 0;
         int buf_used = -1;
@@ -2268,7 +2302,7 @@ public:
             for (int s = 0; s < 16; ++s) {
                 const size_t i = (size_t)t * 16 + s;
                 const int e = hidx_p[i];
-                uint8_t u = (e >= 0 && e < 512 && !gpu_shared[e] && !(vcache_nslots > 1 && vram_flag[ml * 512 + e]) && g.experts[(size_t)ml * 512 + e].tier >= 2) ? 1 : 0;
+                uint8_t u = (e >= 0 && e < 512 && !gpu_shared[e] && !(vcache_nslots > 0 && vram_flag[ml * 512 + e]) && g.experts[(size_t)ml * 512 + e].tier >= 2) ? 1 : 0;
                 if (u && do_tail && minr[e] >= tail_skip) {
                     u = 0;
                     ++tail_skipped_pairs;
@@ -2334,11 +2368,12 @@ public:
                 }
                 if (run_src) HCK(hipMemcpyAsync(d_scratch[b] + run_off, run_src, run_len, hipMemcpyHostToDevice, st2));
             } else {
-                // Pinned bounce ring (Windows WDDM / >48% RAM): 2-half overlapped memcpy+DMA for n_gpu >= 6 so PCIe runs during 2nd half pack!
-                const int mid = (n_gpu >= 6) ? (n_gpu / 2) : n_gpu;
-                used_split = (mid < n_gpu);
+                // Pinned bounce ring (Windows WDDM / >48% RAM): parallel pack via pf_pool (8 threads) when n_gpu >= 4
+                // while cpu.submit is already computing on the CPU pool, then single contiguous DMA!
                 const double t_pk0 = rec_cal ? now_s() : 0.0;
-                for (int i = 0; i < mid; ++i) {
+                PfGroup dec_grp;
+                if (n_gpu >= 4) dec_grp.runs.reserve((size_t)n_gpu);
+                for (int i = 0; i < n_gpu; ++i) {
                     const MissCand& mc = cands[gpu_e[i]];
                     const ExpertRef& er = g.experts[(size_t)ml * 512 + mc.e];
                     const size_t sz = al(mc.bytes);
@@ -2348,29 +2383,21 @@ public:
                     ht[mc.e].gu_code = er.gu_code;
                     ht[mc.e].dn_code = er.dn_code;
                     ht[mc.e].pad = 0;
-                    std::memcpy(h_bounce[b] + off, mc.body, mc.bytes);
+                    if (n_gpu >= 4) {
+                        dec_grp.runs.push_back({mc.body, off, mc.bytes});
+                    } else {
+                        std::memcpy(h_bounce[b] + off, mc.body, mc.bytes);
+                    }
                     off += sz;
                 }
-                if (rec_cal) HCK(hipEventRecord(ev_cal_a, st2));
-                const size_t off_mid = off;
-                if (off_mid > 0) HCK(hipMemcpyAsync(d_scratch[b], h_bounce[b], off_mid, hipMemcpyHostToDevice, st2));
-                if (used_split) {
-                    for (int i = mid; i < n_gpu; ++i) {
-                        const MissCand& mc = cands[gpu_e[i]];
-                        const ExpertRef& er = g.experts[(size_t)ml * 512 + mc.e];
-                        const size_t sz = al(mc.bytes);
-                        gpu_e_off[mc.e] = (uint32_t)off;
-                        ht[mc.e].body_off = (uint64_t)(uintptr_t)(d_scratch[b] + off) - (uint64_t)(uintptr_t)g.d_sec4;
-                        ht[mc.e].dn_off = er.dn_off;
-                        ht[mc.e].gu_code = er.gu_code;
-                        ht[mc.e].dn_code = er.dn_code;
-                        ht[mc.e].pad = 0;
-                        std::memcpy(h_bounce[b] + off, mc.body, mc.bytes);
-                        off += sz;
-                    }
-                    if (off > off_mid) HCK(hipMemcpyAsync(d_scratch[b] + off_mid, h_bounce[b] + off_mid, off - off_mid, hipMemcpyHostToDevice, st2));
+                if (n_gpu >= 4 && !dec_grp.runs.empty()) {
+                    dec_grp.total_bytes = off;
+                    pf_pool.kick(b, h_bounce[b], &dec_grp, nullptr);
+                    pf_pool.wait();
                 }
                 if (rec_cal) pack_ms = (now_s() - t_pk0) * 1000.0;
+                if (rec_cal) HCK(hipEventRecord(ev_cal_a, st2));
+                if (off > 0) HCK(hipMemcpyAsync(d_scratch[b], h_bounce[b], off, hipMemcpyHostToDevice, st2));
             }
             HCK(hipMemcpyAsync(d_pf_dyn_table[b], ht, 512 * sizeof(ExpertDev), hipMemcpyHostToDevice, st2));
             if (rec_cal) HCK(hipEventRecord(ev_cal_b, st2));
@@ -2393,7 +2420,7 @@ public:
         }
         // Promote hottest misses into vcache: GPU-streamed misses copy D2D from d_scratch[buf_used] on `st` (~1.4 us, FREE!);
         // record ev_pf_done[buf_used] AFTER any D2D copies so d_scratch[buf_used] stays valid until they complete.
-        if (vcache_nslots > 1) vcache_note_decode(ml, T, hidx_p, buf_used >= 0 ? d_scratch[buf_used] : nullptr, buf_used >= 0 ? gpu_e_off : nullptr);
+        if (vcache_nslots > 0) vcache_note_decode(ml, T, hidx_p, buf_used >= 0 ? d_scratch[buf_used] : nullptr, buf_used >= 0 ? gpu_e_off : nullptr, hw_p);
         if (buf_used >= 0) {
             HCK(hipEventRecord(ev_pf_done[buf_used], st));
             ev_pf_done_set[buf_used] = true;
@@ -2405,7 +2432,6 @@ public:
                 const double t_cw1 = now_s();
                 const double wait_ms = (t_cw1 - t_cw0) * 1000.0;
                 const double total_ms = (t_cw1 - t_cpu_sub) * 1000.0;
-                // Only accumulate exact CPU timing when cpu.wait() actually observed completion (or discount when host packing outlasted CPU)
                 const double cpu_ms = (wait_ms > 0.015) ? total_ms : (0.75 * total_ms);
                 dec_cal[cal_bkt].cpu_ms_acc += std::max(0.01, cpu_ms);
                 dec_cal[cal_bkt].cpu_exp_acc += (uint64_t)n_cpu_tier2;
@@ -2761,10 +2787,11 @@ public:
 #endif
         fprintf(stderr, "[runner] sparse KV + IndexPool moved to pinned host memory (%d positions, %.2f GB, %.2f s)\n", max_ctx, host_big_bytes / 1e9, now_s() - t0);
     }
-    // Grow sparse KV + IndexPool in 16,384-token VRAM increments; fall back cleanly to pinned host memory if VRAM runs out
+    // Grow sparse KV + IndexPool in elastic VRAM increments (4096/8192/16384); fall back cleanly to pinned host memory if VRAM runs out
     void kv_grow_to(int need) {
         if (kv_is_host || need <= kv_alloc_pos) return;
-        const int target = std::min(max_ctx, ((std::max(need + 16, kv_alloc_pos + 16384) + 16383) / 16384) * 16384);
+        const int kv_step = getenv("HY4_KV_STEP_SLOTS") ? std::max(4096, atoi(getenv("HY4_KV_STEP_SLOTS"))) : 16384;
+        const int target = std::min(max_ctx, ((std::max(need + 16, kv_alloc_pos + kv_step) + kv_step - 1) / kv_step) * kv_step);
         if (target <= kv_alloc_pos) return;
         if (kv_dev_limit > 0 && target > kv_dev_limit) { kv_spill_to_host(); return; }
         const double t0 = now_s();
@@ -2775,7 +2802,8 @@ public:
         const size_t peak_one = ns * row_b + (size_t)(target + 8) * 256 * 2 + (size_t)(target / 4 + 8) * 128 * 2;
         size_t fr = 0, tot = 0;
         HCK(hipMemGetInfo(&fr, &tot));
-        const size_t need_vram = delta_per_layer * 12 + peak_one + (128ull << 20);
+        const size_t floor_b = (size_t)(wddm_vram_floor_gb(tot) * 1e9);
+        const size_t need_vram = delta_per_layer * 12 + peak_one + std::max<size_t>((128ull << 20), floor_b);
         if (fr < need_vram) {
             vcache_release_vram(need_vram);
             HCK(hipMemGetInfo(&fr, &tot));
@@ -2910,7 +2938,7 @@ public:
         if (il > 1) {
             const std::string pm_prev = L(il - 1) + ".mlp";
             for (const auto& pr : peer_runs)
-                hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+                if (pr.has_layer[il - 2]) hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
             hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz);
             lin(pm_prev + ".routed_expert_up_proj.weight", z_h, F2, T);
             hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm_prev + ".combine_output_norm.weight"), x, post, c.rms_eps);
@@ -2967,7 +2995,7 @@ public:
 #endif
         const std::string pm = L(il) + ".mlp";
         for (const auto& pr : peer_runs)
-            hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+            if (pr.has_layer[il - 1]) hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
         hipLaunchKernelGGL(k_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, z_h, nz);
         lin(pm + ".routed_expert_up_proj.weight", z_h, F2, T);
         hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm + ".combine_output_norm.weight"), x, post, c.rms_eps);
@@ -3171,7 +3199,7 @@ public:
                 const std::string pm_last = L(c.n_layers - 1) + ".mlp";
                 ent->g_tail_last = cg_capture_one([&] {
                     for (const auto& pr : peer_runs)
-                        hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
+                        if (pr.has_layer[c.n_layers - 2]) hipLaunchKernelGGL(k_add_inplace, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)pr.d_zpeer0, nz);
                     hipLaunchKernelGGL(k_add_f2h, dim3((nz + 255) / 256), dim3(256), 0, st, zout_f, (const float*)d_zcpu, z_h, nz);
                     lin(pm_last + ".routed_expert_up_proj.weight", z_h, F2, T);
                     hipLaunchKernelGGL(k_add_rms_post, dim3(T), dim3(256), 0, st, F2, (const float*)F3_dec, (const float*)tw(pm_last + ".combine_output_norm.weight"), x, post, c.rms_eps);
@@ -3240,6 +3268,7 @@ public:
 #if HY4_CUDA || HY4_HIP_PEERS
                 for (size_t p = 0; p < peer_runs.size(); ++p) {
                     PeerRun& pr = peer_runs[p];
+                    if (!pr.has_layer[il - 1]) continue;
                     if (!pr.can_p2p) {
                         HCK(hipMemcpyAsync(pr.h_z, z_h, nz * 2, hipMemcpyDeviceToHost, st));
                         HCK(hipMemcpyAsync(pr.h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
@@ -3270,6 +3299,7 @@ public:
                 HCK(hipGraphLaunch(ent->g_gpuexp[il - 1], st));
 #if HY4_CUDA || HY4_HIP_PEERS
                 for (auto& pr : peer_runs) {
+                    if (!pr.has_layer[il - 1]) continue;
                     HCK(hipStreamWaitEvent(st, pr.ev_out, 0));
                     if (!pr.can_p2p) HCK(hipMemcpyAsync(pr.d_zpeer0, pr.h_zout, nz * 4, hipMemcpyHostToDevice, st));
                 }
@@ -3292,6 +3322,7 @@ public:
 #if HY4_CUDA || HY4_HIP_PEERS
                 for (size_t p = 0; p < peer_runs.size(); ++p) {
                     PeerRun& pr = peer_runs[p];
+                    if (!pr.has_layer[il - 1]) continue;
                     if (!pr.can_p2p) {
                         HCK(hipMemcpyAsync(pr.h_z, z_h, nz * 2, hipMemcpyDeviceToHost, st));
                         HCK(hipMemcpyAsync(pr.h_idx, moe_idx, (size_t)T * 16 * 4, hipMemcpyDeviceToHost, st));
@@ -3326,6 +3357,7 @@ public:
                 t_cpu_wait += now_s() - t0;
 #if HY4_CUDA || HY4_HIP_PEERS
                 for (auto& pr : peer_runs) {
+                    if (!pr.has_layer[il - 1]) continue;
                     HCK(hipStreamWaitEvent(st, pr.ev_out, 0));
                     if (!pr.can_p2p) HCK(hipMemcpyAsync(pr.d_zpeer0, pr.h_zout, nz * 4, hipMemcpyHostToDevice, st));
                 }
@@ -3346,7 +3378,7 @@ public:
 #endif
     bool forward_chunk(const int32_t* tok_all, int p0, int T, std::string& err, const TreeSpec* tree = nullptr) {
         if (!kv_is_host && p0 + T + 16 > kv_alloc_pos) kv_grow_to(p0 + T + 16);
-        if (T <= 8 && vcache_nslots > 1) {
+        if (T <= 8 && vcache_nslots > 0) {
             vcache_decay_step(T);
             vcache_poll_commit();
         }
@@ -3404,7 +3436,7 @@ public:
             maybe_dump("x_L" + std::to_string(il) + "_mlp", T, 4 * HID, x, 4);
             if (prof) { HCK(hipStreamSynchronize(st)); double tb = now_s(); (il == 0 ? p_mlp0 : p_moe) += tb - ta; }
         }
-        if (T >= 16 && vcache_nslots > 1 && !vcache_frozen) vcache_rebalance_prefill();
+        if (T >= 16 && vcache_nslots > 0 && !vcache_frozen) vcache_rebalance_prefill();
         return true;
     }
     bool prof = false;

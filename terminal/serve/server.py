@@ -8437,6 +8437,124 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 pass
 
 
+def _autocorrect_shape_config(cfg: dict) -> None:
+    """Auto-correct misconfigured Hy4-Flash or Inkling-2-Mini run configs whose `--native` / `--model` points to a
+    shape-engine `.strata`/`.gguf` file while `arch` / `exe` were left as the generic `strata-engine`."""
+    if not isinstance(cfg, dict):
+        return
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    model_val = None
+    for i, tok in enumerate(args):
+        if tok in ("--native", "--model") and i + 1 < len(args):
+            model_val = str(args[i + 1])
+            break
+    if not model_val:
+        return
+    base = model_val.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    exe = str(cfg.get("exe") or "")
+    exe_base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    generic_exe = (not exe) or exe == "component:strata-engine" or exe_base in ("strata", "strata.exe")
+    if hy4_kind.is_hy4_model_path(model_val) or "--engram" in args:
+        if cfg.get("arch") != hy4_kind.ARCH:
+            cfg["arch"] = hy4_kind.ARCH
+        if generic_exe:
+            cfg["exe"] = hy4_kind.REFERENCE
+    elif ("inkling" in base and (base.endswith(".strata") or base.endswith(".gguf"))) or "--dspark" in args:
+        if cfg.get("arch") != inkling_kind.ARCH:
+            cfg["arch"] = inkling_kind.ARCH
+        if generic_exe:
+            cfg["exe"] = inkling_kind.REFERENCE
+
+
+def _ensure_shape_tokenizer(cfg: dict, tpath: Path) -> bool:
+    """Auto-generate missing `vocab.json` on the fly locally for Hy4-Flash or Inkling-2-Mini (`.strata`/`.gguf`) models
+    before failing with 'the model's tokenizer is missing'. Local-only (zero network calls on the start path)."""
+    if (tpath / "vocab.json").exists():
+        return True
+    if not isinstance(cfg, dict):
+        return False
+    is_hy4 = hy4_kind.is_hy4(cfg)
+    is_ink = inkling_kind.is_inkling(cfg)
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    model_raw = next((str(args[i + 1]) for i, tok in enumerate(args) if tok in ("--native", "--model") and i + 1 < len(args)), None)
+    if not is_hy4 and not is_ink:
+        if model_raw and hy4_kind.is_hy4_model_path(model_raw):
+            is_hy4 = True
+        elif model_raw and "inkling" in model_raw.lower():
+            is_ink = True
+        else:
+            return False
+    cwd = Path(str(cfg.get("cwd") or "."))
+    model_path = None
+    if model_raw:
+        p = Path(model_raw)
+        model_path = p if p.is_absolute() else (cwd / p)
+    tools_dir = str(Path(__file__).resolve().parents[1] / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        tok_mod = __import__("hy4_tokenizer" if is_hy4 else "inkling_tokenizer")
+    except Exception:                                   # noqa: BLE001
+        return False
+    # 1. Direct Python Section 0 read from `.strata`
+    if model_path is not None and model_path.is_file() and model_path.suffix.lower() == ".strata":
+        try:
+            tok_mod.convert_manifest(tok_mod.read_manifest(model_path), tpath)
+            if (tpath / "vocab.json").exists():
+                print(f"[strata] generated missing tokenizer from {model_path.name} -> {tpath}", flush=True)
+                return True
+        except Exception:                               # noqa: BLE001
+            pass
+    # 2. Companion tokenizer.json / tokenizer.hf.json + chat_template.jinja
+    search_dirs: list[Path] = []
+    if model_path is not None:
+        search_dirs.append(model_path.parent)
+    for d in (tpath, tpath.parent):
+        if d not in search_dirs:
+            search_dirs.append(d)
+    for base in search_dirs:
+        if not base.is_dir():
+            continue
+        for tok_name in ("tokenizer.json", "tokenizer.hf.json"):
+            tj = base / tok_name
+            ct = base / "chat_template.jinja"
+            if tj.is_file() and ct.is_file():
+                try:
+                    tok_mod.convert_files(tj, ct, tpath)
+                    if (tpath / "vocab.json").exists():
+                        print(f"[strata] generated missing tokenizer from {tj} -> {tpath}", flush=True)
+                        return True
+                except Exception:                       # noqa: BLE001
+                    pass
+    # 3. Export via the shape engine binary (`--export-tokenizer`)
+    if model_path is not None and model_path.is_file() and model_path.suffix.lower() == ".strata":
+        try:
+            resolved = with_component_engine(dict(cfg))
+            exe_raw = resolved.get("exe")
+            exe = Path(exe_raw) if exe_raw else None
+            if exe is not None and not exe.is_absolute():
+                exe = cwd / exe
+            if exe is not None and exe.is_file():
+                raw = tpath.with_name(tpath.name + "-export")
+                raw.mkdir(parents=True, exist_ok=True)
+                env = dict(os.environ)
+                var = "PATH" if os.name == "nt" else ("DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH")
+                dirs = [str(exe.resolve().parent)] + [str(d) for d in (resolved.get("lib_dirs") or []) if Path(d).is_dir()]
+                env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+                done = subprocess.run([str(exe), "--export-tokenizer", str(model_path), str(raw)],
+                                      capture_output=True, text=True, errors="replace", timeout=60, env=env)
+                if done.returncode == 0 and (raw / "tokenizer.hf.json").is_file() and (raw / "chat_template.jinja").is_file():
+                    tok_mod.convert_files(raw / "tokenizer.hf.json", raw / "chat_template.jinja", tpath)
+                    if (tpath / "vocab.json").exists():
+                        print(f"[strata] exported missing tokenizer via {exe.name} -> {tpath}", flush=True)
+                        return True
+        except Exception:                               # noqa: BLE001
+            pass
+    return (tpath / "vocab.json").exists()
+
+
 def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -8640,11 +8758,15 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
+    if cfg:
+        _autocorrect_shape_config(cfg)
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tcfg = {}
     tpath = Path(a.tokenizer)
+    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+        _ensure_shape_tokenizer(cfg, tpath)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
