@@ -500,6 +500,8 @@ def env_visible(indexes: list[int], vendor: str | None, environ: dict | None = N
                 return None
             seen = got
         return seen
+    if vendor == "intel":
+        return _ordinals(env.get("ZE_AFFINITY_MASK"), cards)
     if vendor != "nvidia":
         return None
     raw = env.get("CUDA_VISIBLE_DEVICES")

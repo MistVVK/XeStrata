@@ -92,9 +92,11 @@ def drafting_choice_available(ctx, family: str | None = None) -> bool:
 
 def flow_for(ctx, family: str | None = None) -> list[str]:
     """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Drafting step only for
-    Qwen3.8-Flash-Next on a computer that can run DFlash2; Tencent Hy4-Flash skips Qwen-only steps (cards, drafting, parallel, tuning, advanced)."""
+    Qwen3.8-Flash-Next on a computer that can run DFlash2; Tencent Hy4-Flash skips Qwen-only steps (drafting, parallel, tuning, advanced)."""
     fam = family if family is not None else getattr(getattr(ctx, "settings", None), "family", None)
     if fam == "hy4-flash":
+        if len(ctx.computer.usable_gpus) >= 2:
+            return ["model", "cards", "folder", "context", "pictures", "access", "save"]
         return ["model", "folder", "context", "pictures", "access", "save"]
     if fam == "inkling-2-mini":
         if len(ctx.computer.usable_gpus) >= 2:
@@ -593,7 +595,6 @@ class ModelScreen(Base):
                     s.parallel = None
                 s.tune = "skip"
                 s.kv = None
-                s.gpu_roles = None
                 s.extra = {}
             r = next(x for x in self.rows if (x.family, x.model) == (fam, model))
             if r.verdict == "no":
@@ -653,7 +654,6 @@ class ModelScreen(Base):
                     s.parallel = None
                 s.tune = "skip"
                 s.kv = None
-                s.gpu_roles = None
                 s.extra = {}
             self.ctx.picked_in_list = False
             self.ctx.refresh_disk()                          # N1: these files need no download, so the list stops marking the row (and the Save screen its "!" line)

@@ -47,7 +47,11 @@ bool Bridge::load(const std::string& pack, int device, int lanes, const std::vec
     I.device = device;
     I.embed = std::move(embed);
     // the ring log (host copies of the activation rows for a rebuild) is the main engine's way of resuming a conversation; the split starts a lane's ring over instead
+#ifdef _WIN32
+    if (!std::getenv("STRATA_DF2_RING_LOG")) _putenv_s("STRATA_DF2_RING_LOG", "0");
+#else
     ::setenv("STRATA_DF2_RING_LOG", "0", 0);
+#endif
     if (cudaSetDevice(device) != cudaSuccess) { err = "dflash2: cannot select the card"; return false; }
     I.d.emplace_back(new Dflash2Drafter);
     Dflash2Drafter& parent = *I.d[0];

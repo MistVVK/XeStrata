@@ -302,16 +302,21 @@ inline void k_linear_sk_sg16(const uint8_t* W, int N, int K, const float* X, flo
 // ============================================================================
 
 // GPU-side expert binning (1 WG of 128 threads = 8 SG16, 1 thread per expert e in 0..127)
-inline void k_moe_plan_sg16(const int* topk_idx, int P, int* uexp, int* uoff, int* ucnt, int* pair_list, int* n_uniq_dev) {
-    Q().submit([&](sycl::handler& h) {
+// When ex_layer != nullptr, only bins experts owned by this GPU (ex_layer[e].body_ptr != nullptr) for Dual-GPU EP!
+inline void k_moe_plan_sg16_q(sycl::queue& q, const int* topk_idx, int P, int* uexp, int* uoff, int* ucnt, int* pair_list, int* n_uniq_dev,
+                              const InkSyExpertDev* ex_layer = nullptr) {
+    q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> sg_u(8, h);
         sycl::local_accessor<int, 1> sg_p(8, h);
         h.parallel_for(NR(1, 128), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
             const int e = (int)it.get_local_id(0);
             auto sg = it.get_sub_group();
             const int sgi = (int)sg.get_group_linear_id(), lane = (int)sg.get_local_linear_id();
+            const bool owned = (ex_layer == nullptr) || (ex_layer[e].body_ptr != nullptr);
             int c = 0;
-            for (int i = 0; i < P; ++i) if (topk_idx[i] == e) ++c;
+            if (owned) {
+                for (int i = 0; i < P; ++i) if (topk_idx[i] == e) ++c;
+            }
             const int has = c > 0 ? 1 : 0;
             const int ex_u = sycl::exclusive_scan_over_group(sg, has, sycl::plus<int>());
             const int ex_p = sycl::exclusive_scan_over_group(sg, c, sycl::plus<int>());
@@ -330,13 +335,18 @@ inline void k_moe_plan_sg16(const int* topk_idx, int P, int* uexp, int* uoff, in
     });
 }
 
+inline void k_moe_plan_sg16(const int* topk_idx, int P, int* uexp, int* uoff, int* ucnt, int* pair_list, int* n_uniq_dev) {
+    k_moe_plan_sg16_q(Q(), topk_idx, P, uexp, uoff, ucnt, pair_list, n_uniq_dev, nullptr);
+}
+
 // Fused w13 + SITU(4.0, 25.0) + 1/sq_xd_dn (grid: 72 x max_uniq, 256 threads = 16 SG16 -> 16 inter channels/WG)
-inline void k_moe_gu_situ_sg16(
+inline void k_moe_gu_situ_sg16_q(
+    sycl::queue& q,
     const InkSyExpertDev* ex_layer, const float* x_in,
     const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
     int max_uniq, float* h_act) {
     // 1152 / 16 = 72 WGs along X, max_uniq along Y
-    Q().parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
+    q.parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
         const int y = (int)it.get_group(0);
         if (y >= n_uniq_dev[0]) return;
         const int sg = (int)it.get_local_id(1) >> 4, lane = (int)it.get_local_id(1) & 15;
@@ -440,11 +450,12 @@ inline void k_moe_gu_situ_sg16(
 
 // Down projection w2 (SF4 / MX8 / paired 2-row S_K SB_0..SB_8) * router weight -> y_pairs [P, 2304]
 // Grid: 72 x max_uniq, 256 threads = 16 SG16 (each SG handles 1 row-pair = 2 output rows!)
-inline void k_moe_dn_sg16(
+inline void k_moe_dn_sg16_q(
+    sycl::queue& q,
     const InkSyExpertDev* ex_layer, const float* topk_w,
     const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
     int max_uniq, const float* h_act, float* y_pairs) {
-    Q().parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
+    q.parallel_for(NR2(72, (size_t)max_uniq, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
         const int yy = (int)it.get_group(0);
         if (yy >= n_uniq_dev[0]) return;
         const int sg = (int)it.get_local_id(1) >> 4, lane = (int)it.get_local_id(1) & 15;
@@ -545,15 +556,40 @@ inline void k_moe_dn_sg16(
     });
 }
 
-inline void k_moe_reduce8_sg16(const float* y_pairs, float* moe_out, int M) {
-    Q().parallel_for(NR2(9, (size_t)M, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
+inline void k_moe_gu_situ_sg16(
+    const InkSyExpertDev* ex_layer, const float* x_in,
+    const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
+    int max_uniq, float* h_act) {
+    k_moe_gu_situ_sg16_q(Q(), ex_layer, x_in, uexp, uoff, ucnt, pair_list, n_uniq_dev, max_uniq, h_act);
+}
+
+inline void k_moe_dn_sg16(
+    const InkSyExpertDev* ex_layer, const float* topk_w,
+    const int* uexp, const int* uoff, const int* ucnt, const int* pair_list, const int* n_uniq_dev,
+    int max_uniq, const float* h_act, float* y_pairs) {
+    k_moe_dn_sg16_q(Q(), ex_layer, topk_w, uexp, uoff, ucnt, pair_list, n_uniq_dev, max_uniq, h_act, y_pairs);
+}
+
+inline void k_moe_reduce8_sg16_q(sycl::queue& q, const float* y_pairs, float* moe_out, int M,
+                                 const InkSyExpertDev* ex_layer = nullptr, const int* topk_idx = nullptr) {
+    q.parallel_for(NR2(9, (size_t)M, 256), [=](sycl::nd_item<2> it) INK_REQD_SG16 {
         const int m = (int)it.get_group(0);
         const int d = (int)it.get_group(1) * 256 + (int)it.get_local_id(1);
         if (d >= 2304) return;
         float s = 0.0f;
-        for (int k = 0; k < 8; ++k) s += y_pairs[((size_t)m * 8 + k) * 2304 + d];
+        for (int k = 0; k < 8; ++k) {
+            if (ex_layer && topk_idx) {
+                const int e = topk_idx[m * 8 + k];
+                if (e < 0 || e >= 128 || ex_layer[e].body_ptr == nullptr) continue;
+            }
+            s += y_pairs[((size_t)m * 8 + k) * 2304 + d];
+        }
         moe_out[(size_t)m * 2304 + d] = s;
     });
+}
+
+inline void k_moe_reduce8_sg16(const float* y_pairs, float* moe_out, int M) {
+    k_moe_reduce8_sg16_q(Q(), y_pairs, moe_out, M, nullptr, nullptr);
 }
 
 }  // namespace ink_sycl

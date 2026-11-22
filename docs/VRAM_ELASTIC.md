@@ -1,4 +1,4 @@
-# POST /v1/vram: what it does and what it answers (opt-in, one NVIDIA GPU, #533, #1034)
+# POST /v1/vram: what it does and what it answers (opt-in; NVIDIA, across a layer split per card or one device; #533, #1034)
 
 This page is written from `terminal/serve/server.py` and the engine's `VRAM` command (`engine/src/program/generate.cpp`,
 `engine/src/core/expert_cache.cpp`), and the cases the unit tests in `terminal/serve/test_vram.py` pin. A line marked **(code)** is
@@ -14,10 +14,10 @@ them again when more is free. Nothing resizes on its own. Only the expert cache 
 MTP head, the CUDA context and the prompt buffers stay, so Strata never gives back "everything".
 
 The engine switches the feature off at start, with one line in its log (`--vram-elastic is off: ...`), when it is not
-a `--serve` engine, with a layer split, with helper caches on other GPUs, with a segment below 64 MiB, and on HIP
+a `--serve` engine, with helper caches on other GPUs (`--peer-device`, an expert-profile tier), with a segment below 64 MiB, and on HIP
 (NVIDIA only). If the driver offers no virtual memory management the cache is one block and the engine starts all the same
 (`--vram-elastic is off: the driver or this GPU offers no virtual memory management`) **(code; not run on such a driver)**.
-Without the flag nothing changes: the same answers as without it.
+Without the flag nothing changes: the same answers as without it. Across a `--layer-split` each card keeps its own segmented cache, so by default one call keeps the reserve on every card at once; pass a `"device"` to free just that CUDA device and leave the others with their full expert cache.
 
 ## The request
 
@@ -25,6 +25,7 @@ Without the flag nothing changes: the same answers as without it.
 POST /v1/vram
 Content-Type: application/json          (anything else: 415)
 {"reserve_mib": 8000}                    (a whole number of MiB, 0 or more; null = the reserve the engine started with)
+{"reserve_mib": 4096, "device": 1}       (free only CUDA device 1; every other card keeps its full expert cache)
 ```
 
 - The server's API key applies as for the other `/v1` routes. A request that carries a foreign `Origin` is refused
@@ -32,13 +33,15 @@ Content-Type: application/json          (anything else: 415)
 - `reserve_mib` is the free VRAM you want left on the card after the call (it counts what any program holds, not only
   Strata). Below 0, a string, a boolean or a fraction: 400.
 - `null` and `0` are the grow-back requests: `null` keeps the `--vram-reserve-mib` the engine started with, `0` keeps
-  nothing free on purpose.
+  nothing free on purpose. With a layer split these apply to every card; add `"device"` to aim one call at that device only.
+- `device` is an optional CUDA index (the engine's grammar is `VRAM <reserve_mib> [dev]`, reserve first). It needs an explicit
+  `reserve_mib` (`device` with a null reserve: 400); below 0, a string or a boolean: 400. Absent means every card. On one GPU it is the only card (and so optional).
 
 ## What comes back
 
 | Case | Status | Body |
 |---|---|---|
-| Done (or nothing to do) | 200 | `{"status": "ok", "reserve_mib", "expert_slots", "expert_slots_full", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib", "prompt_chunk"}` |
+| Done (or nothing to do) | 200 | `{"status": "ok", "reserve_mib", "expert_slots", "expert_slots_full", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib", "prompt_chunk"}` plus a `"per_device"` map (`"<cuda index>": {"mapped_mib", "free_mib"}`, every card after the call) and, when one device was named, `"device"` and `"vram_free_on_device_mib"` |
 | The model is unloaded | 200 | `{"status": "not loaded", "reserve_mib": N, "note": "applied when the model loads"}` |
 | Bad `reserve_mib` | 400 | `invalid_request_error` |
 | The engine refuses the command | 400 | `invalid_request_error`, the engine's reason in `message`. The engine stays up. |

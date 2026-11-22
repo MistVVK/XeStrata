@@ -195,14 +195,15 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
         return Decision(False, ["the all-cards split engine is off (it is opt-in)"])
     why: list[str] = []
     untested: list[str] = []
-    if system != "linux":
-        why.append("the all-cards split engine runs on Linux only")
+    make = cards[0].vendor if cards else "nvidia"
+    is_win = system in ("windows", "win32")
+    if system != "linux" and not (is_win and make == "amd"):
+        why.append("the all-cards split engine runs on Linux (and Windows AMD HIP) only")
     n = len(cards)
     if n < 2:
         why.append("it needs two or more cards")
     elif n > MAX_CARDS:
         why.append(f"it handles at most {MAX_CARDS} cards, this PC offers {n}")
-    make = cards[0].vendor if cards else "nvidia"
     if cards:
         if len({c.vendor for c in cards}) != 1:
             why.append("the cards are of different makes")
@@ -297,12 +298,30 @@ def probe_cards(indexes: list[int] | None = None) -> list[Card]:
     return cards or probe_amd_cards(indexes)
 
 
+def _probe_amd_cards_windows(indexes: list[int] | None = None) -> list[Card]:
+    """AMD GPUs on Windows via setup.amd_gpus_win() (strata-device.exe --list-devices when installed, else display adapters)."""
+    try:
+        import setup as _setup
+        found = _setup.amd_gpus_win()
+    except Exception:                                        # noqa: BLE001 - optional probe
+        return []
+    cards: list[Card] = []
+    for g in found:
+        if g.get("uma") or g.get("cannot_run"):
+            continue
+        mem = int(round(float(g.get("vram_gb") or 0.0) * 1024))
+        cards.append(Card(int(g.get("index", len(cards))), str(g.get("name") or "AMD GPU"), mem, 0, "amd", str(g.get("arch") or "?")))
+    return _named_or_visible(cards, indexes)
+
+
 def probe_amd_cards(indexes: list[int] | None = None, root: str = "/sys") -> list[Card]:
-    """AMD GPUs the compute stack counts, in HIP's order: the KFD topology nodes with SIMDs (gfx_target_version 120001 = gfx1201), their
-    memory from the node's VRAM bank (properties "size_in_bytes" of its memory bank 0) or the drm card's mem_info_vram_total. No ROCm
-    tools needed. [] when there is no /sys/class/kfd."""
+    """AMD GPUs the compute stack counts, in HIP's order: on Linux from KFD topology nodes with SIMDs (gfx_target_version
+    120001 = gfx1201) and their memory from the VRAM bank / drm mem_info_vram_total; on Windows from setup.amd_gpus_win()."""
+    import os
     import pathlib
 
+    if os.name == "nt" and root == "/sys":
+        return _probe_amd_cards_windows(indexes)
     nodes = pathlib.Path(root) / "class/kfd/kfd/topology/nodes"
     cards: list[Card] = []
     try:
@@ -379,10 +398,25 @@ def _named_or_visible(cards: list[Card], indexes: list[int] | None) -> list[Card
 
 def ram_gib() -> tuple[float, float]:
     """(total, available) GiB of this PC's RAM from /proc/meminfo, inside a container its memory limit
-    (strata_control/cgroup_memory.py); (0, 0) where there is none."""
+    (strata_control/cgroup_memory.py), or GlobalMemoryStatusEx on Windows; (0, 0) where there is none."""
+    import os
     from strata_control import cgroup_memory
     total, available = cgroup_memory.ram_bytes()
-    return (total or 0) / (1 << 30), (available or 0) / (1 << 30)
+    if total:
+        return total / (1 << 30), (available or 0) / (1 << 30)
+    if os.name == "nt":
+        try:
+            import ctypes
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            *((n, ctypes.c_ulonglong) for n in ("tp", "ap", "tpf", "apf", "tv", "av", "aev"))]
+            m = _MS()
+            m.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return m.tp / (1 << 30), m.ap / (1 << 30)
+        except Exception:                                    # noqa: BLE001
+            pass
+    return 0.0, 0.0
 
 
 def _flag(args: list, name: str) -> str | None:
@@ -450,8 +484,8 @@ def expected(cfg: dict, *, indexes: list[int] | None = None, native: str | None 
             return False
         if kv not in (None, "int8"):                         # the split keeps int8 (apply_to_config says the same)
             return False
-        system = system or ("linux" if sys.platform.startswith("linux") else sys.platform)
-        cards = (probe or probe_cards)(indexes) if system == "linux" else []
+        system = system or ("linux" if sys.platform.startswith("linux") else "windows" if sys.platform == "win32" else sys.platform)
+        cards = (probe or probe_cards)(indexes) if system in ("linux", "windows", "win32") else []
         total, avail = (ram or ram_gib)()
         model = ASSUMED_MODEL
         if native and os.path.isfile(native):
@@ -525,7 +559,7 @@ def _apply(cfg: dict, *, exe_for_cards, system, allow_untested, probe, ram, scan
     import pathlib
     import sys
 
-    system = system or ("linux" if sys.platform.startswith("linux") else sys.platform)
+    system = system or ("linux" if sys.platform.startswith("linux") else "windows" if sys.platform == "win32" else sys.platform)
     args = [str(a) for a in cfg.get("args") or []]
     native = _flag(args, "--native")
     if not native:
@@ -548,7 +582,7 @@ def _apply(cfg: dict, *, exe_for_cards, system, allow_untested, probe, ram, scan
         return Decision(False, [f"the conversation memory format is {kv}, the all-cards split engine keeps int8"])
     gpus = cfg.get("gpu")
     indexes = [int(g) for g in gpus] if isinstance(gpus, list) else ([int(gpus)] if isinstance(gpus, int) else None)
-    cards = (probe or probe_cards)(indexes) if system == "linux" else []
+    cards = (probe or probe_cards)(indexes) if system in ("linux", "windows", "win32") else []
     total, avail = (ram or ram_gib)()
     try:
         model = (scan or scan_model)(native)
@@ -629,13 +663,20 @@ def exe_finder(cfg: dict):
     import pathlib
 
     def exe_for(n: int, cc: int | None = None, arch: str | None = None):
+        import os
         from strata_control import engine_component as EC
         exe = cfg.get("exe")
         try:
             real = EC.expand(exe, cfg, full=False) if EC.is_reference(exe) else exe
         except Exception:                                    # noqa: BLE001 - no engine to look beside: no split
             return None
-        for name in ((f"strata-split-{n}-{arch}", f"strata-split-{n}-amd") if arch else ((f"strata-split-{n}-sm{cc}",) if cc else ()) + (f"strata-split-{n}",)):
+        suffix = ".exe" if (os.name == "nt" or str(real).lower().endswith(".exe")) else ""
+        names = (
+            (f"strata-split-{n}-{arch}{suffix}", f"strata-split-{n}-amd{suffix}")
+            if arch else
+            ((f"strata-split-{n}-sm{cc}{suffix}",) if cc else ()) + (f"strata-split-{n}{suffix}",)
+        )
+        for name in names:
             p = pathlib.Path(str(real)).parent / name
             if p.is_file():
                 return str(p)

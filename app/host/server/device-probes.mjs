@@ -84,7 +84,8 @@ export async function detectDrmGpus() {
     const busId=resolved.split('/').at(-1),vendorId=await read(`${device}/vendor`);
     const vendor={'0x1002':'amd','0x8086':'intel','0x10de':'nvidia'}[vendorId]??'unknown';
     const name=await probe('lspci',['-s',busId]);
-    const bytes=number(await read(`${device}/mem_info_vram_total`));
+    let bytes=number(await read(`${device}/mem_info_vram_total`));
+    if(bytes===null&&vendor==='intel')bytes=number(await read(`${device}/tile0/physical_vram_size_bytes`))??number(await read(`${device}/lmem_total_bytes`));
     if(!isComputeAdapter(vendor,bytes))continue;
     result.push({id:`drm:${busId}`,index:result.length,busId,vendor,name:name.replace(/^[^ ]+\s+[^:]+:\s*/,'')||`${vendor.toUpperCase()} GPU`,vramGb:bytes===null?0:round(bytes/1024**3,1),unified:vendor==='intel'&&!(bytes>0),backend:'vulkan',sensorPath:device});
   }

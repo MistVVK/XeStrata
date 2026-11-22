@@ -121,6 +121,14 @@ class Mapping(unittest.TestCase):
         nv[0].UDID = b"PCI_VEN_10DE&DEV_2F04"
         self.assertEqual(t._adl_cards(nv, 2), [(1, "164E", "AMD Radeon(TM) Graphics", True)])            # another vendor's adapter is never a card
         self.assertEqual(t._adl_cards(apu, 2), [(0, "1586", "AMD Radeon(TM) 8060S Graphics", True)])
+        # Two identical discrete AMD GPUs on different PCIe buses must both survive dedup while duplicate display outputs on the same bus collapse
+        dual = (A * 3)()
+        for k, bus in enumerate((3, 3, 9)):
+            dual[k].AdapterName = b"AMD Radeon RX 7900 XTX"
+            dual[k].UDID = b"PCI_VEN_1002&DEV_744C&SUBSYS"
+            dual[k].Present = 1
+            dual[k].BusNumber = bus
+        self.assertEqual(t._adl_cards(dual, 3), [(0, "744C", "AMD Radeon RX 7900 XTX", False), (2, "744C", "AMD Radeon RX 7900 XTX", False)])
 
     def test_link_fields(self):
         self.assertEqual(t._adl_link((4, 16, 5, 16), 8), {"pcie_gen": 4, "pcie_gen_max": 5, "pcie_width_max": 16, "pcie_width": 8})

@@ -677,14 +677,17 @@ class Strata:
         from strata_control import hy4_fit
         uni = next((g for g in usable if g.get("unified_gb")), None)
         uma = next((g for g in usable if g.get("uma")), None)
+        extra_vram_gib = 0.0
         if uni:
             vram_gib, ram_gib, unified = None, float(uni["unified_gb"]), True
         elif uma:
             vram_gib, ram_gib, unified = None, float(uma.get("vram_gb") or ram) / hy4_fit.GIB_TO_GB, True
         else:
-            vram_gib, ram_gib, unified = max((float(g["vram_gb"]) for g in usable), default=0.0), float(ram), False
-        placed = hy4_fit.place(build, vram_gib, ram_gib, unified, None, vision)
-        return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified, None, vision)["build"] == build,
+            vrams = sorted((float(g["vram_gb"]) for g in usable), reverse=True)
+            vram_gib, ram_gib, unified = (vrams[0] if vrams else 0.0), float(ram), False
+            extra_vram_gib = sum(vrams[1:])
+        placed = hy4_fit.place(build, vram_gib, ram_gib, unified, None, vision, extra_vram_gib=extra_vram_gib)
+        return {"placement": placed, "mode": hy4_fit.mode(placed["ssd_gb"]), "recommended": hy4_fit.recommend(vram_gib, ram_gib, unified, None, vision, extra_vram_gib=extra_vram_gib)["build"] == build,
                 "unified": unified, "engram_gb": hy4_fit.ENGRAM_GB, "context": hy4_fit.DEFAULT_CONTEXT, "kv_gb": round(hy4_fit.kv_extra_gb(), 2)}
 
     def inkling_fit_row(self, build, ram, usable, vision: bool = True) -> dict | None:
@@ -2612,10 +2615,12 @@ class Tools:
                 raise ToolError("no Intel Arc card Strata can use was found in this computer (the Intel Arc engine runs on Linux)")
             if not intel_app.can_set_up(family, families[family]):
                 raise ToolError(f"{families[family]['title']} {model} can't be set up for an Intel Arc card yet; "
-                                "the Qwen3.8-Flash-Next, Swift, Coder, Gyro and Unsloth sizes can")
-            backend, vision = "sycl", "no"                  # pictures stay off on an Arc (strata_cli/launch/adopt.py)
-            if not gguf_dir and not intel_app.model_files_in(have_dir, family, families[family]):
-                raise ToolError(intel_app.NO_DOWNLOAD)
+                                "the Qwen3.8-Flash-Next, Swift, Coder, Gyro, Unsloth, Hy4-Flash and Inkling-2-Mini sizes can")
+            backend = "sycl"
+            if not md.get("hy4") and not md.get("inkling"):
+                vision = "no"                  # pictures stay off on an Arc for GGUF families (strata_cli/launch/adopt.py)
+                if not gguf_dir and not intel_app.model_files_in(have_dir, family, families[family]):
+                    raise ToolError(intel_app.NO_DOWNLOAD)
         if md.get("hy4"):                                       # Hy4-Flash: the files are in <models>/hy4-flash (the build, the shared Engram shard); the disk need is what is not there yet
             from strata_control import hy4_family
             have_files = hy4_family.local_files(target / "models" / hy4_family.FAMILY)

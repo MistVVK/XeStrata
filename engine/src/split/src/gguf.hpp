@@ -73,7 +73,16 @@ public:
     const uint8_t* shard_base(int s) const { return (const uint8_t*) maps_[(size_t) s].base; }
 
 private:
-    struct Map { void* base = nullptr; size_t size = 0; int fd = -1; std::string path; };
+    struct Map {
+        void* base = nullptr;
+        size_t size = 0;
+        int fd = -1;
+#ifdef _WIN32
+        void* hfile = nullptr;
+        void* hmap = nullptr;
+#endif
+        std::string path;
+    };
     std::vector<Map> maps_;
     std::map<std::string, Tensor> tensors_;
     std::map<std::string, int64_t> ints_;
@@ -131,7 +140,11 @@ private:
     };
     const Gguf& g_;
     std::vector<G> groups_;
+#ifdef _WIN32
+    std::vector<void*> plain_handle_;
+#else
     std::vector<int> direct_fd_, plain_fd_;
+#endif
     std::vector<uint8_t*> free_;   // buffers given back, for the next groups
     size_t buf_bytes_ = 0;
     int consumers_, ahead_, held_ = 0;

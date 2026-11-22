@@ -132,6 +132,24 @@ struct InkSyRunner {
     float* b_moe_raw = nullptr;
     float* b_moe_out = nullptr;
 
+    // Dual-GPU EP peer buffers (allocated on GPU 1 when mod->ep2_active)
+    float* g1_mlp_in = nullptr;
+    int* g1_topk_idx = nullptr;
+    float* g1_topk_w = nullptr;
+    int* g1_moe_uexp = nullptr;
+    int* g1_moe_uoff = nullptr;
+    int* g1_moe_ucnt = nullptr;
+    int* g1_moe_pairs = nullptr;
+    int* g1_moe_n_uniq = nullptr;
+    float* g1_moe_h = nullptr;
+    float* g1_moe_yp = nullptr;
+    float* g1_moe_raw = nullptr;
+    float* g0_ep_y1 = nullptr;      // on GPU 0 (receives GPU 1 partial sum)
+    float* h_ep_x = nullptr;        // pinned host bounce for non-P2P topologies
+    int* h_ep_idx = nullptr;
+    float* h_ep_w = nullptr;
+    float* h_ep_y1 = nullptr;
+
     float* b_h_out = nullptr;
     float* b_h_norm = nullptr;
     float* b_logits = nullptr;
@@ -184,6 +202,19 @@ struct InkSyRunner {
         dfree(b_mlp_in); dfree(b_r_logits); dfree(b_topk_idx); dfree(b_topk_w);
         dfree(b_moe_uexp); dfree(b_moe_uoff); dfree(b_moe_ucnt); dfree(b_moe_pairs); dfree(b_moe_n_uniq);
         dfree(b_moe_h); dfree(b_moe_yp); dfree(b_moe_raw); dfree(b_moe_out);
+        if (mod && mod->q_peer) {
+            try { mod->q_peer->wait(); } catch (...) {}
+            auto pfree = [&](auto*& p) { if (p) { sycl::free(p, *mod->q_peer); p = nullptr; } };
+            pfree(g1_mlp_in); pfree(g1_topk_idx); pfree(g1_topk_w);
+            pfree(g1_moe_uexp); pfree(g1_moe_uoff); pfree(g1_moe_ucnt);
+            pfree(g1_moe_pairs); pfree(g1_moe_n_uniq);
+            pfree(g1_moe_h); pfree(g1_moe_yp); pfree(g1_moe_raw);
+        }
+        dfree(g0_ep_y1); g0_ep_y1 = nullptr;
+        dfree(h_ep_x); h_ep_x = nullptr;
+        dfree(h_ep_idx); h_ep_idx = nullptr;
+        dfree(h_ep_w); h_ep_w = nullptr;
+        dfree(h_ep_y1); h_ep_y1 = nullptr;
         dfree(b_h_out); dfree(b_h_norm); dfree(b_logits); dfree(b_argmax); dfree(b_taps4);
         dfree(xq_s8_dev); dfree(xsc_dev);
         dsp_frnn_slot = nullptr; b_cur = nullptr;
@@ -252,6 +283,27 @@ struct InkSyRunner {
         b_moe_pairs = dalloc<int>(MB * 8); b_moe_n_uniq = dalloc<int>(1);
         b_moe_h = dalloc<float>(MB * 8 * 1152); b_moe_yp = dalloc<float>(MB * 8 * D);
         b_moe_raw = dalloc<float>(MB * D); b_moe_out = dalloc<float>(MB * D);
+
+        if (m.ep2_active && m.q_peer) {
+            auto palloc = [&](auto*& ptr, size_t n) -> bool {
+                using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
+                ptr = sycl::malloc_device<T>(n ? n : 1, *m.q_peer);
+                return ptr != nullptr;
+            };
+            if (!palloc(g1_mlp_in, MB * D) || !palloc(g1_topk_idx, MB * 8) || !palloc(g1_topk_w, MB * 8) ||
+                !palloc(g1_moe_uexp, 128) || !palloc(g1_moe_uoff, 128) || !palloc(g1_moe_ucnt, 128) ||
+                !palloc(g1_moe_pairs, MB * 8) || !palloc(g1_moe_n_uniq, 1) ||
+                !palloc(g1_moe_h, MB * 8 * 1152) || !palloc(g1_moe_yp, MB * 8 * D) || !palloc(g1_moe_raw, MB * D)) {
+                err = "ink_sycl: peer GPU1 scratch allocation failed";
+                return false;
+            }
+            g0_ep_y1 = dalloc<float>(MB * D);
+            h_ep_x = halloc<float>(MB * D);
+            h_ep_idx = halloc<int>(MB * 8);
+            h_ep_w = halloc<float>(MB * 8);
+            h_ep_y1 = halloc<float>(MB * D);
+            m.q_peer->wait();
+        }
 
         b_h_out = dalloc<float>(MB * D); b_h_norm = dalloc<float>(MB * D);
         b_logits = dalloc<float>((size_t)std::min(max_batch, 64) * c.vocab_padded);
@@ -568,7 +620,59 @@ struct InkSyRunner {
             dispatch_linear(man.get(p + ".mlp.gate.weight"), b_mlp_in, b_r_logits, M);
             k_router_topk8_sg16(b_r_logits, tf32(p + ".mlp.gate.bias"), b_topk_idx, b_topk_w, c.route_scale, M);
 
-            if (hybrid.active) {
+            if (mod->ep2_active && mod->q_peer) {
+                // Dual-GPU Expert Parallelism: run GPU 1 routed experts concurrently on q_peer while GPU 0 runs its share!
+                sycl::queue& q1 = *mod->q_peer;
+                const int P = M * 8;
+                const int max_uniq = std::min(128, P);
+                const InkSyExpertDev* ex_g0 = mod->expert_dev + (size_t)ip * c.n_experts;
+                const InkSyExpertDev* ex_g1 = mod->expert_dev_g1 + (size_t)ip * c.n_experts;
+
+                // 1. Stage MoE inputs (b_mlp_in, b_topk_idx, b_topk_w) to GPU 1 (P2P direct or host-pinned bounce)
+                if (mod->ep2_p2p) {
+                    wait();
+                    q1.memcpy(g1_mlp_in, b_mlp_in, (size_t)M * D * sizeof(float));
+                    q1.memcpy(g1_topk_idx, b_topk_idx, (size_t)P * sizeof(int));
+                    q1.memcpy(g1_topk_w, b_topk_w, (size_t)P * sizeof(float));
+                } else {
+                    d2h(h_ep_x, b_mlp_in, (size_t)M * D * sizeof(float));
+                    d2h(h_ep_idx, b_topk_idx, (size_t)P * sizeof(int));
+                    d2h(h_ep_w, b_topk_w, (size_t)P * sizeof(float));
+                    wait();
+                    q1.memcpy(g1_mlp_in, h_ep_x, (size_t)M * D * sizeof(float));
+                    q1.memcpy(g1_topk_idx, h_ep_idx, (size_t)P * sizeof(int));
+                    q1.memcpy(g1_topk_w, h_ep_w, (size_t)P * sizeof(float));
+                }
+
+                // 2. Launch GPU 1 experts asynchronously FIRST (overlaps 100% with GPU 0!)
+                k_moe_plan_sg16_q(q1, g1_topk_idx, P, g1_moe_uexp, g1_moe_uoff, g1_moe_ucnt, g1_moe_pairs, g1_moe_n_uniq, ex_g1);
+                k_moe_gu_situ_sg16_q(q1, ex_g1, g1_mlp_in, g1_moe_uexp, g1_moe_uoff, g1_moe_ucnt, g1_moe_pairs, g1_moe_n_uniq, max_uniq, g1_moe_h);
+                k_moe_dn_sg16_q(q1, ex_g1, g1_topk_w, g1_moe_uexp, g1_moe_uoff, g1_moe_ucnt, g1_moe_pairs, g1_moe_n_uniq, max_uniq, g1_moe_h, g1_moe_yp);
+                k_moe_reduce8_sg16_q(q1, g1_moe_yp, g1_moe_raw, M, ex_g1, g1_topk_idx);
+                sycl::event ev_g1 = mod->ep2_p2p
+                    ? q1.memcpy(g0_ep_y1, g1_moe_raw, (size_t)M * D * sizeof(float))
+                    : q1.memcpy(h_ep_y1, g1_moe_raw, (size_t)M * D * sizeof(float));
+
+                // 3. Concurrently run GPU 0 experts (and CPU hybrid experts if any overflowed both GPUs)
+                if (hybrid.active) {
+                    hybrid.run_moe_hybrid(ip, visit_pass, M,
+                                          b_mlp_in, b_topk_idx, b_topk_w,
+                                          b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq,
+                                          b_moe_h, b_moe_yp, b_moe_raw);
+                } else {
+                    k_moe_plan_sg16_q(Q(), b_topk_idx, P, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, ex_g0);
+                    k_moe_gu_situ_sg16_q(Q(), ex_g0, b_mlp_in, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h);
+                    k_moe_dn_sg16_q(Q(), ex_g0, b_topk_w, b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq, max_uniq, b_moe_h, b_moe_yp);
+                    k_moe_reduce8_sg16_q(Q(), b_moe_yp, b_moe_raw, M, ex_g0, b_topk_idx);
+                }
+
+                // 4. Synchronize GPU 1 partial sum & reduce on GPU 0
+                ev_g1.wait();
+                if (!mod->ep2_p2p) {
+                    h2d(g0_ep_y1, h_ep_y1, (size_t)M * D * sizeof(float));
+                }
+                k_add_sg16(b_moe_raw, g0_ep_y1, b_moe_raw, M_stride);
+            } else if (hybrid.active) {
                 hybrid.run_moe_hybrid(ip, visit_pass, M,
                                       b_mlp_in, b_topk_idx, b_topk_w,
                                       b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_n_uniq,

@@ -1573,6 +1573,9 @@ struct Prefill::Impl {
     PinnedUpload steps_up;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
+    float* tp_ref_sc = nullptr;           // STRATA_SELECT_TWO_PASS_CHECK=1 when m.attn is too small: today's row and ids
+    int32_t* tp_ref_ids = nullptr;
+    size_t tp_ref_sc_n = 0, tp_ref_ids_n = 0;
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
@@ -5384,11 +5387,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // STRATA_SELECT_TWO_PASS_CHECK=1 (diagnostic, one GPU): today's scores and ids for the same
                         // queries, compared with the two-pass ones (counts at the prompt's end).  Their buffers are the
                         // rest of m.attn past the two-pass scratch when it is large enough (the attention below writes
-                        // m.attn after the comparison), else buffers of their own
+                        // m.attn after the comparison), else the stage's own buffers on its own card (freed with m.owned)
                         if (tp_call && tp_check) {
-                            static float* own_sc = nullptr;
-                            static int32_t* own_ids = nullptr;
-                            static size_t own_sc_n = 0, own_ids_n = 0;
                             const size_t want_sc = (size_t) m.sel_batch * (size_t) m.max_blocks, want_ids = (size_t) m.sel_batch * (size_t) m.cap;
                             const uint64_t at = (strata::kernels::qsa_two_pass_scratch_bytes(m.sel_batch, m.max_blocks) + 255u) & ~uint64_t(255u);
                             const uint64_t at_ids = at + (((uint64_t) want_sc * 4u + 255u) & ~uint64_t(255u));
@@ -5398,23 +5398,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ref_sc = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(m.attn) + at);
                                 ref_ids = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(m.attn) + at_ids);
                             } else {
-                                if (want_sc > own_sc_n || want_ids > own_ids_n) {
-                                    cudaStreamSynchronize(m.cs);
-                                    cudaFree(own_sc);
-                                    cudaFree(own_ids);
-                                    own_sc = nullptr;
-                                    own_ids = nullptr;
-                                    own_sc_n = own_ids_n = 0;
-                                    if (cudaMalloc((void**) &own_sc, want_sc * 4) != cudaSuccess ||
-                                        cudaMalloc((void**) &own_ids, want_ids * 4) != cudaSuccess) {
+                                // a larger need takes a new pair; the smaller one stays in m.owned until release
+                                if (want_sc > m.tp_ref_sc_n || want_ids > m.tp_ref_ids_n) {
+                                    float* own_sc = nullptr;
+                                    int32_t* own_ids = nullptr;
+                                    const bool ok = cudaMalloc((void**) &own_sc, want_sc * 4) == cudaSuccess &&
+                                                    cudaMalloc((void**) &own_ids, want_ids * 4) == cudaSuccess;
+                                    if (own_sc) m.owned.push_back(own_sc);
+                                    if (own_ids) m.owned.push_back(own_ids);
+                                    if (!ok) {
                                         err = "STRATA_SELECT_TWO_PASS_CHECK: no room for its buffers";
                                         return false;
                                     }
-                                    own_sc_n = want_sc;
-                                    own_ids_n = want_ids;
+                                    m.tp_ref_sc = own_sc;
+                                    m.tp_ref_ids = own_ids;
+                                    m.tp_ref_sc_n = want_sc;
+                                    m.tp_ref_ids_n = want_ids;
                                 }
-                                ref_sc = own_sc;
-                                ref_ids = own_ids;
+                                ref_sc = m.tp_ref_sc;
+                                ref_ids = m.tp_ref_ids;
                             }
                             if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW, steps0, nb,
                                                                       m.max_blocks, s, ref_sc, m.cs, active)) {

@@ -13,11 +13,19 @@
 
 #include <cuda_runtime.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <sys/stat.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -40,6 +48,7 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
+#if !FNX_HOSTRING && !defined(_WIN32)
 // a card's PCI address in sysfs's spelling
 std::string card_bdf(int dev) {
     char bus[32];
@@ -90,6 +99,7 @@ void check_bar1(int dev, const std::string& bdf, const std::string& dir, const c
     if (bad) throw std::runtime_error("card " + std::to_string(dev) + ": cannot read " + path);
     require_bar1_covers(dev, bdf, prop.name, bar1_bytes(text, path), prop.totalGlobalMem, NCARD);
 }
+#endif
 // the Makefile passes the arch the kernels were compiled for (ARCH): a default here would let a card of another one
 // run them through the driver's PTX compiler unchecked
 #ifndef FNX_ARCH
@@ -891,16 +901,44 @@ struct MtpFiles {
     std::map<std::string, Tensor> t;
     void* base = nullptr;
     size_t size = 0;
+#ifdef _WIN32
+    void* hfile = nullptr;
+    void* hmap = nullptr;
+#endif
     std::vector<uint8_t> gate_b, up_b, down_b;   // the experts' blocks: [512][640][2560], [512][640][2560], [512][2560][640]
     uint32_t etype = T_Q4_0;
     Tensor gate, up, down;
     explicit MtpFiles(const std::string& dir) {
+#ifdef _WIN32
+        HANDLE hf = CreateFileA((dir + "/dense.bin").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) throw std::runtime_error("mtp: cannot open " + dir + "/dense.bin");
+        LARGE_INTEGER fsz{};
+        if (!GetFileSizeEx(hf, &fsz) || fsz.QuadPart <= 0) {
+            CloseHandle(hf);
+            throw std::runtime_error("mtp: cannot stat " + dir + "/dense.bin");
+        }
+        HANDLE hm = CreateFileMappingA(hf, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hm) {
+            CloseHandle(hf);
+            throw std::runtime_error("mtp: cannot map dense.bin");
+        }
+        base = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+        if (!base) {
+            CloseHandle(hm);
+            CloseHandle(hf);
+            throw std::runtime_error("mtp: cannot map dense.bin");
+        }
+        hfile = (void*) hf;
+        hmap = (void*) hm;
+        size = (size_t) fsz.QuadPart;
+#else
         const int fd = ::open((dir + "/dense.bin").c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("mtp: cannot open " + dir + "/dense.bin");
         size = (size_t) lseek(fd, 0, SEEK_END);
         base = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
         ::close(fd);
         if (base == MAP_FAILED) throw std::runtime_error("mtp: cannot map dense.bin");
+#endif
         std::ifstream idx(dir + "/dense.txt");
         if (!idx) throw std::runtime_error("mtp: cannot open " + dir + "/dense.txt");
         std::string line;
@@ -934,7 +972,15 @@ struct MtpFiles {
         std::fprintf(stderr, "fnx: draft layer experts %s\n", ex.c_str());
         views();
     }
-    ~MtpFiles() { if (base) munmap(base, size); }
+    ~MtpFiles() {
+#ifdef _WIN32
+        if (base) UnmapViewOfFile(base);
+        if (hmap) CloseHandle((HANDLE) hmap);
+        if (hfile && hfile != INVALID_HANDLE_VALUE) CloseHandle((HANDLE) hfile);
+#else
+        if (base) munmap(base, size);
+#endif
+    }
     const Tensor& operator[](const std::string& n) const {
         const auto it = t.find(n);
         if (it == t.end()) throw std::runtime_error("mtp: " + n + " is missing");
@@ -1132,8 +1178,14 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
     {
         std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + vocab_file);
+#ifdef _WIN32
+        struct _stat64 stb{};
+        const int st_ok = _fstat64(_fileno(f), &stb);
+#else
         struct stat stb{};
-        if (fstat(fileno(f), &stb) != 0 || stb.st_size % 4 != 0) {
+        const int st_ok = fstat(fileno(f), &stb);
+#endif
+        if (st_ok != 0 || stb.st_size % 4 != 0) {
             std::fclose(f);
             throw std::runtime_error("mtp: " + vocab_file + " is not whole int32 token ids (" + std::to_string((long long) stb.st_size) + " bytes)");
         }
@@ -1180,8 +1232,14 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
         const std::string vf = vocab_file.empty() ? dir + "/draft_vocab.bin" : vocab_file;
         std::FILE* f = std::fopen(vf.c_str(), "rb");
         if (!f) throw std::runtime_error("mtp: cannot open " + vf);
+#ifdef _WIN32
+        struct _stat64 stb{};
+        const int st_ok = _fstat64(_fileno(f), &stb);
+#else
         struct stat stb{};
-        if (fstat(fileno(f), &stb) != 0 || stb.st_size % 4 != 0) {
+        const int st_ok = fstat(fileno(f), &stb);
+#endif
+        if (st_ok != 0 || stb.st_size % 4 != 0) {
             std::fclose(f);
             throw std::runtime_error("mtp: " + vf + " is not whole int32 token ids (" + std::to_string((long long) stb.st_size) + " bytes)");
         }

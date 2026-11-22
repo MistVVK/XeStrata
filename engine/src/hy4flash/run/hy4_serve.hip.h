@@ -54,6 +54,11 @@ struct ServeOpts {
     int64_t image_max_pixels = 4194304;
     int primary_gpu = 0;
     std::vector<int> peer_devs;
+    double vram_experts_gb = -1.0;
+    double ram_experts_gb = -1.0;
+#ifdef STRATA_HY4_DISTRIBUTED
+    RemoteExperts* remote_experts = nullptr;
+#endif
 };
 
 // ---- protocol output: one line at a time, flushed -------------------------------------------------------------------------------------------------------------
@@ -73,43 +78,46 @@ inline void proto(const char* fmt, ...) {
 
 // ---- stdin on its own thread: STOP is seen while a request runs -----------------------------------------------------------------------------------------------
 class LineInput {
+    struct State {
+        std::atomic<bool> stop{false};
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::deque<std::string> lines;
+        bool eof = false;
+    };
+    std::shared_ptr<State> state_ = std::make_shared<State>();
+
 public:
-    std::atomic<bool> stop{false};
+    std::atomic<bool>& stop = state_->stop;
     void start() {
-        th_ = std::thread([this] {
+        std::thread([state = state_] {
             std::string line;
             while (std::getline(std::cin, line)) {
                 while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
                 if (line == "STOP") {
-                    stop.store(true);
+                    state->stop.store(true);
                     continue;
                 }
-                std::lock_guard<std::mutex> lk(m_);
-                q_.push_back(line);
-                cv_.notify_one();
+                const bool quit = line == "QUIT";
+                std::lock_guard<std::mutex> lk(state->mutex);
+                state->lines.push_back(std::move(line));
+                state->ready.notify_one();
+                if (quit) break;
             }
-            std::lock_guard<std::mutex> lk(m_);
-            eof_ = true;
-            cv_.notify_all();
-        });
-        th_.detach();
+            std::lock_guard<std::mutex> lk(state->mutex);
+            state->eof = true;
+            state->ready.notify_all();
+        }).detach();
     }
     // false at EOF with nothing left
     bool next(std::string& out) {
-        std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [this] { return !q_.empty() || eof_; });
-        if (q_.empty()) return false;
-        out = q_.front();
-        q_.pop_front();
+        std::unique_lock<std::mutex> lk(state_->mutex);
+        state_->ready.wait(lk, [this] { return !state_->lines.empty() || state_->eof; });
+        if (state_->lines.empty()) return false;
+        out = std::move(state_->lines.front());
+        state_->lines.pop_front();
         return true;
     }
-
-private:
-    std::thread th_;
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::deque<std::string> q_;
-    bool eof_ = false;
 };
 
 // ---- parsing a GEN line ---------------------------------------------------------------------------------------------------------------------------------------
@@ -252,11 +260,29 @@ inline int hy4_serve_main(const ServeOpts& o) {
     size_t fr = 0, tot = 0;
     HCK(hipMemGetInfo(&fr, &tot));
     fprintf(stderr, "[gpu] %s %s free %.1f / %.1f GiB\n", p.name, gpu_arch(p), fr / 1073741824.0, tot / 1073741824.0);
-    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model, !o.peer_devs.empty());
     GpuModel g;
     g.primary_gpu = o.primary_gpu;
     g.has_vision = !o.vision.empty();
+    g.vram_experts_gb_cap = o.vram_experts_gb;
+    g.ram_experts_gb_cap = o.ram_experts_gb;
     g.peer_devs = o.peer_devs;
+    bool expert_split = !o.peer_devs.empty();
+    size_t min_peer_tot = 0;
+    for (int pd : o.peer_devs) {
+        HCK(hipSetDevice(pd));
+        size_t pfr = 0, ptot = 0;
+        HCK(hipMemGetInfo(&pfr, &ptot));
+        min_peer_tot = (min_peer_tot == 0) ? ptot : std::min(min_peer_tot, ptot);
+    }
+    if (!o.peer_devs.empty()) HCK(hipSetDevice(o.primary_gpu));
+#ifdef STRATA_HY4_DISTRIBUTED
+    if (o.remote_experts) {
+        g.expert_shard = 0;
+        expert_split = true;
+    }
+#endif
+    const int serve_chunk = plan_memory(o.max_ctx, o.chunk, tot, o.model, expert_split, !o.vision.empty(), (int)o.peer_devs.size(), min_peer_tot);
+    g.planned_chunk = serve_chunk;
     double t_load0 = now_s();
     if (!load_gpu_model(g, o.model, true)) {
         proto("ERR cannot load %s", o.model.c_str());
@@ -275,6 +301,9 @@ inline int hy4_serve_main(const ServeOpts& o) {
     r.index_topk = o.index_topk;
     r.index_on = o.no_index ? 0 : 1;
     r.tail_skip = o.tail_skip;
+#ifdef STRATA_HY4_DISTRIBUTED
+    r.remote_experts = o.remote_experts;
+#endif
     std::string err;
     if (!r.init(o.no_engram ? std::string() : o.engram, err)) {
         proto("ERR init: %s", err.c_str());
@@ -295,6 +324,9 @@ inline int hy4_serve_main(const ServeOpts& o) {
     }
     std::unique_ptr<Spec> spec;
     if (use_spec) spec.reset(new Spec(r, df, o.spec));
+#ifdef STRATA_HY4_DISTRIBUTED
+    if (o.remote_experts) o.remote_experts->start(r.Tc);
+#endif
     const int V = r.c.vocab, EOS = r.c.eos, EOT = 120008;
     std::vector<int32_t> tok;
     tok.reserve((size_t)max_ctx + 16);  // a stable host buffer: the Engram prefetch thread reads it

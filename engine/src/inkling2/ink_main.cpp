@@ -425,19 +425,25 @@ int main(int argc, char** argv) {
             std::string spec = next();
             if (spec.find(',') != std::string::npos || a == "--devices") {
                 cfg.bopts.gpu_ids.clear();
-                size_t p = 0;
-                while (p < spec.size()) {
-                    size_t c = spec.find(',', p);
-                    std::string tok = (c == std::string::npos) ? spec.substr(p) : spec.substr(p, c - p);
-                    if (!tok.empty()) cfg.bopts.gpu_ids.push_back(std::atoi(tok.c_str()));
-                    if (c == std::string::npos) break;
-                    p = c + 1;
+                for (size_t pos = 0; pos < spec.size();) {
+                    size_t q = spec.find(',', pos);
+                    if (q == std::string::npos) q = spec.size();
+                    if (q > pos) {
+                        int id = std::atoi(spec.substr(pos, q - pos).c_str());
+                        if (id >= 0 && std::find(cfg.bopts.gpu_ids.begin(), cfg.bopts.gpu_ids.end(), id) == cfg.bopts.gpu_ids.end()) {
+                            cfg.bopts.gpu_ids.push_back(id);
+                        }
+                    }
+                    pos = q + 1;
                 }
                 if (!cfg.bopts.gpu_ids.empty()) {
                     cfg.bopts.gpu_index = cfg.bopts.gpu_ids[0];
                     cfg.bopts.gpus = static_cast<int>(cfg.bopts.gpu_ids.size());
+                } else {
+                    cfg.bopts.gpus = 1;
                 }
             } else {
+                cfg.bopts.gpu_ids.clear();
                 cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
             }
         } else if (a == "--ep-split") {
@@ -473,7 +479,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Read optional IK2_EP_SPLIT & IK2_GPUS env overrides (#6506)
+    // Read optional IK2_EP_SPLIT and IK2_GPUS env overrides (#6506)
     if (const char* ep_env = std::getenv("IK2_EP_SPLIT"); ep_env && *ep_env) {
         double v = std::atof(ep_env);
         if (v > 0.0 && v < 1.0) cfg.bopts.ep_split = v;
@@ -482,20 +488,23 @@ int main(int argc, char** argv) {
         if (const char* g_env = std::getenv("IK2_GPUS"); g_env && *g_env) {
             std::string spec(g_env);
             if (spec.find(',') != std::string::npos) {
-                size_t p = 0;
-                while (p < spec.size()) {
-                    size_t c = spec.find(',', p);
-                    std::string tok = (c == std::string::npos) ? spec.substr(p) : spec.substr(p, c - p);
-                    if (!tok.empty()) cfg.bopts.gpu_ids.push_back(std::atoi(tok.c_str()));
-                    if (c == std::string::npos) break;
-                    p = c + 1;
+                for (size_t pos = 0; pos < spec.size();) {
+                    size_t q = spec.find(',', pos);
+                    if (q == std::string::npos) q = spec.size();
+                    if (q > pos) {
+                        int id = std::atoi(spec.substr(pos, q - pos).c_str());
+                        if (id >= 0 && std::find(cfg.bopts.gpu_ids.begin(), cfg.bopts.gpu_ids.end(), id) == cfg.bopts.gpu_ids.end()) {
+                            cfg.bopts.gpu_ids.push_back(id);
+                        }
+                    }
+                    pos = q + 1;
                 }
                 if (!cfg.bopts.gpu_ids.empty()) {
                     cfg.bopts.gpu_index = cfg.bopts.gpu_ids[0];
                     cfg.bopts.gpus = static_cast<int>(cfg.bopts.gpu_ids.size());
                 }
             } else {
-                cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
+                cfg.bopts.gpus = std::max(1, std::atoi(g_env));
             }
         }
     }

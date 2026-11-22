@@ -74,11 +74,14 @@ int main(int argc, char** argv) {
     // Backend: Level Zero with SYCL command_graph replay (~2.15 us/kernel) beats OpenCL eager (~7.35 us/kernel) on both prefill & decode!
     // HY4S_BACKEND=opencl (or an explicit ONEAPI_DEVICE_SELECTOR) overrides.
     const bool user_sel = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
+    const char* be_env = std::getenv("HY4S_BACKEND");
+    const bool want_ocl = (be_env && std::string(be_env) == "opencl");
     if (!user_sel) {
-        const char* be = std::getenv("HY4S_BACKEND");
-        hy4s_setenv("ONEAPI_DEVICE_SELECTOR", (be && std::string(be) == "opencl") ? "opencl:gpu" : "level_zero:gpu", 1);
+        hy4s_setenv("ONEAPI_DEVICE_SELECTOR", want_ocl ? "opencl:gpu" : "level_zero:gpu", 1);
     }
     std::string model, engram, tok_path, out_dir = ".", force_route, draft;
+    std::string gpus_spec = std::getenv("HY4_GPUS") ? std::getenv("HY4_GPUS") : "";
+    int gpu_arg = -1;
     SpecCfg scfg;
     int wincheck = 0, wincheck_skip = 0, detcheck = 0;
     bool detnotap = false;
@@ -114,8 +117,9 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
         else if (a == "--gpu") {
-            const std::string n = nxt();
-            if (!user_sel) hy4s_setenv("ONEAPI_DEVICE_SELECTOR", ("opencl:gpu:" + n).c_str(), 1);
+            gpu_arg = atoi(nxt().c_str());
+        } else if (a == "--gpus" || a == "--devices") {
+            gpus_spec = nxt();
         } else if (a == "--vision") {
             vision_path = nxt();
             vision_requested = true;
@@ -175,6 +179,22 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // Resolve single-GPU (--gpu N) or multi-GPU (--gpus 0,1 / --gpus 2 / --devices 0,1 / HY4_GPUS) BEFORE touching Q()/dev_caps().
+    int primary_gpu = (gpu_arg >= 0) ? gpu_arg : 0;
+    std::vector<int> peer_devs;
+    if (!gpus_spec.empty()) {
+        const auto avail_devs = enum_gpu_devices();
+        parse_gpu_spec(gpus_spec, primary_gpu, (int)avail_devs.size(), primary_gpu, peer_devs);
+        set_primary_gpu_index(primary_gpu);
+    } else if (gpu_arg >= 0) {
+        if (!user_sel) {
+            const std::string sel = std::string(want_ocl ? "opencl:gpu:" : "level_zero:gpu:") + std::to_string(gpu_arg);
+            hy4s_setenv("ONEAPI_DEVICE_SELECTOR", sel.c_str(), 1);
+            set_primary_gpu_index(0);
+        } else {
+            set_primary_gpu_index(gpu_arg);
+        }
+    }
     if (serve) {
         if (model.empty()) {
             printf("ERR --native FILE.strata is required\n");
@@ -205,6 +225,8 @@ int main(int argc, char** argv) {
         so.vision_requested = vision_requested;
         so.vision = vision_path;
         so.image_max_pixels = image_max_pixels;
+        so.primary_gpu = primary_gpu;
+        so.peer_devs = peer_devs;
         so.spec = scfg;
         return hy4s_serve_main(so);
     }
@@ -240,6 +262,7 @@ int main(int argc, char** argv) {
         const bool spec_mode = draft == "dfly2" && gen > 0;
         hy4::CpuExperts ucx;
         SyVramExpertCache vcache;
+        SyPeerExperts peers;
         Runner r(g, ucx, max_ctx, Tc, std::max(8, all_logits ? std::min(Tc, std::max(T0, 1)) : 8));
         r.dump = dump;
         r.dbg_layers = dbg;
@@ -261,11 +284,12 @@ int main(int argc, char** argv) {
         const bool want_gx = (gx_mb > 0 && (load_only || T0 >= gx_min_t));
         const size_t gx_reserve = (want_gx ? ((size_t)gx_mb * 2 / 3 + 220) * (1ull << 20) : 0) + (16ull << 20);
         const size_t host_oh = r.kv_host_bytes + g.host_bytes_total + ((size_t)std::max(gx_mb, 0) << 20) + (640ull << 20);
-        if (!setup_experts_unified(model, threads, vram_experts_gb, ram_experts_gb, gx_reserve, host_oh, hi_act || (expert_act == 0), vcache, ucx, err)) {
+        if (!setup_experts_unified(model, threads, vram_experts_gb, ram_experts_gb, gx_reserve, host_oh, hi_act || (expert_act == 0), vcache, ucx, err, peer_devs, &peers)) {
             fprintf(stderr, "experts: %s\n", err.c_str());
             return 1;
         }
         r.vcache = vcache.active() ? &vcache : nullptr;
+        r.peers = peers.active() ? &peers : nullptr;
         DFly2 df(r);
         if (draft == "dfly2") {
             if (!df.init(err)) {

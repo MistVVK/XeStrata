@@ -3,6 +3,13 @@
 #include "env.hpp"
 
 #include <cuda_runtime.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <malloc.h>
+#endif
 
 #include <array>
 #include <algorithm>
@@ -67,6 +74,12 @@ void install_graph(CardBuf::GraphSlot& s, cudaGraph_t g, const std::vector<int>&
 }
 
 long host_available_mib() {
+#ifdef _WIN32
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    if (!GlobalMemoryStatusEx(&st)) return -1;
+    return (long) (st.ullAvailPhys / (1024ull * 1024ull));
+#else
     std::FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return -1;
     char line[256];
@@ -75,6 +88,7 @@ long host_available_mib() {
         if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
     std::fclose(f);
     return kb < 0 ? -1 : kb / 1024;
+#endif
 }
 
 struct CardPool {
@@ -482,7 +496,11 @@ size_t Engine::SeqState::total() const {
 }
 
 Engine::SeqState::~SeqState() {
+#ifdef _WIN32
+    for (void* p : host) if (p) _aligned_free(p);
+#else
     for (void* p : host) std::free(p);
+#endif
 }
 
 void stage_copy(CardBuf& b, const std::vector<std::pair<char*, size_t>>& pieces, char* host, size_t total, bool to_host) {
@@ -577,7 +595,11 @@ std::shared_ptr<Engine::SeqState> Engine::save_state(bool kv) {
         pieces[(size_t) c] = state_pieces(*cb_[c], m_.cards[c], mtp_ != nullptr, pos_, kv, half, lanes_[(size_t) cur_].pages);
         size_t n = 0;
         for (const auto& p : pieces[(size_t) c]) n += p.second;
+#ifdef _WIN32
+        s->host[c] = _aligned_malloc((n + 4095) / 4096 * 4096, 4096);
+#else
         s->host[c] = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+#endif
         if (!s->host[c])
             throw std::runtime_error("save_state: host memory for " + std::to_string(n >> 20) + " MiB (" + std::to_string(host_available_mib()) +
                                      " MiB available)");

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "strata/program/split_rules.hpp"
+#include "strata/program/stage_reserve.hpp"
 
 using namespace strata::program::split_rules;
 
@@ -157,6 +158,51 @@ int main() {
         CHECK(trim_credit(2, 3000 * MiB) == 0);
         CHECK(trim_credit(0, 0) == 0);
         CHECK(trim_credit(0, -5) == 0);   // trim off: trim_frees is 0 (never negative); a negative figure is no credit
+    }
+    // The gate-off fallback keeps to placements whose later stages hold an expert slot.  2x 8 GB (RTX 3060 Ti + RTX 3070 Ti),
+    // 48 layers, serve with DFlash2 on CUDA1 and --vram-reserve-later-mib 5800: no placement could start the prompt path, so
+    // auto chose by decode speed alone, and the PCIe probe decided K.  CUDA0 read 10.6-12.6 GB/s and CUDA1 2.9, a gap of
+    // 3.66-4.34 on both sides of kLinkScaleMin: below it K=45 (CUDA1 runs 45-47), which stopped at "CUDA1 expert cache: no
+    // room"; above it K=47, which loaded with 28 slots.
+    {
+        const int64_t MiB = 1 << 20;
+        CHECK(link_miss_scale({10.6, 2.9})[1] == 1.0);   // gap 3.66: unscaled, K=45 is the faster
+        CHECK(link_miss_scale({12.6, 2.9})[1] > 4.0);    // gap 4.34: scaled, K=47 is the faster
+        // CUDA1's room before its session carve, planned as the cache step will size it: 7578 MiB free, 5800 + 256 + 96
+        // reserved, 1000 for the drafter and the head, DFlash2's drafter over that (112) and what it binds after the cache
+        // (160 MiB in serve)
+        strata::program::stage_reserve::Inputs in;
+        in.base_reserve_mib = 5800 + 256;
+        in.later = true;
+        in.drafter = true;
+        in.df2_bind_mib = strata::program::stage_reserve::df2_search_mib(true);
+        const int64_t room = strata::program::stage_reserve::room_bytes(7578 * MiB, in);
+        // each placement's session and weights on CUDA1: the search logged 143 MiB left at K=45 and 294 at K=47 of 426, and
+        // (with the after-cache term alone booked) 57 at K=46 of 266
+        const int64_t carve45 = (426 - 143) * MiB, carve46 = (266 - 57) * MiB, carve47 = (426 - 294) * MiB;
+        const int64_t slot = 13 * MiB / 10;   // an expert slot, ~1.3 MiB
+        auto held = [&](int64_t k) {          // CUDA0's cache held 400 slots at either K
+            const int64_t left = room - (k == 45 ? carve45 : k == 46 ? carve46 : carve47);
+            return std::vector<int64_t>{400, left > 0 ? left / slot : 0};
+        };
+        CHECK(later_stage_empty(held(45)));    // K=45: -129 MiB planned (the cache step found 0.00 GiB, 6.06 GiB free)
+        CHECK(later_stage_empty(held(46)));    // K=46: -55 MiB planned (the cache step found 0.00 GiB, 6.13 GiB free)
+        CHECK(!later_stage_empty(held(47)));   // K=47: 22 MiB planned (the cache step found 0.04 GiB: 28 slots)
+        // the fallback's pick: the fastest whose later stages hold a slot, else the fastest
+        auto pick = [&](const std::vector<int64_t>& by_speed) {
+            for (const int64_t k : by_speed)
+                if (!later_stage_empty(held(k))) return k;
+            return by_speed.front();
+        };
+        CHECK(pick({45, 46, 47}) == 47);   // gap 3.66
+        CHECK(pick({46, 45, 47}) == 47);   // the pick with the after-cache term alone booked (gap 4.15, STRATA_SPLIT_LINK_MIN=4.5)
+        CHECK(pick({47, 46, 45}) == 47);   // gap 4.34
+        std::printf("split_rules_test: DFlash2 on CUDA1, gate off: K=45 holds %lld slots, K=46 %lld, K=47 %lld; pick K=%lld at "
+                    "gap 3.66, K=%lld at 4.34\n", (long long) held(45)[1], (long long) held(46)[1], (long long) held(47)[1],
+                    (long long) pick({45, 46, 47}), (long long) pick({47, 46, 45}));
+        // nothing with a slot: the pick is as before; the first stage and a single card are not this rule's
+        CHECK(later_stage_empty({400, 0}) && later_stage_empty({400, 5, 0}));
+        CHECK(!later_stage_empty({0, 5}) && !later_stage_empty({0}) && !later_stage_empty({}));
     }
     if (failed == 0) std::printf("split_rules_test: ok\n");
     return failed ? 1 : 0;
