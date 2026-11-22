@@ -1340,15 +1340,22 @@ constexpr size_t kBih3PassExperts = 32;
 constexpr int64_t kBih3MatrixRows = 48;
 // A mixed layer whose experts average this many rows or more takes the shared FP16 path (each expert dequantized by
 // bih3_r1q2_dequant_f16, the FP16 grouped products, as every native pack without int8 products), where the device has
-// FP16 matrix engines.  XESTRATA_BIH3_PROMPT_F16=0|1 fixes the choice (A/B).
-constexpr int64_t kBih3F16Rows = 48;
+// FP16 matrix engines.  16 is the fastest on the B70, the RTX 4070 and the RX 9060 XT (ROCm 7.2 and 10.1) alike, 8 the
+// same: 1K prompts' layers average 21.5 to 37 rows an expert, and their prefill runs against 48 +19 to 35% on the B70,
+// +27 to 60% on the RTX and +4 to 20% on the RX; the 4K prompt the same (2026-11-21).  XESTRATA_BIH3_F16_ROWS sets the
+// rows, XESTRATA_BIH3_PROMPT_F16=0|1 fixes the choice (A/B).
+constexpr int64_t kBih3F16Rows = 16;
 bool bih3_prompt_f16(int64_t rows, int64_t experts) {
     static const int env = [] {
         const char* v = strata::env_get("BIH3_PROMPT_F16");
         return v == nullptr || v[0] == '\0' ? -1 : (int) std::strtol(v, nullptr, 10);
     }();
     if (env >= 0) return env != 0;
-    return strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) && rows >= kBih3F16Rows * experts;
+    static const int64_t min_rows = [] {
+        const char* v = strata::env_get("BIH3_F16_ROWS");
+        return v == nullptr || v[0] == '\0' ? kBih3F16Rows : (int64_t) std::strtol(v, nullptr, 10);
+    }();
+    return strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) && rows >= min_rows * experts;
 }
 size_t bih3_meta_ints(size_t T, int64_t k, int64_t n_expert) { return (size_t) (6 * n_expert + 2) + T * (size_t) k; }
 

@@ -949,7 +949,12 @@ static int check_bih3_grouped(void* stream) {
     strata::parity::copy_out(got.data(), dy, got.size());
     const double had_error = rel(got, want);
     std::printf("bih3 grouped scalar with Hadamard: rel %.9g\n", had_error);
-    return std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
+    // the direct decode path with the Hadamard
+    strata::kernels::bih3_r1q2_grouped(L, dptr, dstart, groups, ddst, dtok, 3, NT, dx, scratch, dy, stream);
+    strata::parity::copy_out(got.data(), dy, got.size());
+    const double had_direct_error = rel(got, want);
+    std::printf("bih3 grouped with Hadamard: rel %.9g\n", had_direct_error);
+    return std::isfinite(had_direct_error) && had_direct_error < 1e-2 && std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
            std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(groups_error) && groups_error < 1e-2 &&
            std::isfinite(had_error) && had_error < 1e-2 && std::isfinite(dq_error) && dq_error < 1e-3 &&
            std::isfinite(tile_error) && tile_error < 1e-5 ? 0 : 1;
