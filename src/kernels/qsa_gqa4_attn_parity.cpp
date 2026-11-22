@@ -33,7 +33,7 @@ int main() {
     s.n_head = 16; s.n_head_kv = 4; s.head_dim = 256; s.page_size = 4;
     const int64_t nh = s.n_head, nkv = s.n_head_kv, hd = s.head_dim, ps = s.page_size;
     const int64_t pages = cells / ps, rows = pages * nkv * ps;
-    std::mt19937 rng(917);
+    std::mt19937 rng(917);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<uint16_t> kh((size_t) (rows * hd)), vh(kh.size());
     for (auto& x : kh) x = k::f16_from_f32(nd(rng) * 1.5f);
