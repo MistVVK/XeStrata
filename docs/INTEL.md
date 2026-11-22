@@ -384,6 +384,21 @@ prefill path (`moe_mmq.cu`) is not built. `--peer-device` (a second GPU as an ex
 message. The sm_90 thread-block-cluster sampler and QSA top-k have no SYCL counterpart. Images on the llama.cpp config are not wired;
 on the SYCL port they are ([Pictures](#pictures-on-an-arc)).
 
+## Routed expert prefill on Battlemage
+
+The SYCL engine selects these paths automatically on a Level Zero Battlemage GPU when the request qualifies.
+
+| Setting | Automatic behavior and how to disable it |
+| --- | --- |
+| `STRATA_SYCL_BMG_ROUTED_EXPERTS` | Group routed rows, dequantization and expert projections. Where available, TLA kernels fuse gate/up and SwiGLU or project directly from the packed expert weights. Set to `0` to use the previous expert path and disable the window. |
+| `STRATA_SYCL_BMG_EXPERT_WINDOW` | With routed experts and the TLA expert build enabled, share compressed weights across adjacent eligible chunks. Set to `0` to process one chunk at a time while keeping eligible grouped projections. Checkpoints can split a window. Set `STRATA_TRACE=1` to log the actual chunk lengths. |
+
+A single unbatched run can select one Battlemage GPU even when other GPUs are visible. The paired walk requires 48 native expert layers, 512 experts with top-10 routing, 2,560 input columns, 640 feed-forward columns, and an 8,192-token chunk plan. It serves a streamed model whose expert cache does not hold all experts. Eligible layers use IQ2_XXS, IQ2_S or IQ1_M gate/up and Q2_0 down. A second chunk needs at least 4,096 rows. Shorter tails run individually.
+
+For a portable or Battlemage AOT build with Level Zero, `-DSTRATA_SYCL_TLA_EXPERT_GU=AUTO` (default) uses local sycl-tla headers from `STRATA_SYCL_TLA_DIR` or `engine/third_party/sycl-tla`. Use `ON` to require the kernels at configure time or `OFF` to omit them even with the headers present. This build option is independent of prompt attention. The row-count rules for combining gate/up and down GEMMs were checked with icpx 2026.1.1 and oneMKL 2026.1.0. When changing oneMKL, rerun the oneMKL split/merged, direct and gate/up byte-parity tests against the installed library and check windowed generations against the unmodified engine.
+
+The paired walk can borrow fewer expert-cache slots. For full host-mirror coverage, set `STRATA_LEND_MIRROR` to cover the loan reported at startup.
+
 ## Switch reference
 
 All are environment variables for the engine. Put them in the config's `"env"` block. Defaults are for the current engine.

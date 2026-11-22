@@ -77,6 +77,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "../bmg_window_session.hpp"
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -4287,6 +4288,7 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
+        strata::prefill::configure_bmg_window(ss, *strata::q_of(main_cs), !multi_gpu && stages.empty() && o.batch <= 0);
         if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
@@ -11407,7 +11409,12 @@ int main(int argc, char **argv) try {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) {
                     b60_layouts.packed(false);
-                    const bool ok=sp.run(ids.data()+a0,b0-a0,a0,e);
+                    const bool window = ss.bmg_window_device && !piped;
+                    const bool ok = window
+                        ? sp.run_expert_window(ids.data() + a0, b0 - a0, a0, e, pp_next_check, o.prompt_cache_every,
+                                               pp_total, o.short_read,
+                                               o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 && !pp_tail_saved)
+                        : sp.run(ids.data() + a0, b0 - a0, a0, e);
                     b60_layouts.packed(true);
                     return ok;
                 }

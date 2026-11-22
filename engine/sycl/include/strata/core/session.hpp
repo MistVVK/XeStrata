@@ -86,6 +86,9 @@ struct SessionState {
     /// `session_capture`/`session_loop`/`session_token` need no new parameter to reach it.  A `PleRun` whose
     /// `ready()` is false is skipped, which is what every caller had before LEDGER L123.
     PleRun ple;
+
+    // Set by the engine for its selected unsplit, unbatched BMG queue before sizing the prompt loan.
+    bool bmg_window_device = false;
 };
 
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
