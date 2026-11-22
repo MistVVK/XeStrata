@@ -34,13 +34,22 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
             self.assertTrue(rec["fits"])
 
     def test_discrete_16gb_and_24gb_mac_select_sq15(self):
+        # #6613: 16 GiB discrete GPU at 32K plans SQ-15 as safe hybrid (never OOMing on KV growth),
+        # while speed preference selects 100%-VRAM SQ-10 and 24 GiB Mac UMA fits SQ-15 100% in memory.
         rec_16 = inkling_fit.recommend(vram_gib=16, ram_gib=32)
         self.assertEqual(rec_16["build"], "SQ-15")
-        self.assertEqual(rec_16["mode"], "full_vram")
+        self.assertEqual(rec_16["mode"], "ram_vram_zero_ssd")
         self.assertTrue(rec_16["fits"])
+        self.assertLessEqual(rec_16["placement"]["vram_gb"], 10.6)
+
+        rec_16_speed = inkling_fit.recommend(vram_gib=16, ram_gib=32, preference="speed")
+        self.assertEqual(rec_16_speed["build"], "SQ-10")
+        self.assertEqual(rec_16_speed["mode"], "full_vram")
+        self.assertTrue(rec_16_speed["fits"])
 
         rec_mac24 = inkling_fit.recommend(vram_gib=None, ram_gib=24, unified=True)
         self.assertEqual(rec_mac24["build"], "SQ-15")
+        self.assertEqual(rec_mac24["mode"], "full_vram")
         self.assertTrue(rec_mac24["fits"])
 
     def test_discrete_12gb_quality_vs_speed(self):
@@ -103,11 +112,29 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
         self.assertGreater(p12["vram_gb"], 7.5)
         self.assertEqual(p12["ssd_gb"], 0.0)
 
-        # 16 GiB + SQ-15 + 32K fits 100% in VRAM with lossless FP16 KV (0 host spill)
-        p16 = inkling_fit.compute("SQ-15", 16, 32, 32768)
-        self.assertEqual(p16["kv_dtype"], "fp16")
-        self.assertTrue(p16["full_vram"])
-        self.assertEqual(p16["host_kv_gb"], 0.0)
+        # #6613: 16 GiB (and 15.92 GiB Radeon RX 9060 XT / RX 9070 XT) + SQ-15 + 32K must NOT plan full_vram=True
+        # (12.28 GB experts leaves <100 MiB for HIP kv grow_pool); it keeps safe VRAM headroom (~10.44-10.53 GB experts)
+        # while SQ-10 fits 100% in VRAM at 32K and SQ-15 fits 100% in VRAM at 8K.
+        for v_16, bkd in ((15.92, "hip"), (15.92, None), (16.0, "cuda")):
+            p16 = inkling_fit.compute("SQ-15", v_16, 64, 32768, backend=bkd)
+            self.assertEqual(p16["kv_dtype"], "fp16")
+            self.assertFalse(p16["full_vram"], (v_16, bkd, p16))
+            self.assertLessEqual(p16["vram_gb"], 10.6, (v_16, bkd, p16))
+            self.assertGreater(p16["ram_gb"], 1.5, (v_16, bkd, p16))
+            self.assertEqual(p16["ssd_gb"], 0.0)
+            self.assertEqual(p16["host_kv_gb"], 0.0)
+
+        p16_radeon_vis = inkling_fit.compute("SQ-15", 15.92, 64, 32768, vision=True, backend="hip")
+        self.assertFalse(p16_radeon_vis["full_vram"])
+        self.assertLessEqual(p16_radeon_vis["vram_gb"], 10.0)
+        self.assertEqual(p16_radeon_vis["ssd_gb"], 0.0)
+
+        p16_sq10 = inkling_fit.compute("SQ-10", 15.92, 64, 32768, vision=True, backend="hip")
+        self.assertTrue(p16_sq10["full_vram"])
+        self.assertEqual(p16_sq10["ram_gb"], 0.0)
+
+        p16_sq15_8k = inkling_fit.compute("SQ-15", 16.0, 32, 8192)
+        self.assertTrue(p16_sq15_8k["full_vram"])
 
         # 4 GiB & 6 GiB GPUs never produce negative VRAM; low-RAM 4 GiB auto-activates SSD tier
         p4 = inkling_fit.compute("SQ-10", 4, 8, 32768)
@@ -116,11 +143,62 @@ class TestInklingFitAndHardwareSelection(unittest.TestCase):
         ssd_f = inkling_fit.ssd_mode_flags("SQ-10", 4, 8, ctx=32768)
         self.assertIn("--ssd-experts", ssd_f["flags"])
 
-        # Multi-GPU layer-split auto-activates for 3x P100, unequal VRAM, mixed arch, or Windows WDDM
+        # Multi-GPU layer-split auto-activates for 2..4 GPUs so KV + experts span combined VRAM (#6592, #6631)
+        f_2x16 = inkling_fit.multi_gpu_flags([{"vram_gb": 16, "arch": "sm_120"}] * 2, windows=False)
+        self.assertEqual(f_2x16, ["--gpus", "2", "--layer-split", "auto"])
         f_3p100 = inkling_fit.multi_gpu_flags([{"vram_gb": 16, "arch": "sm_60"}] * 3, windows=True)
         self.assertEqual(f_3p100, ["--gpus", "3", "--layer-split", "auto"])
         f_mixed = inkling_fit.multi_gpu_flags([{"vram_gb": 24, "arch": "sm_86"}, {"vram_gb": 12, "arch": "sm_89"}])
         self.assertEqual(f_mixed, ["--gpus", "2", "--layer-split", "auto"])
+        # 2x 16 GiB GPUs (e.g. RTX 5080 + RTX 5070 Ti) fit SQ-15, SQ-20, UD-Q4_K_XL, UD-Q8_K_XL 100% in VRAM
+        for build in ("SQ-15", "SQ-20", "UD-Q4_K_XL", "UD-Q8_K_XL"):
+            p_dual = inkling_fit.place(build, 16.0, 32.0, ctx=32768, extra_vram_gib=16.0)
+            self.assertTrue(p_dual["full_vram"], (build, p_dual))
+            self.assertEqual(p_dual["ram_gb"], 0.0)
+            self.assertEqual(p_dual["ssd_gb"], 0.0)
+
+    def test_all_10_unsloth_gguf_and_strata_builds_across_all_vram_and_uma_tiers(self):
+        unsloth_quants = (
+            "UD-Q8_K_XL", "UD-Q4_K_XL", "UD-Q4_K_M", "UD-IQ4_XS", "UD-Q3_K_XL",
+            "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-IQ2_XXS", "UD-IQ1_M", "UD-IQ1_S",
+        )
+        self.assertEqual(tuple(inkling_fit.GGUF_ORDER), unsloth_quants)
+        all_builds = (*inkling_fit.STRATA_ORDER, *unsloth_quants)
+
+        # Discrete tiers: 4, 6, 8, 10, 12, 16, 24, 32 GiB
+        for vram, ram in ((4, 16), (6, 16), (8, 32), (10, 32), (12, 32), (16, 64), (24, 64), (32, 128)):
+            for b in all_builds:
+                p = inkling_fit.compute(b, vram, ram, 32768)
+                self.assertGreaterEqual(p["vram_gb"], 0.0, (vram, b, p))
+                self.assertGreaterEqual(p["ram_gb"], 0.0, (vram, b, p))
+                self.assertGreaterEqual(p["ssd_gb"], 0.0, (vram, b, p))
+                total_exp = round(p["vram_gb"] + p["ram_gb"] + p["ssd_gb"], 2)
+                self.assertAlmostEqual(total_exp, inkling_fit.BUILDS[b]["bodies_gb"], delta=0.03, msg=(vram, b, p))
+                if vram == 32:
+                    self.assertTrue(p["full_vram"], (vram, b, p))
+                if vram == 16 and b in ("SQ-15", "UD-Q8_K_XL", "UD-Q4_K_XL", "UD-Q4_K_M", "UD-IQ4_XS", "UD-Q3_K_XL"):
+                    self.assertFalse(p["full_vram"], (vram, b, p))
+                    self.assertEqual(p["ssd_gb"], 0.0, (vram, b, p))
+                if vram == 16 and b in ("SQ-10", "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-IQ2_XXS", "UD-IQ1_M", "UD-IQ1_S"):
+                    self.assertTrue(p["full_vram"], (vram, b, p))
+                if vram == 24 and b == "UD-Q8_K_XL":
+                    self.assertFalse(p["full_vram"], (vram, b, p))
+                    self.assertEqual(p["ssd_gb"], 0.0, (vram, b, p))
+                if vram == 24 and b == "UD-Q4_K_XL":
+                    self.assertTrue(p["full_vram"], (vram, b, p))
+
+        # Unified tiers: Mac Metal (16/24/36/48/64/128), Strix Halo (96/128), DGX Spark (128)
+        for pool in (16, 24, 36, 48, 64, 96, 128):
+            for b in all_builds:
+                p = inkling_fit.compute_unified(b, pool, 32768)
+                self.assertGreaterEqual(p["vram_gb"], 0.0, (pool, b, p))
+                self.assertEqual(p["ram_gb"], 0.0)
+                if pool >= 36:
+                    self.assertTrue(p["full_vram"], (pool, b, p))
+                elif pool == 24 and b in ("SQ-15", "SQ-10", "UD-Q4_K_XL", "UD-Q4_K_M", "UD-IQ4_XS", "UD-Q3_K_XL", "UD-IQ3_XXS", "UD-Q2_K_XL", "UD-IQ2_XXS", "UD-IQ1_M", "UD-IQ1_S"):
+                    self.assertTrue(p["full_vram"], (pool, b, p))
+                elif pool == 16 and b in ("SQ-10", "UD-Q2_K_XL", "UD-IQ2_XXS", "UD-IQ1_M", "UD-IQ1_S"):
+                    self.assertTrue(p["full_vram"], (pool, b, p))
 
     def test_kv_cache_scales_for_parallel_1_to_64(self):
         k1 = inkling_fit.kv_cache_gb(32768, parallel=1)

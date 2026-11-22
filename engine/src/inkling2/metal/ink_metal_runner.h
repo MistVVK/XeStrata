@@ -1627,8 +1627,9 @@ struct InkMetalRunner {
             // Router (exact FP32!) + Top-8 (+ fused M==1 moe_plan -> kills 48 barriers!) + MoE
             push_trunk_linear(ds, p + ".mlp.gate.weight", mtl::Arg::B(b_mlp_in), mtl::Arg::B(b_r_logits), M, -1, true, true);
             const size_t ex_off = (size_t)ip * c.n_experts * sizeof(InkExpertDev);
+            const bool layer_has_gguf = (((layer_gu_mask[ip] | layer_dn_mask[ip]) & (1u << FMT_GGUF_RAW)) != 0);
             const int mpp_moe_min_m = is_apple10 ? 10 : 16;
-            if (use_mpp && M >= mpp_moe_min_m) {
+            if (use_mpp && M >= mpp_moe_min_m && !layer_has_gguf) {
                 {
                     mtl::Dispatch d;
                     d.p = &p_router_topk8; d.grid[0] = (uint32_t)M; d.tg[0] = 128;
@@ -1660,64 +1661,72 @@ struct InkMetalRunner {
                 if (allow_128) {
                     mtl::Dispatch d128;
                     d128.p = &p_mpp_moe_gu_dir[gu_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
-                    d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                 mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_128)};
+                    d128.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                 mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_128),
+                                 mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d128));
                 }
                 {
                     mtl::Dispatch d64;
                     d64.barrier = !allow_128;
                     d64.p = &p_mpp_moe_gu_dir[gu_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
-                    d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_64)};
+                    d64.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_64),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d64));
                 }
                 {
                     mtl::Dispatch d32;
                     d32.barrier = false;
                     d32.p = &p_mpp_moe_gu_dir[gu_ci][1]; d32.ind_off = 13 * sizeof(uint32_t); d32.tg[0] = 128; d32.indirect = &b_mpp_meta;
-                    d32.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_32)};
+                    d32.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_32),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d32));
                 }
                 {
                     mtl::Dispatch d16;
                     d16.barrier = false;
                     d16.p = &p_mpp_moe_gu_dir[gu_ci][0]; d16.ind_off = 16 * sizeof(uint32_t); d16.tg[0] = 128; d16.indirect = &b_mpp_meta;
-                    d16.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_16)};
+                    d16.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_xs), mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_tiles_16),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d16));
                 }
                 // All 4 w2 buckets (128, 64, 32, 16) write disjoint rows of YE -> run 100% CONCURRENTLY!
                 if (allow_128) {
                     mtl::Dispatch d128;
                     d128.p = &p_mpp_moe_dn_dir[dn_ci][3]; d128.ind_off = 7 * sizeof(uint32_t); d128.tg[0] = 128; d128.indirect = &b_mpp_meta;
-                    d128.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                 mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_128)};
+                    d128.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                 mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_128),
+                                 mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d128));
                 }
                 {
                     mtl::Dispatch d64;
                     d64.barrier = !allow_128;
                     d64.p = &p_mpp_moe_dn_dir[dn_ci][2]; d64.ind_off = 10 * sizeof(uint32_t); d64.tg[0] = 128; d64.indirect = &b_mpp_meta;
-                    d64.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_64)};
+                    d64.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_64),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d64));
                 }
                 {
                     mtl::Dispatch d32;
                     d32.barrier = false;
                     d32.p = &p_mpp_moe_dn_dir[dn_ci][1]; d32.ind_off = 13 * sizeof(uint32_t); d32.tg[0] = 128; d32.indirect = &b_mpp_meta;
-                    d32.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_32)};
+                    d32.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_32),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d32));
                 }
                 {
                     mtl::Dispatch d16;
                     d16.barrier = false;
                     d16.p = &p_mpp_moe_dn_dir[dn_ci][0]; d16.ind_off = 16 * sizeof(uint32_t); d16.tg[0] = 128; d16.indirect = &b_mpp_meta;
-                    d16.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off),
-                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_16)};
+                    d16.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off),
+                                mtl::Arg::B(b_mpp_hs), mtl::Arg::B(b_mpp_ye), mtl::Arg::B(b_mpp_tiles_16),
+                                mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                     ds.push_back(std::move(d16));
                 }
                 {
@@ -1780,9 +1789,10 @@ struct InkMetalRunner {
                             : (layer_homog_gu[ip] == 16) ? &p_moe_gu_mm_mx8 : &p_moe_gu_mm_gen;
                         d.ind_off = 8 * sizeof(uint32_t);
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
-                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
+                        d.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
                                   mtl::Arg::B(b_moe_tiles), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h),
+                                  mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                         ds.push_back(std::move(d));
                     }
                     {
@@ -1791,9 +1801,10 @@ struct InkMetalRunner {
                             : (layer_homog_dn[ip] == 16) ? &p_moe_dn_mm_mx8 : &p_moe_dn_mm_gen;
                         d.ind_off = 8 * sizeof(uint32_t);
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
-                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
+                        d.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
                                   mtl::Arg::B(b_moe_tiles), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp),
+                                  mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                         ds.push_back(std::move(d));
                     }
                 } else {
@@ -1810,9 +1821,10 @@ struct InkMetalRunner {
                         else if ((layer_gu_mask[ip] & ~kSk23Mask) == 0) { d.p = &p_moe_gu_sk23; d.ind_off = 2 * sizeof(uint32_t); }
                         else                               { d.p = &p_moe_gu;      d.ind_off = 2 * sizeof(uint32_t); }
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
-                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
+                        d.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_mlp_in),
                                   mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h)};
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h),
+                                  mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                         ds.push_back(std::move(d));
                     }
                     {
@@ -1826,9 +1838,10 @@ struct InkMetalRunner {
                         else if ((layer_dn_mask[ip] & ~kSk23Mask) == 0) { d.p = &p_moe_dn_sk23; d.ind_off = 5 * sizeof(uint32_t); }
                         else                               { d.p = &p_moe_dn;      d.ind_off = 2 * sizeof(uint32_t); }
                         d.tg[0] = 256; d.indirect = &b_moe_meta;
-                        d.args = {mod->sec4_arg(), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
+                        d.args = {mod->sec4_arg(0), mtl::Arg::B(mod->expert_dev_buf, ex_off), mtl::Arg::B(b_topk_w),
                                   mtl::Arg::B(b_moe_uexp), mtl::Arg::B(b_moe_uoff), mtl::Arg::B(b_moe_ucnt),
-                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp)};
+                                  mtl::Arg::B(b_moe_pairs), mtl::Arg::B(b_moe_meta), mtl::Arg::B(b_moe_h), mtl::Arg::B(b_moe_yp),
+                                  mod->sec4_arg(1), mod->sec4_arg(2), mod->sec4_arg(3)};
                         ds.push_back(std::move(d));
                     }
                 }

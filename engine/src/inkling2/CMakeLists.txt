@@ -31,21 +31,73 @@ if(NOT TARGET strata_zstd_dec)
   target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
 endif()
 
+# Standalone ISA-dispatched strata_quant library if not already defined by root engine/CMakeLists.txt
+set(_ink_cpu_x86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64|i[3-6]86|x86|X86)$" OR NOT CMAKE_SYSTEM_PROCESSOR)
+  set(_ink_cpu_x86 ON)
+endif()
+if(NOT TARGET strata_quant)
+  set(_sq "${_ink_engine_root}")
+  add_library(strata_quant STATIC
+    ${_sq}/src/quant/types.cpp
+    ${_sq}/src/quant/isa.cpp
+    ${_sq}/src/quant/dispatch.cpp
+    ${_sq}/src/quant/selfcheck.cpp
+    ${_sq}/src/quant/act_ref.cpp
+    ${_sq}/src/quant/dot_generic.cpp
+    ${_sq}/src/quant/dequant.cpp
+    ${_sq}/src/quant/sk_codecs.cpp
+  )
+  target_include_directories(strata_quant PUBLIC ${_sq}/include PRIVATE ${_sq}/src/quant)
+  if(NOT MSVC)
+    set_source_files_properties(${_sq}/src/quant/dot_generic.cpp ${_sq}/src/quant/act_ref.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  endif()
+  if(_ink_cpu_x86)
+    target_sources(strata_quant PRIVATE
+      ${_sq}/src/quant/x86/dot_avx2.cpp
+      ${_sq}/src/quant/x86/act_avx2.cpp
+      ${_sq}/src/quant/x86/dot_avx.cpp
+      ${_sq}/src/quant/x86/act_avx.cpp
+      ${_sq}/src/quant/x86/dot_avx512.cpp
+    )
+    target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
+    if(MSVC)
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
+      else()
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+      endif()
+    else()
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=fast")
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-ffp-contract=fast")
+      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx2;-mfma;-mf16c;-ffp-contract=fast")
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    target_sources(strata_quant PRIVATE ${_sq}/src/quant/arm/dot_neon.cpp ${_sq}/src/quant/arm/act_neon.cpp)
+    target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_ARM_TIERS=1)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      set_source_files_properties(${_sq}/src/quant/arm/dot_neon.cpp ${_sq}/src/quant/arm/act_neon.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16+i8mm;-ffp-contract=fast")
+    else()
+      set_source_files_properties(${_sq}/src/quant/arm/dot_neon.cpp ${_sq}/src/quant/arm/act_neon.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+fp16+i8mm")
+    endif()
+  endif()
+endif()
+
 # Core Inkling-2-Mini + .strata v1.1 + Official HF safetensors + Community GGUF static library
 add_library(strata_inkling_core STATIC
   ${_ink_engine_root}/src/artifact/strata_reader.cpp
-  ${_ink_engine_root}/src/quant/sk_codecs.cpp
-  ${_ink_engine_root}/src/quant/dequant.cpp
-  ${_ink_engine_root}/src/quant/types.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/inkling2_loop.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/ink_cpu_backend.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ink_host_avx2.cpp
 )
 target_include_directories(strata_inkling_core PUBLIC
   ${_ink_engine_root}/include
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${_ink_engine_root}/third_party/stb
 )
-target_link_libraries(strata_inkling_core PUBLIC strata_zstd_dec)
+target_link_libraries(strata_inkling_core PUBLIC strata_zstd_dec strata_quant)
 if(WIN32)
   target_compile_definitions(strata_inkling_core PUBLIC _CRT_SECURE_NO_WARNINGS)
 endif()
@@ -58,12 +110,32 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(strata_inkling_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
-# Enable AVX2/AVX512 on x86_64 when appropriate (portable builds keep AVX2 floor)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64)$" OR NOT CMAKE_SYSTEM_PROCESSOR)
+# #6618: Keep base startup/control TUs strictly free of AVX2/FMA/F16C so CPUs without AVX2
+# (e.g. Ivy Bridge Xeon E5 v2) never SIGILL; compile ONLY ink_host_avx2.cpp with AVX2+FMA
+# and dispatch at runtime via strata::quant::caps().avx2 (also honoring STRATA_ISA_FLOOR)!
+if(_ink_cpu_x86)
   if(MSVC)
-    target_compile_options(strata_inkling_core PRIVATE /O2 /arch:AVX2)
+    target_compile_options(strata_inkling_core PRIVATE /O2)
+    if(STRATA_ISA_FLOOR STREQUAL "avx")
+      target_compile_options(strata_inkling_core PRIVATE /arch:AVX)
+    endif()
+    if(NOT STRATA_ISA_FLOOR STREQUAL "none" AND NOT STRATA_ISA_FLOOR STREQUAL "avx")
+      set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ink_host_avx2.cpp PROPERTIES
+        COMPILE_OPTIONS "/arch:AVX2"
+        COMPILE_DEFINITIONS "INK_BUILD_HOST_AVX2=1")
+    endif()
   else()
-    target_compile_options(strata_inkling_core PRIVATE -O3 -mavx2 -mfma -mf16c)
+    target_compile_options(strata_inkling_core PRIVATE -O3)
+    if(STRATA_ISA_FLOOR STREQUAL "avx")
+      target_compile_options(strata_inkling_core PRIVATE -mavx -mno-avx2 -mno-fma -mno-f16c)
+    elseif(STRATA_ISA_FLOOR STREQUAL "none")
+      target_compile_options(strata_inkling_core PRIVATE -msse4.2 -mpopcnt -mno-avx -mno-avx2 -mno-fma -mno-f16c)
+    else()
+      target_compile_options(strata_inkling_core PRIVATE -msse4.2 -mpopcnt -mno-avx -mno-avx2 -mno-fma -mno-f16c)
+      set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ink_host_avx2.cpp PROPERTIES
+        COMPILE_OPTIONS "-O3;-mavx2;-mfma;-mf16c"
+        COMPILE_DEFINITIONS "INK_BUILD_HOST_AVX2=1")
+    endif()
   endif()
 endif()
 

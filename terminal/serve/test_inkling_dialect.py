@@ -160,7 +160,152 @@ class TestInklingDialect(unittest.TestCase):
         self.assertIn("--parallel", built)
         self.assertEqual(built[built.index("--parallel") + 1], "32")
         self.assertIn("--gpus", built)
-        self.assertEqual(built[built.index("--gpus") + 1], "2")
+        self.assertEqual(built[built.index("--gpus") + 1], "1,0")
+        self.assertIn("--layer-split", built)
+        self.assertEqual(built[built.index("--layer-split") + 1], "auto")
+
+    def test_multigpu_main_first_ordinals_and_stale_vram_strip_6631(self):
+        base = ["--native", "Inkling-2-Mini-SQ-15.strata", "--max-context", "32768"]
+        # 5080 (GPU 0) = Main, 5070 Ti (GPU 1) = Helper -> child_env sets CUDA_VISIBLE_DEVICES=1,0 ->
+        # local ordinal 1 is Main (5080) and local 0 is Helper (5070 Ti), so --gpus MUST be 1,0!
+        cfg_roles = {
+            "arch": "inkling2_loop",
+            "backend": "cuda",
+            "gpu_roles": {"0": "main", "1": "helper"},
+            "args": base + ["--vram-experts-gb", "10.50", "--ram-experts-gb", "1.78"],
+        }
+        got = inkling_kind.engine_args(cfg_roles, announce=False)
+        self.assertEqual(got[got.index("--gpus") + 1], "1,0")
+        self.assertEqual(got[got.index("--layer-split") + 1], "auto")
+        self.assertNotIn("--vram-experts-gb", got)
+        self.assertNotIn("--ram-experts-gb", got)
+
+        # Bare count --gpus 2 written by setup is rewritten to Main-first 1,0 unless explicitly in user_args
+        cfg_setup = {
+            "arch": "inkling2_loop",
+            "backend": "cuda",
+            "gpu_roles": {"0": "main", "1": "helper"},
+            "args": base + ["--gpus", "2"],
+        }
+        got_setup = inkling_kind.engine_args(cfg_setup, announce=False)
+        self.assertEqual(got_setup[got_setup.index("--gpus") + 1], "1,0")
+
+        # Explicit user_args --gpus / --vram-experts-gb are respected verbatim
+        cfg_user = {
+            "arch": "inkling2_loop",
+            "backend": "cuda",
+            "gpu": [0, 1],
+            "args": list(base),
+            "user_args": ["--gpus", "0,1", "--vram-experts-gb", "9.00"],
+        }
+        got_user = inkling_kind.engine_args(cfg_user, announce=False)
+        self.assertEqual(got_user[got_user.index("--gpus") + 1], "0,1")
+        self.assertIn("--vram-experts-gb", got_user)
+
+        # 3 & 4 CUDA GPUs emit Main-first local ordinals + --layer-split auto; HIP/SYCL cap at 2 GPUs (Main + last Helper)
+        for gpu_sel, bkd, want in (
+            ([0, 1, 2], "cuda", "2,0,1"),
+            ([0, 1, 2, 3], "cuda", "3,0,1,2"),
+            ([0, 1], "hip", "1,0"),
+            ([0, 1, 2], "hip", "2,1"),
+            ([0, 1], "sycl", "1,0"),
+        ):
+            c = {"arch": "inkling2_loop", "backend": bkd, "gpu": gpu_sel, "args": list(base)}
+            a = inkling_kind.engine_args(c, announce=False)
+            self.assertEqual(a[a.index("--gpus") + 1], want, (gpu_sel, bkd, a))
+            if bkd == "cuda":
+                self.assertEqual(a[a.index("--layer-split") + 1], "auto")
+            else:
+                self.assertNotIn("--layer-split", a)
+
+        # Explicit --ep-split keeps EP2 without injecting --layer-split auto
+        cfg_ep = {"arch": "inkling2_loop", "backend": "cuda", "gpu": [0, 1], "args": base + ["--ep-split", "0.5"]}
+        got_ep = inkling_kind.engine_args(cfg_ep, announce=False)
+        self.assertEqual(got_ep[got_ep.index("--gpus") + 1], "1,0")
+        self.assertNotIn("--layer-split", got_ep)
+
+    def test_dspark_drafting_off_flag_and_drafting_info_6633(self):
+        base = ["--native", "Inkling-2-Mini-SQ-20.strata", "--max-context", "32768"]
+        # drafting: "off" MUST emit --draft off so strata-inkling does not default to auto/dspark
+        got_off = inkling_kind.engine_args({"arch": "inkling2_loop", "drafting": "off", "args": list(base)}, announce=False)
+        self.assertIn("--draft", got_off)
+        self.assertEqual(got_off[got_off.index("--draft") + 1], "off")
+        self.assertEqual(inkling_kind.drafting_info(got_off, {"drafter": "dspark"}), {"drafting": "off", "drafting_note": ""})
+
+        # --draft dspark or INFO drafter=dspark reports drafting: "dspark"
+        got_on = base + ["--draft", "dspark"]
+        self.assertEqual(inkling_kind.drafting_info(got_on, {"drafter": "dspark"}), {"drafting": "dspark", "drafting_note": ""})
+        self.assertEqual(inkling_kind.drafting_info(base, {"drafter": "dspark"}), {"drafting": "dspark", "drafting_note": ""})
+        self.assertEqual(inkling_kind.drafting_info(base, {"drafter": "none"}), {"drafting": "off", "drafting_note": ""})
+
+    def test_finish_prompt_skips_hidden_thinking_for_plain_and_tool_turns_6612_6627(self):
+        base_prompt = (
+            "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+            "<|message_user|><|content_text|>Say hello in five words.<|end_message|>"
+        )
+        plain = inkling_dialect.finish_prompt(base_prompt, has_tools=False)
+        self.assertTrue(plain.endswith("<|message_model|><|content_text|>"))
+        # Idempotent
+        self.assertEqual(inkling_dialect.finish_prompt(plain, has_tools=False), plain)
+
+        # With tools: closes an empty thinking turn so model immediately chooses text or tool invocation
+        with_tools = inkling_dialect.finish_prompt(base_prompt, has_tools=True)
+        self.assertTrue(with_tools.endswith("<|message_model|><|content_thinking|><|end_message|>"))
+        self.assertEqual(inkling_dialect.finish_prompt(with_tools, has_tools=True), with_tools)
+
+        # Already ending with <|message_model|>
+        self.assertEqual(
+            inkling_dialect.finish_prompt(base_prompt + "<|message_model|>", has_tools=False),
+            base_prompt + "<|message_model|><|content_text|>",
+        )
+        self.assertEqual(
+            inkling_dialect.finish_prompt(base_prompt + "<|message_model|>", has_tools=True),
+            base_prompt + "<|message_model|><|content_thinking|><|end_message|>",
+        )
+        # Forced tool call leaves prompt untouched
+        self.assertEqual(inkling_dialect.finish_prompt(base_prompt, has_tools=True, forced=True), base_prompt)
+
+    def test_dialect_hardening_prevents_empty_replies_on_missing_tags_and_yaml_6620(self):
+        # 1. Model emits <|message_model|> followed directly by YAML/prose (omitting <|content_text|>):
+        # header state flushes on newline / close instead of discarding the entire reply!
+        yaml_reply = (
+            "<|message_model|>Her er problemerne i din docker-compose-fil:\n"
+            "```yaml\nservices:\n  db:\n    image: postgres:16\n```\n"
+            "<|end_message|><|content_model_end_sampling|>"
+        )
+        p = frontend.InklingOutputParser(tools=[
+            {"name": "search_web", "parameters": {"type": "object"}},
+            {"name": "fetch_article", "parameters": {"type": "object"}},
+        ])
+        evs = []
+        for i in range(0, len(yaml_reply), 4):
+            evs.extend(p.feed(yaml_reply[i:i + 4]))
+        evs.extend(p.finish())
+        content = "".join(ev.text for ev in evs if ev.kind == "content")
+        self.assertIn("postgres:16", content)
+        self.assertIn("Her er problemerne", content)
+
+        # 2. Short single-line reply with <|message_model|>...<|end_message|> (no <|content_text|>) still flushes
+        short_missing_tag = "<|message_model|>Hello world!<|end_message|>"
+        self.assertEqual(inkling_dialect.translate(short_missing_tag), "Hello world!")
+
+        # 3. Direct <|content_text|> transition out of <|content_thinking|> (omitting <|end_message|><|message_model|>)
+        direct_exit = (
+            "<|message_model|><|content_thinking|>internal plan"
+            "<|content_text|>Visible YAML answer.<|end_message|>"
+        )
+        self.assertEqual(inkling_dialect.translate(direct_exit), "Visible YAML answer.")
+
+        # 4. Truncated non-JSON inside <|content_invoke_tool_json|> on final=True releases text instead of bogus raw call
+        truncated_prose = "<|message_model|>search_web<|content_invoke_tool_json|>services:\n  db:\n    image: postgres:16"
+        d = inkling_dialect.InklingDialect()
+        out = d.feed(truncated_prose, final=True)
+        self.assertIn("postgres:16", out)
+        self.assertNotIn("<tool_call>", out)
+
+        # 5. Model continuing directly from finish_prompt's <|message_model|><|content_text|> prefill
+        prefilled_out = "Red<|end_message|><|content_model_end_sampling|>"
+        self.assertEqual(inkling_dialect.translate(prefilled_out), "Red")
 
 
 if __name__ == "__main__":

@@ -426,9 +426,12 @@ struct InkCudaModel {
                 for (int il = man.c.core_end; il < man.c.n_phys; ++il)
                     for (int r = 0; r < man.c.n_experts; ++r) order.push_back((uint16_t)(il * man.c.n_experts + r));
             }
-            // Reserve full headroom (runner + KV init + O(1) prefill + DSpark + WDDM floor + 192 MiB staging)!
+            // Reserve full headroom (runner + KV init + O(1) prefill + DSpark + WDDM floor + 2x pf_stage)!
+            size_t max_body_all = 0;
+            for (const auto& e : dir) max_body_all = std::max<size_t>(max_body_all, e.body_bytes);
+            const size_t pf_bytes = 2 * InkHybridEngine::pf_stage_size(max_body_all);
             const size_t hyb_post_res = std::max(reserve, (size_t)(1408ull << 20) + wddm_floor / 2);
-            const size_t hyb_reserve = hyb_post_res + (192ull << 20);
+            const size_t hyb_reserve = hyb_post_res + pf_bytes + (64ull << 20);
             size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             if (user_vram_cap < vram_budget) vram_budget = user_vram_cap;
             const size_t ram_cap = safe_host_ram_cap(ram_experts_gb, ssd_experts);
@@ -451,6 +454,15 @@ struct InkCudaModel {
                 } else {
                     ++n_ssd_experts;
                     ++n_host_experts;
+                }
+            }
+            // #6617: Allocate ping-pong prefill staging buffers BEFORE d_sec4 and the pinned host arena so
+            // pinned-RAM VRAM page tables can never starve pf_buf to 0 MB and silently skip host experts!
+            if (n_host_experts > 0) {
+                hybrid.start_workers(cpu_threads);
+                if (!hybrid.alloc_pf_stage(max_exp_bytes)) {
+                    err = "not enough free VRAM for the 2x prefill staging buffers required by host experts; close other GPU apps or use a smaller pack";
+                    return false;
                 }
             }
             INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
@@ -1170,8 +1182,11 @@ struct InkCudaModel {
         const size_t user_vram_cap = (vram_experts_gb >= 0.0)
             ? static_cast<size_t>(vram_experts_gb * 1073741824.0)
             : static_cast<size_t>(-1);
+        size_t max_body_all = 0;
+        for (int di = 0; di < n_total; ++di) max_body_all = std::max<size_t>(max_body_all, eff_bytes[di]);
+        const size_t pf_bytes = 2 * InkHybridEngine::pf_stage_size(max_body_all);
         const size_t hyb_post_res = std::max(res0, (size_t)(1664ull << 20));
-        const size_t hyb_bud0 = (vf0 > hyb_post_res + (256ull << 20)) ? (vf0 - hyb_post_res - (256ull << 20)) : 0;
+        const size_t hyb_bud0 = (vf0 > hyb_post_res + pf_bytes + (64ull << 20)) ? (vf0 - hyb_post_res - pf_bytes - (64ull << 20)) : 0;
 
         n_vram_experts = 0; n_peer_experts = 0; n_host_experts = 0;
         for (int s = 0; s < kMaxStages; ++s) { stage_sec4_bytes[s] = 0; stage_n_experts[s] = 0; }
@@ -1194,10 +1209,7 @@ struct InkCudaModel {
                     stage_n_experts[s]++;
                     if (s == 0) ++n_vram_experts; else ++n_peer_experts;
                 } else {
-                    if (dir[di].gu_code_id == FMT_GGUF_RAW) {
-                        need_sf4_repack[di] = 1;
-                        eff_bytes[di] = sf4_body_const;
-                    }
+                    // Preserve lossless native FMT_GGUF_RAW blocks in host RAM (zero SF4 quality loss & zero repack startup delay!)
                     const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
                     target_tier[di] = 2; uh += hb; ++n_host_experts;
                     max_exp_b = std::max(max_exp_b, eff_bytes[di]);
@@ -1232,10 +1244,7 @@ struct InkCudaModel {
                 } else if (u0 + eb <= cap0) {
                     target_tier[di] = 0; u0 += eb; ++n_vram_experts;
                 } else {
-                    if (dir[di].gu_code_id == FMT_GGUF_RAW) {
-                        need_sf4_repack[di] = 1;
-                        eff_bytes[di] = sf4_body_const;
-                    }
+                    // Preserve lossless native FMT_GGUF_RAW blocks in host RAM (evaluated via strata::quant SIMD & GPU DP4A staging!)
                     const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
                     target_tier[di] = 2; uh += hb; ++n_host_experts;
                     max_exp_b = std::max(max_exp_b, eff_bytes[di]);
@@ -1255,10 +1264,6 @@ struct InkCudaModel {
                             const int di = il * E + r;
                             if (target_tier[di] == 1) {
                                 u1 -= eff_bytes[di]; --n_peer_experts;
-                                if (dir[di].gu_code_id == FMT_GGUF_RAW) {
-                                    need_sf4_repack[di] = 1;
-                                    eff_bytes[di] = sf4_body_const;
-                                }
                                 const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
                                 target_tier[di] = 2; uh += hb; ++n_host_experts;
                                 max_exp_b = std::max(max_exp_b, eff_bytes[di]);
@@ -1269,8 +1274,15 @@ struct InkCudaModel {
             }
         }
 
-        // Allocate GPU stage/EP arenas and optional Host hybrid arena
+        // #6617: Allocate ping-pong prefill staging buffers BEFORE d_sec4 and host pinned arena!
         INK_CK(cudaSetDevice(primary_gpu));
+        if (n_host_experts > 0) {
+            hybrid.start_workers(cpu_threads);
+            if (!hybrid.alloc_pf_stage(max_exp_b)) {
+                err = "not enough free VRAM for the 2x prefill staging buffers required by host experts; close other GPU apps or use a smaller quant";
+                return false;
+            }
+        }
         sec4_bytes = u0;
         INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, sec4_bytes)));
         stage_d_sec4[0] = d_sec4;

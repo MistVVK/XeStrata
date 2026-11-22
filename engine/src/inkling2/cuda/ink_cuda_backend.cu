@@ -77,6 +77,8 @@ public:
 
     int effective_max_ctx() const override { return initialized_ ? eff_max_ctx_ : 0; }
 
+    bool dspark_ready() const override { return initialized_ && dspark_ && dspark_->ready; }
+
     std::string device_info() const override { return dev_info_; }
 
     BackendStats stats() const override {
@@ -252,6 +254,7 @@ public:
         snap_active_.assign(max_slots_, false);
         snap_p0_.assign(max_slots_, 0);
         snap_M_.assign(max_slots_, 0);
+        prompt_ckpts_.assign(max_slots_, PromptCkpt{});
         initialized_ = true;
         return true;
     }
@@ -270,6 +273,7 @@ public:
         if (slot >= 0 && slot < max_slots_) {
             slot_alloc_[slot] = false;
             snap_active_[slot] = false;
+            if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot] = PromptCkpt{};
             if (slot == 0) tree_snap_ready_ = false;
         }
     }
@@ -278,7 +282,173 @@ public:
         if (!initialized_ || slot < 0 || slot >= max_slots_) return;
         runner_->reset_slot(slot);
         snap_active_[slot] = false;
+        if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot].valid = false;
         if (slot == 0) { dspark_slot_ = -1; tree_snap_ready_ = false; }
+    }
+
+    // #6627: Save/restore slot's ShortConv (3.83 MB) + 40 SWA KV ring windows (<=160 MiB in host RAM) + DSpark SWA KV
+    // so multi-turn chats and exact repeats reuse the full prior prompt even if hidden thinking or trailing tokens diverged!
+    bool save_prompt_checkpoint(int slot, int seq_len) override {
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return false;
+        if (seq_len <= 0 || max_slots_ > 8) return false;
+        auto& ck = prompt_ckpts_[slot];
+        ck.valid = false;
+        ck.seq_len = seq_len;
+        // 1. Copy 48-visit ShortConv state via d_sconv_snap_ -> host RAM (3.83 MB)
+        const size_t sc_elems = (size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh;
+        ck.sconv.resize(sc_elems);
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
+        INK_CK(cudaMemcpyAsync(ck.sconv.data(), d_sconv_snap_, sc_elems * sizeof(float), cudaMemcpyDeviceToHost, runner_->st));
+        // 2. Copy active SWA KV ring window [start_pos .. seq_len-1] for all 40 SWA visits
+        const int start_pos = std::max(0, seq_len - strata::ink::kInkSwaWin);
+        const int n_pos = seq_len - start_pos;
+        ck.swa_start = start_pos;
+        ck.swa_len = n_pos;
+        ck.swa_k.clear(); ck.swa_v.clear(); ck.swa_ksc.clear(); ck.swa_vsc.clear();
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const auto& kv = runner_->kv_desc[v];
+            if (!kv.is_swa) continue;
+            const int cap = kv.cap_pos;
+            const int p0 = start_pos % cap;
+            const int seg1 = std::min(n_pos, cap - p0);
+            const int seg2 = n_pos - seg1;
+            const size_t slot_base = (size_t)slot * cap;
+            auto copy_d2h = [&](const void* base, size_t elem_b, size_t stride_elems, std::vector<uint8_t>& dst) {
+                const size_t off = dst.size();
+                dst.resize(off + (size_t)n_pos * stride_elems * elem_b);
+                const uint8_t* bp = reinterpret_cast<const uint8_t*>(base);
+                INK_CK(cudaMemcpyAsync(dst.data() + off, bp + (slot_base + p0) * stride_elems * elem_b,
+                                       (size_t)seg1 * stride_elems * elem_b, cudaMemcpyDeviceToHost, runner_->st));
+                if (seg2 > 0) {
+                    INK_CK(cudaMemcpyAsync(dst.data() + off + (size_t)seg1 * stride_elems * elem_b,
+                                           bp + slot_base * stride_elems * elem_b,
+                                           (size_t)seg2 * stride_elems * elem_b, cudaMemcpyDeviceToHost, runner_->st));
+                }
+            };
+            if (kv.kv_fmt == 0) {
+                copy_d2h(kv.k_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_k);
+                copy_d2h(kv.v_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_v);
+            } else {
+                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : strata::ink::kInkKVDim;
+                copy_d2h(kv.k_f8, 1, strata::ink::kInkKVDim, ck.swa_k);
+                copy_d2h(kv.v_f8, 1, v_stride, ck.swa_v);
+                copy_d2h(kv.k_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_ksc);
+                copy_d2h(kv.v_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_vsc);
+            }
+        }
+        // 3. Save DSpark SWA-1025 context KV (layers 0 & 2) + f_rnn row at seq_len-1 for slot 0
+        ck.has_dspark = false;
+        if (slot == 0 && dspark_ && dspark_->ready && dspark_slot_ == 0) {
+            ck.dspark_k.clear(); ck.dspark_v.clear();
+            for (int il = 0; il < 3; ++il) {
+                if (model_.man.c.dspark_is_swa[il] == 0) continue;
+                const int cap = dspark_->ctx_cap[il];
+                const int s0 = std::max(0, seq_len - model_.man.c.dspark_swa_win);
+                const int np = seq_len - s0;
+                const int p0 = s0 % cap;
+                const int seg1 = std::min(np, cap - p0);
+                const int seg2 = np - seg1;
+                auto copy_ds = [&](const __half* src, std::vector<uint8_t>& dst) {
+                    const size_t row_b = (size_t)strata::ink::kInkKVDim * sizeof(__half);
+                    const size_t off = dst.size();
+                    dst.resize(off + (size_t)np * row_b);
+                    const uint8_t* bp = reinterpret_cast<const uint8_t*>(src);
+                    INK_CK(cudaMemcpyAsync(dst.data() + off, bp + (size_t)p0 * row_b, (size_t)seg1 * row_b, cudaMemcpyDeviceToHost, runner_->st));
+                    if (seg2 > 0) {
+                        INK_CK(cudaMemcpyAsync(dst.data() + off + (size_t)seg1 * row_b, bp, (size_t)seg2 * row_b, cudaMemcpyDeviceToHost, runner_->st));
+                    }
+                };
+                copy_ds(dspark_->d_ctx_k[il], ck.dspark_k);
+                copy_ds(dspark_->d_ctx_v[il], ck.dspark_v);
+            }
+            ck.dspark_frnn.resize(strata::ink::kInkHidden);
+            const int fr_slot = (seq_len - 1) % dspark_->frnn_cap;
+            INK_CK(cudaMemcpyAsync(ck.dspark_frnn.data(), dspark_->d_f_rnn + (size_t)fr_slot * strata::ink::kInkHidden,
+                                   (size_t)strata::ink::kInkHidden * sizeof(float), cudaMemcpyDeviceToHost, runner_->st));
+            ck.has_dspark = true;
+        }
+        INK_CK(cudaStreamSynchronize(runner_->st));
+        ck.valid = true;
+        return true;
+    }
+
+    bool restore_prompt_checkpoint(int slot, int seq_len) override {
+        if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return false;
+        if (slot >= (int)prompt_ckpts_.size()) return false;
+        const auto& ck = prompt_ckpts_[slot];
+        if (!ck.valid || ck.seq_len != seq_len) return false;
+        snap_active_[slot] = false;
+        if (slot == 0) tree_snap_ready_ = false;
+        // 1. Restore ShortConv state
+        const size_t sc_elems = (size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh;
+        INK_CK(cudaMemcpyAsync(d_sconv_snap_, ck.sconv.data(), sc_elems * sizeof(float), cudaMemcpyHostToDevice, runner_->st));
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, false);
+        // 2. Restore 40 SWA KV ring windows (Global KV is append-only and already intact at [0..seq_len-1]!)
+        size_t ok = 0, ov = 0, oks = 0, ovs = 0;
+        const int start_pos = ck.swa_start;
+        const int n_pos = ck.swa_len;
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const auto& kv = runner_->kv_desc[v];
+            if (!kv.is_swa) continue;
+            const int cap = kv.cap_pos;
+            const int p0 = start_pos % cap;
+            const int seg1 = std::min(n_pos, cap - p0);
+            const int seg2 = n_pos - seg1;
+            const size_t slot_base = (size_t)slot * cap;
+            auto copy_h2d = [&](void* base, size_t elem_b, size_t stride_elems, const std::vector<uint8_t>& src, size_t& off) {
+                uint8_t* bp = reinterpret_cast<uint8_t*>(base);
+                INK_CK(cudaMemcpyAsync(bp + (slot_base + p0) * stride_elems * elem_b, src.data() + off,
+                                       (size_t)seg1 * stride_elems * elem_b, cudaMemcpyHostToDevice, runner_->st));
+                if (seg2 > 0) {
+                    INK_CK(cudaMemcpyAsync(bp + slot_base * stride_elems * elem_b,
+                                           src.data() + off + (size_t)seg1 * stride_elems * elem_b,
+                                           (size_t)seg2 * stride_elems * elem_b, cudaMemcpyHostToDevice, runner_->st));
+                }
+                off += (size_t)n_pos * stride_elems * elem_b;
+            };
+            if (kv.kv_fmt == 0) {
+                copy_h2d(kv.k_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_k, ok);
+                copy_h2d(kv.v_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_v, ov);
+            } else {
+                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : strata::ink::kInkKVDim;
+                copy_h2d(kv.k_f8, 1, strata::ink::kInkKVDim, ck.swa_k, ok);
+                copy_h2d(kv.v_f8, 1, v_stride, ck.swa_v, ov);
+                copy_h2d(kv.k_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_ksc, oks);
+                copy_h2d(kv.v_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_vsc, ovs);
+            }
+        }
+        // 3. Restore DSpark SWA-1025 context KV + f_rnn row for slot 0
+        if (slot == 0 && ck.has_dspark && dspark_ && dspark_->ready) {
+            size_t dk_o = 0, dv_o = 0;
+            for (int il = 0; il < 3; ++il) {
+                if (model_.man.c.dspark_is_swa[il] == 0) continue;
+                const int cap = dspark_->ctx_cap[il];
+                const int s0 = std::max(0, seq_len - model_.man.c.dspark_swa_win);
+                const int np = seq_len - s0;
+                const int p0 = s0 % cap;
+                const int seg1 = std::min(np, cap - p0);
+                const int seg2 = np - seg1;
+                auto copy_ds_h2d = [&](__half* dst, const std::vector<uint8_t>& src, size_t& off) {
+                    const size_t row_b = (size_t)strata::ink::kInkKVDim * sizeof(__half);
+                    uint8_t* bp = reinterpret_cast<uint8_t*>(dst);
+                    INK_CK(cudaMemcpyAsync(bp + (size_t)p0 * row_b, src.data() + off, (size_t)seg1 * row_b, cudaMemcpyHostToDevice, runner_->st));
+                    if (seg2 > 0) {
+                        INK_CK(cudaMemcpyAsync(bp, src.data() + off + (size_t)seg1 * row_b, (size_t)seg2 * row_b, cudaMemcpyHostToDevice, runner_->st));
+                    }
+                    off += (size_t)np * row_b;
+                };
+                copy_ds_h2d(dspark_->d_ctx_k[il], ck.dspark_k, dk_o);
+                copy_ds_h2d(dspark_->d_ctx_v[il], ck.dspark_v, dv_o);
+            }
+            const int fr_slot = (seq_len - 1) % dspark_->frnn_cap;
+            INK_CK(cudaMemcpyAsync(dspark_->d_f_rnn + (size_t)fr_slot * strata::ink::kInkHidden, ck.dspark_frnn.data(),
+                                   (size_t)strata::ink::kInkHidden * sizeof(float), cudaMemcpyHostToDevice, runner_->st));
+            dspark_slot_ = 0;
+        }
+        INK_CK(cudaStreamSynchronize(runner_->st));
+        return true;
     }
 
     void snapshot_slot(int slot) override {
@@ -692,8 +862,21 @@ private:
         if (d_sel_idx_)    { cudaFree(d_sel_idx_); d_sel_idx_ = nullptr; }
         if (h_logits_pin_) { cudaFreeHost(h_logits_pin_); h_logits_pin_ = nullptr; h_logits_cap_ = 0; }
         model_.free_all();
+        prompt_ckpts_.clear();
         initialized_ = false;
     }
+
+    struct PromptCkpt {
+        bool valid = false;
+        bool has_dspark = false;
+        int seq_len = 0;
+        int swa_start = 0;
+        int swa_len = 0;
+        std::vector<float> sconv;
+        std::vector<uint8_t> swa_k, swa_v, swa_ksc, swa_vsc;
+        std::vector<uint8_t> dspark_k, dspark_v;
+        std::vector<float> dspark_frnn;
+    };
 
     bool initialized_ = false;
     int gpu_id_ = 0;
@@ -715,6 +898,7 @@ private:
     std::vector<bool> snap_active_;
     std::vector<int> snap_p0_;
     std::vector<int> snap_M_;
+    std::vector<PromptCkpt> prompt_ckpts_;
     bool tree_snap_ready_ = false;
     int tree_snap_p0_ = 0;
     int tree_snap_M_ = 0;

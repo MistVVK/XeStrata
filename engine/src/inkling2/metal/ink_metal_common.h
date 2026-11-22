@@ -41,11 +41,23 @@ enum InkFmt : int32_t {
     FMT_S8    = 8,
     FMT_SF4   = 15,   // Lossless NVFP4 (E2M1 + F8_E4M3/16w + 4x F32 header)
     FMT_MX8   = 16,   // Lossless MXFP8 (F8_E4M3 + UE8M0/32w)
+    FMT_GGUF_RAW = 20,// Native lossless GGUF quant blocks (Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS/IQ3_XXS/IQ4_NL/Q4_0/Q3_K/Q2_K/MXFP4/BF16/F16/F32)
     FMT_Q8ROW = 100,  // [N float32 scales][N * K int8]
     FMT_F32   = 101,
     FMT_BF16  = 102,
     FMT_F16   = 103,
 };
+
+inline bool gguf_type_has_metal_kernel(uint32_t t) noexcept {
+    switch (t) {
+        case 0: case 1: case 2: case 8:
+        case 10: case 11: case 12: case 13: case 14:
+        case 18: case 20: case 23: case 30: case 39:
+            return true;
+        default:
+            return false;
+    }
+}
 
 inline int fmt_from_name(const std::string& s) {
     if (s == "F32" || s == "float32") return FMT_F32;
@@ -78,6 +90,7 @@ inline const char* fmt_name(int fmt) {
         case FMT_S8:    return "S8_K";
         case FMT_SF4:   return "SF4";
         case FMT_MX8:   return "MX8";
+        case FMT_GGUF_RAW: return "GGUF_RAW";
         case FMT_Q8ROW: return "Q8_ROW";
         case FMT_F32:   return "F32";
         case FMT_BF16:  return "BF16";
@@ -184,11 +197,11 @@ struct InkManifest {
 
 // GPU-side expert descriptor matching ink_metal_codecs.metal (16 bytes)
 struct InkExpertDev {
-    uint64_t body_off;
+    uint64_t body_off;   // byte offset inside sec4_bufs[chunk_idx]
     uint32_t dn_off;
     uint8_t gu_code;
     uint8_t dn_code;
-    uint16_t pad;
+    uint16_t chunk_idx;  // 0..kMaxSec4Chunks-1 (multi-buffer sec4 index for >maxBufferLength models!)
 };
 static_assert(sizeof(InkExpertDev) == 16, "InkExpertDev must be 16 B");
 
@@ -314,7 +327,11 @@ struct InkMetalModel {
     uint64_t sec1_off = 0, sec1_bytes = 0;
     uint64_t sec4_off = 0, sec4_bytes = 0;
     uint8_t format_minor = 0;
-    mtl::Buffer wbuf;                      // zero-copy mmap over entire .strata file
+    static constexpr size_t kMaxSec4Chunks = 4;
+    mtl::Buffer sec1_buf;                  // zero-copy wrap over Section 1 (trunk + DSpark)
+    uint64_t sec1_map_off = 0;
+    mtl::Buffer sec4_bufs[kMaxSec4Chunks]; // 1..4 page-aligned zero-copy Metal buffers over Section 4
+    size_t n_sec4_chunks = 0;
     mtl::Buffer expert_dev_buf;            // [24 * 128] InkExpertDev
     mtl::Buffer msg_queries_buf;           // [12 * 4 * 2304] F32 pre-stacked cross-pass queries
     mtl::Buffer static_sconv_buf;          // [24 * (1024+1024+2304+2304) * 4] F32 pre-oriented [C, 4] lag3..lag0
@@ -396,6 +413,7 @@ struct InkMetalModel {
         // Read Section 3 (v1.1: 32 B StrataExpertEntry + 2 B uint16 vram_load_order when flags & 1)
         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
         experts.assign(n_total, InkExpertDev{0, 0, 0, 0, 0});
+        std::vector<uint64_t> exp_body_bytes(n_total, 0);
         vram_load_order.clear();
         if (secs[3].byte_length > 0) {
             std::vector<uint8_t> s3(secs[3].byte_length);
@@ -418,6 +436,7 @@ struct InkMetalModel {
                         ents[i].dn_code_id,
                         0,
                     };
+                    exp_body_bytes[gid] = ents[i].body_bytes;
                 }
             }
             if (has_order && s3.size() >= dir_bytes + n_ent * 2) {
@@ -426,8 +445,7 @@ struct InkMetalModel {
             }
         }
 
-        // Zero-copy mmap entire .strata file (10.47 GB SQ-10 fits in 16 GB Mac, 14.35 GB SQ-15 in 24 GB Mac,
-        // 19.35 GB SQ-20 in 32+ GB Mac!). Use chunked wrap if > max_buffer_length.
+        // Zero-copy mmap entire .strata file and wrap Section 1 & Section 4 cleanly within maxBufferLength!
         const size_t pg = 16384;
         map_len = (fsize + pg - 1) / pg * pg;
         void* m = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -436,12 +454,8 @@ struct InkMetalModel {
             return false;
         }
         base = static_cast<uint8_t*>(m);
-        const size_t max_buf = cx.max_buffer_length();
-        if (map_len <= max_buf) {
-            wbuf = cx.wrap(base, map_len);
-        } else {
-            // Chunked zero-copy wrap (max single tensor span = 1 GiB)
-            wbuf = cx.wrap(base, map_len, 1ull << 30);
+        if (!wrap_model_buffers(cx, exp_body_bytes, err)) {
+            return false;
         }
 
         // Upload compact metadata & pre-oriented tables to GPU
@@ -450,13 +464,108 @@ struct InkMetalModel {
 
         prepare_preoriented_tables(cx);
 
+        const size_t max_buf = cx.max_buffer_length();
         t_load = mtl::now_s() - t0;
         fprintf(stderr,
-                "[ink_metal] loaded %s (build=%s, minor=%u, %.2f GiB, trunk=%zu, dspark=%zu, experts=%zu, vram_order=%zu) in %.2fs (workSet=%.1f GiB, maxBuf=%.1f GiB)\n",
+                "[ink_metal] loaded %s (build=%s, minor=%u, %.2f GiB, trunk=%zu, dspark=%zu, experts=%zu, vram_order=%zu, sec4_bufs=%zu) in %.2fs (workSet=%.1f GiB, maxBuf=%.1f GiB)\n",
                 p.c_str(), man.build.c_str(), format_minor, fsize / (1024.0 * 1024.0 * 1024.0),
-                man.T.size(), man.D.size(), experts.size(), vram_load_order.size(), t_load,
+                man.T.size(), man.D.size(), experts.size(), vram_load_order.size(), n_sec4_chunks, t_load,
                 cx.recommended_working_set() / (1024.0 * 1024.0 * 1024.0),
                 max_buf / (1024.0 * 1024.0 * 1024.0));
+        return true;
+    }
+
+    // Wrap Section 1 and Section 4 as separate page-aligned zero-copy Metal buffers, splitting Section 4
+    // into up to kMaxSec4Chunks buffers when Section 4 > maxBufferLength (fixes #6630 out-of-bounds sec4 read!).
+    bool wrap_model_buffers(mtl::Context& cx, const std::vector<uint64_t>& exp_body_bytes, std::string& err) {
+        const uint64_t pg = 16384ull;
+        const uint64_t hw_max_buf = (cx.max_buffer_length() / pg) * pg;
+        uint64_t eff_max_buf = hw_max_buf;
+        if (const char* ev = std::getenv("INK_METAL_MAX_BUF_MB")) {
+            const uint64_t mb = std::strtoull(ev, nullptr, 10);
+            if (mb >= 256ull) {
+                const uint64_t cap = ((mb << 20) / pg) * pg;
+                if (cap < eff_max_buf) eff_max_buf = cap;
+            }
+        }
+
+        // 1. Wrap Section 1 (trunk + DSpark)
+        sec1_map_off = (sec1_off / pg) * pg;
+        const uint64_t sec1_end_pg = std::min<uint64_t>(map_len, ((sec1_off + sec1_bytes + pg - 1) / pg) * pg);
+        const uint64_t sec1_map_len = std::max<uint64_t>(pg, sec1_end_pg > sec1_map_off ? (sec1_end_pg - sec1_map_off) : pg);
+        if (sec1_map_len <= hw_max_buf) {
+            sec1_buf = cx.wrap(base + sec1_map_off, sec1_map_len);
+        } else {
+            sec1_buf = cx.wrap(base + sec1_map_off, sec1_map_len, 1ull << 30);
+        }
+
+        // 2. Partition Section 4 into 1..kMaxSec4Chunks page-aligned Metal buffers with minimal expert-aligned overlap
+        uint64_t max_eb = 0;
+        for (uint64_t eb : exp_body_bytes) max_eb = std::max(max_eb, eb);
+        const uint64_t s4_start = (sec4_off / pg) * pg;
+        uint64_t s4_end = std::min<uint64_t>(map_len, ((sec4_off + sec4_bytes + pg - 1) / pg) * pg);
+        if (s4_end <= s4_start) s4_end = std::min<uint64_t>(map_len, s4_start + pg);
+
+        const uint64_t overlap = ((max_eb + 2 * pg - 1) / pg) * pg;
+        if (eff_max_buf <= overlap) {
+            err = "INK_METAL_MAX_BUF_MB too small for expert size";
+            return false;
+        }
+
+        uint64_t chunk_start[kMaxSec4Chunks]{};
+        uint64_t chunk_end[kMaxSec4Chunks]{};
+        n_sec4_chunks = 0;
+        uint64_t cur = s4_start;
+        while (cur < s4_end) {
+            if (n_sec4_chunks >= kMaxSec4Chunks) {
+                err = "Section 4 (" + std::to_string((s4_end - s4_start) >> 20) + " MiB) exceeds " +
+                      std::to_string(kMaxSec4Chunks) + " Metal buffers of " +
+                      std::to_string(eff_max_buf >> 20) + " MiB each";
+                return false;
+            }
+            const uint64_t end = std::min<uint64_t>(s4_end, cur + eff_max_buf);
+            chunk_start[n_sec4_chunks] = cur;
+            chunk_end[n_sec4_chunks] = end;
+            sec4_bufs[n_sec4_chunks] = cx.wrap(base + cur, end - cur);
+            ++n_sec4_chunks;
+            if (end >= s4_end) break;
+            cur = ((end - overlap) / pg) * pg;
+        }
+        if (n_sec4_chunks == 0) {
+            err = "failed to wrap Section 4 Metal buffer";
+            return false;
+        }
+
+        // 3. Remap every expert's (body_off, chunk_idx) strictly inside its owning sec4_bufs[c]
+        for (size_t gid = 0; gid < experts.size(); ++gid) {
+            const uint64_t eb = (gid < exp_body_bytes.size()) ? exp_body_bytes[gid] : 0;
+            if (eb == 0) {
+                experts[gid].chunk_idx = 0;
+                continue;
+            }
+            const uint64_t abs_start = sec4_off + experts[gid].body_off;
+            const uint64_t abs_end = abs_start + eb;
+            bool placed = false;
+            for (size_t c = 0; c < n_sec4_chunks; ++c) {
+                if (abs_start >= chunk_start[c] && abs_end <= chunk_end[c]) {
+                    experts[gid].body_off = abs_start - chunk_start[c];
+                    experts[gid].chunk_idx = (uint16_t)c;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                err = "expert " + std::to_string(gid) + " [" + std::to_string(abs_start) + "," +
+                      std::to_string(abs_end) + ") does not fit any Metal sec4 buffer chunk";
+                return false;
+            }
+        }
+        if (n_sec4_chunks > 1 || eff_max_buf < hw_max_buf) {
+            fprintf(stderr,
+                    "[ink_metal] split-buffer sec1=%.2f GiB + sec4=%.2f GiB across %zu Metal buffers (effMaxBuf=%.2f GiB, overlap=%.1f MiB)\n",
+                    sec1_map_len / 1073741824.0, (s4_end - s4_start) / 1073741824.0,
+                    n_sec4_chunks, eff_max_buf / 1073741824.0, overlap / 1048576.0);
+        }
         return true;
     }
 
@@ -539,32 +648,49 @@ struct InkMetalModel {
             man.D[kv.first] = std::move(ti);
         }
 
-        // 2. Read Section 1 (Trunk + DSpark) and plan transcoded expert layout
+        // 2. Read Section 1 (Trunk + DSpark) and plan native lossless GGUF_RAW or transcoded S_K expert layout
         std::vector<uint8_t> sec1;
         if (!mf.read_section1(sec1, err)) return false;
 
         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
+        const bool force_sk = (std::getenv("INK_METAL_FORCE_SK_TRANSCODE") && std::getenv("INK_METAL_FORCE_SK_TRANSCODE")[0] == '1');
+        const auto& raw_dir = mf.expert_directory();
         std::vector<strata::artifact::StrataExpertEntry> adj_dir;
         ink2::transcode::plan_transcoded_expert_directory(mf, adj_dir);
+        std::vector<uint8_t> keep_native(n_total, 0);
+        size_t n_native_gguf = 0;
 
         experts.assign(n_total, InkExpertDev{0, 0, 0, 0, 0});
         std::vector<size_t> dir_idx_by_gid(n_total, (size_t)-1);
-        std::vector<size_t> plan_body_bytes(n_total, 0);
+        std::vector<uint64_t> plan_body_bytes(n_total, 0);
         uint64_t cur_exp_off = 0;
         for (size_t i = 0; i < std::min(adj_dir.size(), n_total); ++i) {
             const size_t layer = i / (size_t)man.c.n_experts;
             const size_t gid = layer * (size_t)man.c.n_experts + adj_dir[i].expert_id;
             if (gid >= n_total) continue;
             dir_idx_by_gid[gid] = i;
-            plan_body_bytes[gid] = adj_dir[i].body_bytes;
+
+            bool native_ok = false;
+            if (!force_sk && mf.kind == ink2::ModelSourceKind::Gguf && mf.gguf_adapter &&
+                i < raw_dir.size() && raw_dir[i].gu_code_id == FMT_GGUF_RAW && raw_dir[i].dn_code_id == FMT_GGUF_RAW &&
+                layer < mf.gguf_adapter->layers.size()) {
+                const auto& lm = mf.gguf_adapter->layers[layer];
+                if (gguf_type_has_metal_kernel(lm.gu_type) && gguf_type_has_metal_kernel(lm.dn_type)) {
+                    native_ok = true;
+                }
+            }
+            const auto& ent = native_ok ? raw_dir[i] : adj_dir[i];
+            keep_native[gid] = native_ok ? 1 : 0;
+            if (native_ok) ++n_native_gguf;
+            plan_body_bytes[gid] = ent.body_bytes;
             experts[gid] = InkExpertDev{
                 cur_exp_off,
-                adj_dir[i].dn_offset,
-                adj_dir[i].gu_code_id,
-                adj_dir[i].dn_code_id,
+                ent.dn_offset,
+                ent.gu_code_id,
+                ent.dn_code_id,
                 0,
             };
-            cur_exp_off += ((uint64_t)adj_dir[i].body_bytes + 63ull) & ~63ull;
+            cur_exp_off += ((uint64_t)ent.body_bytes + 63ull) & ~63ull;
         }
         vram_load_order = mf.vram_load_order;
 
@@ -590,46 +716,47 @@ struct InkMetalModel {
         sec1.clear();
         sec1.shrink_to_fit();
 
-        // 4. Stream & transcode all experts in parallel directly into base + sec4_off
+        // 4. Stream native lossless GGUF_RAW (or transcode exotic quants) in parallel directly into base + sec4_off
         const int n_threads = ink2::transcode::default_transcode_threads();
         bool ok = ink2::transcode::parallel_run(n_total, n_threads, [&](size_t gid, std::string& lerr) -> bool {
             const size_t di = dir_idx_by_gid[gid];
             if (di == (size_t)-1) return true;
             std::vector<uint8_t> body;
-            uint32_t dn_off = 0;
-            uint8_t gu_code = 0, dn_code = 0;
-            if (!ink2::transcode::read_or_transcode_expert(mf, di, body, dn_off, gu_code, dn_code, lerr)) {
-                return false;
+            uint32_t dn_off = experts[gid].dn_off;
+            uint8_t gu_code = experts[gid].gu_code, dn_code = experts[gid].dn_code;
+            if (keep_native[gid]) {
+                if (!mf.read_expert_body(di, body, lerr)) return false;
+            } else {
+                if (!ink2::transcode::read_or_transcode_expert(mf, di, body, dn_off, gu_code, dn_code, lerr)) {
+                    return false;
+                }
             }
             if (body.size() > plan_body_bytes[gid]) {
-                lerr = "transcoded expert exceeded planned arena slot";
+                lerr = "expert body exceeded planned arena slot";
                 return false;
             }
             std::memcpy(base + sec4_off + experts[gid].body_off, body.data(), body.size());
             experts[gid].dn_off = dn_off;
             experts[gid].gu_code = gu_code;
             experts[gid].dn_code = dn_code;
+            plan_body_bytes[gid] = body.size();
             return true;
         }, err);
         if (!ok) return false;
 
         // 5. Wrap zero-copy in Metal buffer(s) + upload descriptors & pre-oriented tables
-        const size_t max_buf = cx.max_buffer_length();
-        if (map_len <= max_buf) {
-            wbuf = cx.wrap(base, map_len);
-        } else {
-            wbuf = cx.wrap(base, map_len, 1ull << 30);
-        }
+        if (!wrap_model_buffers(cx, plan_body_bytes, err)) return false;
 
         expert_dev_buf = cx.alloc(experts.size() * sizeof(InkExpertDev));
         std::memcpy(expert_dev_buf.ptr, experts.data(), experts.size() * sizeof(InkExpertDev));
         prepare_preoriented_tables(cx);
 
+        const size_t max_buf = cx.max_buffer_length();
         t_load = mtl::now_s() - t0;
         fprintf(stderr,
-                "[ink_metal] loaded %s (src=%s, build=%s, %.2f GiB arena, trunk=%zu, dspark=%zu, experts=%zu) in %.2fs (workSet=%.1f GiB, maxBuf=%.1f GiB)\n",
+                "[ink_metal] loaded %s (src=%s, build=%s, %.2f GiB arena, trunk=%zu, dspark=%zu, experts=%zu, native_gguf=%zu, sec4_bufs=%zu) in %.2fs (workSet=%.1f GiB, maxBuf=%.1f GiB)\n",
                 path.c_str(), ink2::source_kind_name(mf.kind), man.build.c_str(),
-                map_len / (1024.0 * 1024.0 * 1024.0), man.T.size(), man.D.size(), experts.size(), t_load,
+                map_len / (1024.0 * 1024.0 * 1024.0), man.T.size(), man.D.size(), experts.size(), n_native_gguf, n_sec4_chunks, t_load,
                 cx.recommended_working_set() / (1024.0 * 1024.0 * 1024.0),
                 max_buf / (1024.0 * 1024.0 * 1024.0));
         return true;
@@ -724,12 +851,14 @@ struct InkMetalModel {
         return base + sec1_off + man.get(name).off;
     }
     mtl::Arg tw(const std::string& name) const {
-        return mtl::Arg::B(wbuf, sec1_off + man.get(name).off);
+        return mtl::Arg::B(sec1_buf, (sec1_off - sec1_map_off) + man.get(name).off);
     }
     mtl::Arg dw(const std::string& name) const {
-        return mtl::Arg::B(wbuf, sec1_off + man.get_d(name).off);
+        return mtl::Arg::B(sec1_buf, (sec1_off - sec1_map_off) + man.get_d(name).off);
     }
-    mtl::Arg sec4_arg() const { return mtl::Arg::B(wbuf, sec4_off); }
+    mtl::Arg sec4_arg(size_t chunk = 0) const {
+        return mtl::Arg::B(sec4_bufs[(chunk < n_sec4_chunks) ? chunk : 0], 0);
+    }
 
     static bool read_section0_json(int fd, uint64_t off, uint64_t len, std::string& out, std::string& err);
 };

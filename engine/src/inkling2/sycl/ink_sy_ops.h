@@ -323,15 +323,19 @@ inline void k_router_topk8_sg16(const float* r_logits, const float* r_bias, int*
         sycl::local_accessor<float, 1> sh_s(128, h);
         h.parallel_for(NR(M, 128), [=](sycl::nd_item<1> it) INK_REQD_SG16 {
             const int m = (int)it.get_group(0), tid = (int)it.get_local_id(0);
-            const float p = 1.0f / (1.0f + sycl::exp(-r_logits[(size_t)m * 128 + tid]));
+            const float raw_l = r_logits[(size_t)m * 128 + tid];
+            const float p_raw = 1.0f / (1.0f + sycl::exp(-raw_l));
+            const float p = sycl::isfinite(p_raw) ? p_raw : 0.0f;
+            const float sc = p + r_bias[tid];
             sh_p[tid] = p;
-            sh_s[tid] = p + r_bias[tid];
+            sh_s[tid] = sycl::isfinite(sc) ? sc : -1e29f;
             sycl::group_barrier(it.get_group());
             if (tid == 0) {
                 int sel[8]; float pw[8]; float sum = 0.0f;
                 for (int k = 0; k < 8; ++k) {
-                    int bi = 0; float bs = sh_s[0];
-                    for (int e = 1; e < 128; ++e) if (sh_s[e] > bs) { bs = sh_s[e]; bi = e; }
+                    int bi = -1; float bs = -1e30f;
+                    for (int e = 0; e < 128; ++e) if (sh_s[e] > bs) { bs = sh_s[e]; bi = e; }
+                    if (bi < 0) bi = k;
                     sel[k] = bi; pw[k] = sh_p[bi]; sum += pw[k]; sh_s[bi] = -1e30f;
                 }
                 const float inv = route_scale / (sum + 1e-20f);

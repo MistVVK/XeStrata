@@ -18,7 +18,13 @@
 #include "ink_cuda.cuh"
 #include "ink_moe_cuda.cuh"
 #include "../ink_cold_store.hpp"
+#include "../ink_host_avx2.h"
 #include "strata/core/moe_wave_plan.hpp"
+#include "strata/quant/act.hpp"
+#include "strata/quant/dequant.hpp"
+#include "strata/quant/dot.hpp"
+#include "strata/quant/isa.hpp"
+#include "strata/quant/types.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -42,10 +48,7 @@
 #include <sys/mman.h>
 #endif
 
-#if defined(__AVX2__) && !defined(__CUDA_ARCH__)
-#include <immintrin.h>
-#define INK_HOST_AVX2 1
-#elif defined(__ARM_NEON) && !defined(__CUDACC__)
+#if defined(__ARM_NEON) && !defined(__CUDACC__)
 #include <arm_neon.h>
 #define INK_HOST_NEON 1
 #endif
@@ -175,57 +178,13 @@ inline const float* ue8m0_lut_h() noexcept {
     return t;
 }
 
-#if defined(INK_HOST_AVX2)
-inline float avx2_hsum_ps(__m256 v) noexcept {
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    return _mm_cvtss_f32(s);
-}
-
-inline int32_t avx2_hsum_epi32(__m256i v) noexcept {
-    __m128i hi = _mm256_extracti128_si256(v, 1);
-    __m128i lo = _mm256_castsi256_si128(v);
-    __m128i s = _mm_add_epi32(lo, hi);
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
-    return _mm_cvtsi128_si32(s);
-}
-
-inline int32_t avx2_dot_u8_i8_64(__m256i u0, __m256i u1, const int8_t* qs) noexcept {
-    const __m256i ones = _mm256_set1_epi16(1);
-    const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs));
-    const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs + 32));
-    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(u0, q0), ones);
-    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(u1, q1), ones);
-    return avx2_hsum_epi32(_mm256_add_epi32(p0, p1));
-}
-#endif
-
 inline float dot_sf4_row_h(const uint8_t* p, const uint8_t* sc, float w_outer, const float* x, int cols) noexcept {
     const float* e4 = e4m3_lut_h();
-    const int nb = cols >> 4;
-#if defined(INK_HOST_AVX2)
-    // 2x E2M1 integer LUT -> _mm_shuffle_epi8 unpacks 16 weights/block in 1 cycle + 8-wide AVX2 FMA!
-    const __m128i lut2x  = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
-    const __m128i mask0f = _mm_set1_epi8(0x0F);
-    __m256 vsum = _mm256_setzero_ps();
-    for (int b = 0; b < nb; ++b) {
-        const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p + b * 8));
-        const __m128i lo  = _mm_and_si128(raw, mask0f);
-        const __m128i hi  = _mm_and_si128(_mm_srli_epi16(raw, 4), mask0f);
-        const __m128i nib = _mm_unpacklo_epi8(lo, hi);
-        const __m128i w8  = _mm_shuffle_epi8(lut2x, nib);
-        const __m256 wf0  = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w8));
-        const __m256 wf1  = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(w8, 8)));
-        const float* xb   = x + b * 16;
-        const __m256 prod = _mm256_fmadd_ps(wf0, _mm256_loadu_ps(xb), _mm256_mul_ps(wf1, _mm256_loadu_ps(xb + 8)));
-        vsum = _mm256_fmadd_ps(prod, _mm256_set1_ps(0.5f * e4[sc[b]]), vsum);
+    if (host_avx2::available()) {
+        return host_avx2::dot_sf4_row(p, sc, w_outer, x, cols, e4);
     }
-    return avx2_hsum_ps(vsum) * w_outer;
-#elif defined(INK_HOST_NEON)
+    const int nb = cols >> 4;
+#if defined(INK_HOST_NEON)
     static const int8_t kLut2x[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     const int8x16_t lut2x = vld1q_s8(kLut2x);
     const uint8x8_t m0f   = vdup_n_u8(0x0F);
@@ -270,23 +229,11 @@ inline float dot_sf4_row_h(const uint8_t* p, const uint8_t* sc, float w_outer, c
 inline float dot_mx8_row_h(const uint8_t* w, const uint8_t* sc, const float* x, int cols) noexcept {
     const float* e4 = e4m3_lut_h();
     const float* u8 = ue8m0_lut_h();
-    const int nb = cols >> 5;
-#if defined(INK_HOST_AVX2)
-    __m256 vsum = _mm256_setzero_ps();
-    for (int b = 0; b < nb; ++b) {
-        const uint8_t* wb = w + b * 32;
-        const float* xb = x + b * 32;
-        __m256 acc = _mm256_setzero_ps();
-        for (int k = 0; k < 32; k += 8) {
-            const __m256 wf = _mm256_setr_ps(
-                e4[wb[k + 0]], e4[wb[k + 1]], e4[wb[k + 2]], e4[wb[k + 3]],
-                e4[wb[k + 4]], e4[wb[k + 5]], e4[wb[k + 6]], e4[wb[k + 7]]);
-            acc = _mm256_fmadd_ps(wf, _mm256_loadu_ps(xb + k), acc);
-        }
-        vsum = _mm256_fmadd_ps(acc, _mm256_set1_ps(u8[sc[b]]), vsum);
+    if (host_avx2::available()) {
+        return host_avx2::dot_mx8_row(w, sc, x, cols, e4, u8);
     }
-    return avx2_hsum_ps(vsum);
-#elif defined(INK_HOST_NEON)
+    const int nb = cols >> 5;
+#if defined(INK_HOST_NEON)
     float32x4_t vsum = vdupq_n_f32(0.0f);
     for (int b = 0; b < nb; ++b) {
         const uint8_t* wb = w + b * 32;
@@ -369,100 +316,12 @@ inline void s15_unpack64_h(const uint8_t* pl, int g, int8_t out[64]) noexcept {
 }
 
 inline float dot_sk_sub64_h(const uint8_t* pl, int fmt, int g, const InkQ8_1_G64& xb, float eff) noexcept {
+    if (host_avx2::available()) {
+        return host_avx2::dot_sk_sub64(pl, fmt, g, xb.qs, xb.d, xb.s, eff, s15_trit_lut_h());
+    }
     const int8_t* qs = xb.qs;
     int32_t isum = 0;
-#if defined(INK_HOST_AVX2)
-    if (fmt == FMT_S1_5) {
-        alignas(32) int8_t tr[64];
-        s15_unpack64_h(pl, g, tr);
-        const __m256i bias = _mm256_set1_epi8(1);
-        const __m256i u0 = _mm256_add_epi8(_mm256_load_si256(reinterpret_cast<const __m256i*>(tr)), bias);
-        const __m256i u1 = _mm256_add_epi8(_mm256_load_si256(reinterpret_cast<const __m256i*>(tr + 32)), bias);
-        isum = avx2_dot_u8_i8_64(u0, u1, qs);
-        return eff * (xb.d * (float)isum - xb.s);
-    } else if (fmt == FMT_S4_K) {
-        const uint8_t* p = pl + g * 32;
-        const __m128i m0f = _mm_set1_epi8(0x0F);
-        const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
-        const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16));
-        const __m128i lo0 = _mm_and_si128(v0, m0f), hi0 = _mm_and_si128(_mm_srli_epi16(v0, 4), m0f);
-        const __m128i lo1 = _mm_and_si128(v1, m0f), hi1 = _mm_and_si128(_mm_srli_epi16(v1, 4), m0f);
-        const __m256i u0 = _mm256_set_m128i(_mm_unpackhi_epi8(lo0, hi0), _mm_unpacklo_epi8(lo0, hi0));
-        const __m256i u1 = _mm256_set_m128i(_mm_unpackhi_epi8(lo1, hi1), _mm_unpacklo_epi8(lo1, hi1));
-        isum = avx2_dot_u8_i8_64(u0, u1, qs);
-        return eff * (xb.d * (float)isum - 7.5f * xb.s);
-    } else if (fmt == FMT_S8_K) {
-        const int8_t* p = reinterpret_cast<const int8_t*>(pl + g * 64);
-        const __m256i p0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        const __m256i p1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
-        const __m256i q0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs));
-        const __m256i q1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs + 32));
-        const __m256i ones = _mm256_set1_epi16(1);
-        const __m256i a0 = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(p0), _mm256_sign_epi8(q0, p0)), ones);
-        const __m256i a1 = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(p1), _mm256_sign_epi8(q1, p1)), ones);
-        isum = avx2_hsum_epi32(_mm256_add_epi32(a0, a1));
-        return eff * xb.d * (float)isum;
-    } else if (fmt == FMT_S2_K || fmt == FMT_S3_K || fmt == FMT_S5_K || fmt == FMT_S6_K) {
-        alignas(32) uint8_t u[64];
-        if (fmt == FMT_S2_K) {
-            const uint8_t* p = pl + g * 16;
-            for (int i = 0; i < 16; ++i) {
-                const uint8_t b = p[i];
-                u[4 * i + 0] = (uint8_t)(b & 3u);
-                u[4 * i + 1] = (uint8_t)((b >> 2) & 3u);
-                u[4 * i + 2] = (uint8_t)((b >> 4) & 3u);
-                u[4 * i + 3] = (uint8_t)(b >> 6);
-            }
-            isum = avx2_dot_u8_i8_64(_mm256_load_si256(reinterpret_cast<const __m256i*>(u)),
-                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(u + 32)), qs);
-            return eff * (xb.d * (float)isum - 1.5f * xb.s);
-        } else if (fmt == FMT_S3_K) {
-            const uint8_t* p = pl + g * 16;
-            const uint8_t* hp = pl + 64 + g * 8;
-            for (int i = 0; i < 8; ++i) {
-                const uint8_t b0 = p[2 * i], b1 = p[2 * i + 1], h = hp[i];
-                u[8 * i + 0] = (uint8_t)((b0 & 3u) | ((h & 1u) << 2));
-                u[8 * i + 1] = (uint8_t)(((b0 >> 2) & 3u) | (((h >> 1) & 1u) << 2));
-                u[8 * i + 2] = (uint8_t)(((b0 >> 4) & 3u) | (((h >> 2) & 1u) << 2));
-                u[8 * i + 3] = (uint8_t)((b0 >> 6) | (((h >> 3) & 1u) << 2));
-                u[8 * i + 4] = (uint8_t)((b1 & 3u) | (((h >> 4) & 1u) << 2));
-                u[8 * i + 5] = (uint8_t)(((b1 >> 2) & 3u) | (((h >> 5) & 1u) << 2));
-                u[8 * i + 6] = (uint8_t)(((b1 >> 4) & 3u) | (((h >> 6) & 1u) << 2));
-                u[8 * i + 7] = (uint8_t)((b1 >> 6) | (((h >> 7) & 1u) << 2));
-            }
-            isum = avx2_dot_u8_i8_64(_mm256_load_si256(reinterpret_cast<const __m256i*>(u)),
-                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(u + 32)), qs);
-            return eff * (xb.d * (float)isum - 3.5f * xb.s);
-        } else if (fmt == FMT_S5_K) {
-            const uint8_t* p = pl + g * 32;
-            const uint8_t* hp = pl + 128 + g * 8;
-            for (int i = 0; i < 8; ++i) {
-                const uint8_t h = hp[i];
-                for (int k = 0; k < 4; ++k) {
-                    const uint8_t b = p[4 * i + k];
-                    u[8 * i + 2 * k + 0] = (uint8_t)((b & 0xFu) | (((h >> (2 * k)) & 1u) << 4));
-                    u[8 * i + 2 * k + 1] = (uint8_t)((b >> 4) | (((h >> (2 * k + 1)) & 1u) << 4));
-                }
-            }
-            isum = avx2_dot_u8_i8_64(_mm256_load_si256(reinterpret_cast<const __m256i*>(u)),
-                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(u + 32)), qs);
-            return eff * (xb.d * (float)isum - 15.5f * xb.s);
-        } else {
-            const uint8_t* p = pl + g * 32;
-            const uint8_t* hp = pl + 128 + g * 16;
-            for (int i = 0; i < 16; ++i) {
-                const uint8_t h = hp[i], b0 = p[2 * i], b1 = p[2 * i + 1];
-                u[4 * i + 0] = (uint8_t)((b0 & 0xFu) | ((h & 3u) << 4));
-                u[4 * i + 1] = (uint8_t)((b0 >> 4) | (((h >> 2) & 3u) << 4));
-                u[4 * i + 2] = (uint8_t)((b1 & 0xFu) | (((h >> 4) & 3u) << 4));
-                u[4 * i + 3] = (uint8_t)((b1 >> 4) | ((h >> 6) << 4));
-            }
-            isum = avx2_dot_u8_i8_64(_mm256_load_si256(reinterpret_cast<const __m256i*>(u)),
-                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(u + 32)), qs);
-            return eff * (xb.d * (float)isum - 31.5f * xb.s);
-        }
-    }
-#elif defined(INK_HOST_NEON)
+#if defined(INK_HOST_NEON)
     auto neon_dot_s8_64 = [&](const int8_t* w8) -> int32_t {
         int32x4_t acc = vdupq_n_s32(0);
         for (int i = 0; i < 64; i += 16) {
@@ -565,6 +424,163 @@ inline float dot_sk_sub64_h(const uint8_t* pl, int fmt, int g, const InkQ8_1_G64
     return 0.0f;
 }
 
+// Lossless SIMD host evaluator for native FMT_GGUF_RAW experts (Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, IQ3_XXS, IQ2_XXS, IQ1_M/S, etc.)
+// Uses strata::quant runtime CPUID SIMD kernels (AVX-512 VNNI 4-row / AVX2 / AVX1 / NEON / Scalar) with zero SF4 quality loss!
+inline void eval_gguf_raw_batch_h(
+    const InkHostExpertMeta& em,
+    const uint8_t* body,
+    const float* const* xs,
+    float* const* ys,
+    int T,
+    void (*wait_down)(void*), void* wait_ctx) noexcept {
+    constexpr int D = kInkHidden;
+    constexpr int I = kInkInter;
+    constexpr int MAX_T = 16;
+    InkGgufExpertHeader hdr{};
+    std::memcpy(&hdr, body, sizeof(hdr));
+    float act[MAX_T][I];
+
+    auto dot_f32_h = [](const float* a, const float* b, int n) noexcept -> float {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+            s0 += a[i + 0] * b[i + 0]; s1 += a[i + 1] * b[i + 1];
+            s2 += a[i + 2] * b[i + 2]; s3 += a[i + 3] * b[i + 3];
+        }
+        float s = (s0 + s1) + (s2 + s3);
+        for (; i < n; ++i) s += a[i] * b[i];
+        return s;
+    };
+
+    auto deq_gguf_row_h = [](uint32_t gtype, const uint8_t* src, float* dst, int K) noexcept {
+        if (gtype == 0) {
+            std::memcpy(dst, src, (size_t)K * 4u);
+        } else if (gtype == 1) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+            for (int c = 0; c < K; ++c) dst[c] = f16_to_f32_h(p[c]);
+        } else if (gtype == 30) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+            for (int c = 0; c < K; ++c) {
+                uint32_t u = (uint32_t)p[c] << 16;
+                std::memcpy(&dst[c], &u, 4);
+            }
+        } else {
+            strata::quant::dequant_row(static_cast<strata::quant::Type>(gtype), src, dst, K);
+        }
+    };
+
+    const auto arith = strata::quant::default_arith();
+
+    // 1. Gate + Up + SITU(4.0, 25.0)
+    {
+        const auto qt = static_cast<strata::quant::Type>(hdr.gu_type);
+        const auto* ti = strata::quant::type_info(qt);
+        const size_t rb = strata::quant::row_bytes((int)hdr.gu_type, D);
+        const auto* dk = (ti && ti->has_dot) ? strata::quant::dot_kernel(qt, arith) : nullptr;
+        const auto* dk4 = (ti && ti->has_dot) ? strata::quant::dot_x4_kernel(qt, arith) : nullptr;
+        const auto* ak = (dk && ti && ti->act != qt) ? strata::quant::act_kernel(ti->act, arith) : nullptr;
+        const size_t act_rb = ak ? strata::quant::row_bytes((int)ti->act, D) : 0;
+        const uint8_t* w_base = body + sizeof(InkGgufExpertHeader);
+        if (dk && ak && act_rb > 0 && rb > 0) {
+            alignas(32) uint8_t qa[MAX_T][3072];  // max Q8_K(2304) = 9 * 292 = 2628 B < 3072 B
+            for (int t = 0; t < T; ++t) ak->fn(xs[t], qa[t], D);
+            int j = 0;
+            if (dk4) {
+                for (; j + 4 <= I; j += 4) {
+                    const uint8_t* wg = w_base + (size_t)j * rb;
+                    const uint8_t* wu = w_base + (size_t)(I + j) * rb;
+                    for (int t = 0; t < T; ++t) {
+                        float g4[4], u4[4];
+                        dk4->fn(D, g4, wg, rb, qa[t]);
+                        dk4->fn(D, u4, wu, rb, qa[t]);
+                        for (int k = 0; k < 4; ++k) {
+                            const float g = g4[k] * hdr.gate_scale;
+                            const float u = u4[k] * hdr.up_scale;
+                            const float sig = 1.0f / (1.0f + std::exp(-g));
+                            act[t][j + k] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) *
+                                            (kInkSituLb * std::tanh(u / kInkSituLb));
+                        }
+                    }
+                }
+            }
+            for (; j < I; ++j) {
+                const uint8_t* wg = w_base + (size_t)j * rb;
+                const uint8_t* wu = w_base + (size_t)(I + j) * rb;
+                for (int t = 0; t < T; ++t) {
+                    float gs = 0.0f, us = 0.0f;
+                    dk->fn(D, &gs, wg, qa[t]);
+                    dk->fn(D, &us, wu, qa[t]);
+                    const float g = gs * hdr.gate_scale;
+                    const float u = us * hdr.up_scale;
+                    const float sig = 1.0f / (1.0f + std::exp(-g));
+                    act[t][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) *
+                                (kInkSituLb * std::tanh(u / kInkSituLb));
+                }
+            }
+        } else {
+            float wg_f[D], wu_f[D];
+            for (int j = 0; j < I; ++j) {
+                deq_gguf_row_h(hdr.gu_type, w_base + (size_t)j * rb, wg_f, D);
+                deq_gguf_row_h(hdr.gu_type, w_base + (size_t)(I + j) * rb, wu_f, D);
+                for (int t = 0; t < T; ++t) {
+                    const float g = dot_f32_h(wg_f, xs[t], D) * hdr.gate_scale;
+                    const float u = dot_f32_h(wu_f, xs[t], D) * hdr.up_scale;
+                    const float sig = 1.0f / (1.0f + std::exp(-g));
+                    act[t][j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) *
+                                (kInkSituLb * std::tanh(u / kInkSituLb));
+                }
+            }
+        }
+    }
+
+    // 2. Down projection [D, I]
+    if (wait_down) wait_down(wait_ctx);
+    {
+        const auto qt = static_cast<strata::quant::Type>(hdr.dn_type);
+        const auto* ti = strata::quant::type_info(qt);
+        const size_t rb = strata::quant::row_bytes((int)hdr.dn_type, I);
+        const auto* dk = (ti && ti->has_dot) ? strata::quant::dot_kernel(qt, arith) : nullptr;
+        const auto* dk4 = (ti && ti->has_dot) ? strata::quant::dot_x4_kernel(qt, arith) : nullptr;
+        const auto* ak = (dk && ti && ti->act != qt) ? strata::quant::act_kernel(ti->act, arith) : nullptr;
+        const size_t act_rb = ak ? strata::quant::row_bytes((int)ti->act, I) : 0;
+        const uint8_t* w_base = body + em.dn_off;
+        if (dk && ak && act_rb > 0 && rb > 0) {
+            alignas(32) uint8_t qa[MAX_T][2048];  // max Q8_0(1152) = 36 * 34 = 1224 B < 2048 B
+            for (int t = 0; t < T; ++t) ak->fn(act[t], qa[t], I);
+            int r = 0;
+            if (dk4) {
+                for (; r + 4 <= D; r += 4) {
+                    const uint8_t* wr = w_base + (size_t)r * rb;
+                    for (int t = 0; t < T; ++t) {
+                        float s4[4];
+                        dk4->fn(I, s4, wr, rb, qa[t]);
+                        ys[t][r + 0] = s4[0] * hdr.dn_scale;
+                        ys[t][r + 1] = s4[1] * hdr.dn_scale;
+                        ys[t][r + 2] = s4[2] * hdr.dn_scale;
+                        ys[t][r + 3] = s4[3] * hdr.dn_scale;
+                    }
+                }
+            }
+            for (; r < D; ++r) {
+                const uint8_t* wr = w_base + (size_t)r * rb;
+                for (int t = 0; t < T; ++t) {
+                    float s = 0.0f;
+                    dk->fn(I, &s, wr, qa[t]);
+                    ys[t][r] = s * hdr.dn_scale;
+                }
+            }
+        } else {
+            float wd_f[I];
+            for (int r = 0; r < D; ++r) {
+                deq_gguf_row_h(hdr.dn_type, w_base + (size_t)r * rb, wd_f, I);
+                for (int t = 0; t < T; ++t) {
+                    ys[t][r] = dot_f32_h(wd_f, act[t], I) * hdr.dn_scale;
+                }
+            }
+        }
+    }
+}
+
 inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out,
                               const uint8_t* body_override = nullptr,
                               void (*wait_down)(void*) = nullptr, void* wait_ctx = nullptr) noexcept {
@@ -573,6 +589,12 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
     const uint8_t* body = body_override ? body_override : em.body;
     if (!body) {
         std::memset(y_out, 0, (size_t)D * sizeof(float));
+        return;
+    }
+    if (em.gu_code == FMT_GGUF_RAW || em.dn_code == FMT_GGUF_RAW) {
+        const float* xs[1] = {x};
+        float* ys[1] = {y_out};
+        eval_gguf_raw_batch_h(em, body, xs, ys, 1, wait_down, wait_ctx);
         return;
     }
     float act[I];
@@ -694,6 +716,10 @@ inline void eval_expert_batch_f32_h(
     }
     constexpr int MAX_T = 16;
     const int T = std::min(cnt, MAX_T);
+    if (em.gu_code == FMT_GGUF_RAW || em.dn_code == FMT_GGUF_RAW) {
+        eval_gguf_raw_batch_h(em, body, xs, ys, T, wait_down, wait_ctx);
+        return;
+    }
     float act[MAX_T][I];
 
     // 1. Gate + Up + SITU(4.0, 25.0) — reuse each weight row across all T tokens in L1!
@@ -1204,9 +1230,7 @@ struct InkHybridEngine {
                                         const size_t len = host_meta[key].body_bytes;
                                         for (size_t o = 0; o < len; o += 64) {
                                             if ((o & 16383u) == 0 && work_gen.load(std::memory_order_acquire) != seen) break;
-#if defined(INK_HOST_AVX2)
-                                            _mm_prefetch(ptr + o, _MM_HINT_T1);
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
                                             __builtin_prefetch(ptr + o, 0, 2);
 #endif
                                         }
@@ -1304,27 +1328,53 @@ struct InkHybridEngine {
         active = true;
     }
 
-    // Allocate ping-pong prefill streaming buffers (2 x 64 MiB) + optional dynamic decode promotion ring!
+    // Size of each ping-pong prefill staging buffer for experts up to max_exp_bytes (32..64 MiB, at least 1 expert).
+    static size_t pf_stage_size(size_t max_exp_bytes) noexcept {
+        const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
+        return std::max(align_b, std::min<size_t>(64ull << 20, std::max<size_t>(16 * align_b, 32ull << 20)));
+    }
+
+    // #6617: Allocate the 2 ping-pong prefill staging buffers BEFORE d_sec4 and the host pinned arena!
+    // Without them, multi-token MoE cannot stream host experts over PCIe; try full size then 16 MiB minimum.
+    bool alloc_pf_stage(size_t max_exp_bytes) {
+        if (d_pf_stage[0]) return true;
+        const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
+        size_t tries[2] = {pf_stage_size(max_exp_bytes), std::max(align_b, (size_t)(16ull << 20))};
+        for (size_t b : tries) {
+            if (b == 0) continue;
+            if (cudaMalloc(&d_pf_stage[0], b) == cudaSuccess && cudaMalloc(&d_pf_stage[1], b) == cudaSuccess) {
+                pf_stage_bytes = b;
+                return true;
+            }
+            (void)cudaGetLastError();
+            if (d_pf_stage[0]) { cudaFree(d_pf_stage[0]); d_pf_stage[0] = nullptr; }
+            if (d_pf_stage[1]) { cudaFree(d_pf_stage[1]); d_pf_stage[1] = nullptr; }
+        }
+        pf_stage_bytes = 0;
+        return false;
+    }
+
+    // Allocate ping-pong prefill streaming buffers (unless alloc_pf_stage already did) + optional dynamic decode promotion ring!
     void alloc_staging(size_t max_exp_bytes, size_t vram_avail) {
         if (!active) return;
         const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
         promo_slot_bytes = align_b;
         // Reserve 2 x 16..64 MiB ping-pong staging buffers for ultra-fast prefill DMA streaming!
-        if (vram_avail > (48ull << 20)) {
+        if (!d_pf_stage[0] && vram_avail > (48ull << 20)) {
             const size_t max_each = (vram_avail - (16ull << 20)) / 2;
             pf_stage_bytes = std::min<size_t>(64ull << 20, std::min(max_each, std::max<size_t>(16 * align_b, 32ull << 20)));
             pf_stage_bytes = std::max(pf_stage_bytes, align_b);
             INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
-            if (!sec4_is_pinned) {
-                for (int b = 0; b < 2; ++b) {
-                    if (cudaHostAlloc(&h_pf_bounce[b], pf_stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
-                        (void)cudaGetLastError();
-                        h_pf_bounce[b] = nullptr;
-                    }
+            vram_avail -= 2 * pf_stage_bytes;
+        }
+        if (d_pf_stage[0] && !sec4_is_pinned && !h_pf_bounce[0]) {
+            for (int b = 0; b < 2; ++b) {
+                if (cudaHostAlloc(&h_pf_bounce[b], pf_stage_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    h_pf_bounce[b] = nullptr;
                 }
             }
-            vram_avail -= 2 * pf_stage_bytes;
         }
         // Remaining spare VRAM (> 256 MiB headroom) becomes dynamic decayed-frequency promotion ring!
         if (vram_avail > (320ull << 20) && align_b > 0) {
@@ -1552,6 +1602,8 @@ inline void launch_ink_moe_hybrid(
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
     } else {
+        // #6617: Clear y_pair so no unwritten slot can ever carry an earlier layer's stale output!
+        INK_CK(cudaMemsetAsync(ws.y_pair, 0, (size_t)M * kInkTopK * kInkHidden * sizeof(float), st));
         // Double-Buffered Ping-Pong Async DMA Streaming + Simultaneous PCIe/CPU Miss-Sharing (M=2..16) + GPU+SSD Wave Planning!
         std::vector<int> host_list;
         host_list.reserve(kInkExperts);

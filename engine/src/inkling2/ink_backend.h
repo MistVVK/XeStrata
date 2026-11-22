@@ -68,6 +68,20 @@ public:
     virtual void snapshot_slot(int slot) = 0;
     virtual void rollback_slot(int slot, int keep_len) = 0;
 
+    // Optional prompt-end conversation checkpoint (#6627): saves/restores SWA KV + ShortConv + DSpark state at `seq_len`
+    // so multi-turn chats and exact repeats reuse the cached prompt even when hidden thinking or trailing tokens diverge.
+    virtual bool save_prompt_checkpoint(int slot, int seq_len) {
+        (void)slot; (void)seq_len;
+        return false;
+    }
+    virtual bool restore_prompt_checkpoint(int slot, int seq_len) {
+        (void)slot; (void)seq_len;
+        return false;
+    }
+
+    // Returns true when the on-device DSpark drafter is initialized and ready to serve drafts (#6633).
+    virtual bool dspark_ready() const { return false; }
+
     // Batched 48-visit forward across 1..64 active slots!
     // logits_out: [batch.count_logits(), vocab_unpadded] FP32 (already softcapped by 30*tanh(z/30) and sliced to 200058).
     virtual bool forward_batch(

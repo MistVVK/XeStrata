@@ -2,7 +2,11 @@
 // MIT License - Copyright (c) 2026 Strata contributors
 #include "strata/inkling2/inkling2_loop.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/quant/act.hpp"
 #include "strata/quant/dequant.hpp"
+#include "strata/quant/dot.hpp"
+#include "strata/quant/isa.hpp"
+#include "strata/quant/types.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -220,44 +224,117 @@ void eval_inkling2_expert_batch(
         strata::block_geometry(hdr.gu_type, be, bb);
         const size_t row_b = (be > 0) ? (hidden / static_cast<size_t>(be)) * static_cast<size_t>(bb) : 0;
         const uint8_t* w_base = body + sizeof(GgufExpertHeader);
-        std::vector<float> wrow(hidden);
-        auto deq_row = [&](const uint8_t* src) {
-            if (hdr.gu_type == 0) {
-                std::memcpy(wrow.data(), src, hidden * 4);
-            } else if (hdr.gu_type == 1) {
-                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
-                for (size_t c = 0; c < hidden; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
-            } else if (hdr.gu_type == 30) {
-                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
-                for (size_t c = 0; c < hidden; ++c) {
-                    uint32_t u = static_cast<uint32_t>(p[c]) << 16;
-                    std::memcpy(&wrow[c], &u, 4);
+        const bool interleaved = (hdr.flags & 1u) != 0;
+
+        const auto qt = static_cast<strata::quant::Type>(hdr.gu_type);
+        const auto* ti = strata::quant::type_info(qt);
+        const auto arith = strata::quant::default_arith();
+        const auto* dk = (ti && ti->has_dot) ? strata::quant::dot_kernel(qt, arith) : nullptr;
+        const auto* dk4 = (ti && ti->has_dot) ? strata::quant::dot_x4_kernel(qt, arith) : nullptr;
+        const auto* ak = (dk && ti && ti->act != qt) ? strata::quant::act_kernel(ti->act, arith) : nullptr;
+        const size_t act_rb = ak ? strata::quant::row_bytes(static_cast<int>(ti->act), static_cast<int64_t>(hidden)) : 0;
+
+        if (dk && ak && act_rb > 0 && row_b > 0) {
+            std::vector<uint8_t> qa(m * act_rb);
+            for (size_t t = 0; t < m; ++t) {
+                ak->fn(x_in + t * hidden, qa.data() + t * act_rb, static_cast<int64_t>(hidden));
+            }
+            if (interleaved) {
+                size_t r = 0;
+                if (dk4) {
+                    for (; r + 4 <= 2 * inter; r += 4) {
+                        const uint8_t* wr = w_base + r * row_b;
+                        for (size_t t = 0; t < m; ++t) {
+                            float s4[4];
+                            dk4->fn(static_cast<int>(hidden), s4, wr, row_b, qa.data() + t * act_rb);
+                            float* dst = gu.data() + t * (2 * inter) + r;
+                            dst[0] = s4[0] * hdr.gate_scale;
+                            dst[1] = s4[1] * hdr.up_scale;
+                            dst[2] = s4[2] * hdr.gate_scale;
+                            dst[3] = s4[3] * hdr.up_scale;
+                        }
+                    }
+                }
+                for (; r < 2 * inter; ++r) {
+                    const uint8_t* wr = w_base + r * row_b;
+                    const float sc = ((r & 1u) == 0) ? hdr.gate_scale : hdr.up_scale;
+                    for (size_t t = 0; t < m; ++t) {
+                        float s = 0.0f;
+                        dk->fn(static_cast<int>(hidden), &s, wr, qa.data() + t * act_rb);
+                        gu[t * (2 * inter) + r] = s * sc;
+                    }
                 }
             } else {
-                strata::quant::dequant_row(static_cast<strata::quant::Type>(hdr.gu_type), src, wrow.data(), static_cast<int64_t>(hidden));
-            }
-        };
-        const bool interleaved = (hdr.flags & 1u) != 0;
-        if (interleaved) {
-            for (size_t r = 0; r < 2 * inter; ++r) {
-                deq_row(w_base + r * row_b);
-                const float sc = ((r & 1u) == 0) ? hdr.gate_scale : hdr.up_scale;
-                for (size_t t = 0; t < m; ++t) {
-                    gu[t * (2 * inter) + r] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * sc;
+                // Split layout: rows [0..inter-1] = gate, rows [inter..2*inter-1] = up
+                size_t j = 0;
+                if (dk4) {
+                    for (; j + 4 <= inter; j += 4) {
+                        const uint8_t* wg = w_base + j * row_b;
+                        const uint8_t* wu = w_base + (inter + j) * row_b;
+                        for (size_t t = 0; t < m; ++t) {
+                            float g4[4], u4[4];
+                            const void* ap = qa.data() + t * act_rb;
+                            dk4->fn(static_cast<int>(hidden), g4, wg, row_b, ap);
+                            dk4->fn(static_cast<int>(hidden), u4, wu, row_b, ap);
+                            float* dst = gu.data() + t * (2 * inter) + 2 * j;
+                            for (int k = 0; k < 4; ++k) {
+                                dst[2 * k + 0] = g4[k] * hdr.gate_scale;
+                                dst[2 * k + 1] = u4[k] * hdr.up_scale;
+                            }
+                        }
+                    }
+                }
+                for (; j < inter; ++j) {
+                    const uint8_t* wg = w_base + j * row_b;
+                    const uint8_t* wu = w_base + (inter + j) * row_b;
+                    for (size_t t = 0; t < m; ++t) {
+                        float gs = 0.0f, us = 0.0f;
+                        const void* ap = qa.data() + t * act_rb;
+                        dk->fn(static_cast<int>(hidden), &gs, wg, ap);
+                        dk->fn(static_cast<int>(hidden), &us, wu, ap);
+                        gu[t * (2 * inter) + 2 * j + 0] = gs * hdr.gate_scale;
+                        gu[t * (2 * inter) + 2 * j + 1] = us * hdr.up_scale;
+                    }
                 }
             }
         } else {
-            // Split layout: rows [0..inter-1] = gate, rows [inter..2*inter-1] = up
-            for (size_t j = 0; j < inter; ++j) {
-                deq_row(w_base + j * row_b);
-                for (size_t t = 0; t < m; ++t) {
-                    gu[t * (2 * inter) + 2 * j + 0] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.gate_scale;
+            std::vector<float> wrow(hidden);
+            auto deq_row = [&](const uint8_t* src) {
+                if (hdr.gu_type == 0) {
+                    std::memcpy(wrow.data(), src, hidden * 4);
+                } else if (hdr.gu_type == 1) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                    for (size_t c = 0; c < hidden; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
+                } else if (hdr.gu_type == 30) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                    for (size_t c = 0; c < hidden; ++c) {
+                        uint32_t u = static_cast<uint32_t>(p[c]) << 16;
+                        std::memcpy(&wrow[c], &u, 4);
+                    }
+                } else {
+                    strata::quant::dequant_row(qt, src, wrow.data(), static_cast<int64_t>(hidden));
                 }
-            }
-            for (size_t j = 0; j < inter; ++j) {
-                deq_row(w_base + (inter + j) * row_b);
-                for (size_t t = 0; t < m; ++t) {
-                    gu[t * (2 * inter) + 2 * j + 1] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.up_scale;
+            };
+            if (interleaved) {
+                for (size_t r = 0; r < 2 * inter; ++r) {
+                    deq_row(w_base + r * row_b);
+                    const float sc = ((r & 1u) == 0) ? hdr.gate_scale : hdr.up_scale;
+                    for (size_t t = 0; t < m; ++t) {
+                        gu[t * (2 * inter) + r] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * sc;
+                    }
+                }
+            } else {
+                for (size_t j = 0; j < inter; ++j) {
+                    deq_row(w_base + j * row_b);
+                    for (size_t t = 0; t < m; ++t) {
+                        gu[t * (2 * inter) + 2 * j + 0] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.gate_scale;
+                    }
+                }
+                for (size_t j = 0; j < inter; ++j) {
+                    deq_row(w_base + (inter + j) * row_b);
+                    for (size_t t = 0; t < m; ++t) {
+                        gu[t * (2 * inter) + 2 * j + 1] = dot_f32(wrow.data(), x_in + t * hidden, hidden) * hdr.up_scale;
+                    }
                 }
             }
         }
@@ -328,25 +405,64 @@ void eval_inkling2_expert_batch(
         strata::block_geometry(hdr.dn_type, be, bb);
         const size_t row_b = (be > 0) ? (inter / static_cast<size_t>(be)) * static_cast<size_t>(bb) : 0;
         const uint8_t* w2_base = body + dn_offset;
-        std::vector<float> wrow(inter);
-        for (size_t r = 0; r < hidden; ++r) {
-            const uint8_t* src = w2_base + r * row_b;
-            if (hdr.dn_type == 0) {
-                std::memcpy(wrow.data(), src, inter * 4);
-            } else if (hdr.dn_type == 1) {
-                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
-                for (size_t c = 0; c < inter; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
-            } else if (hdr.dn_type == 30) {
-                const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
-                for (size_t c = 0; c < inter; ++c) {
-                    uint32_t u = static_cast<uint32_t>(p[c]) << 16;
-                    std::memcpy(&wrow[c], &u, 4);
-                }
-            } else {
-                strata::quant::dequant_row(static_cast<strata::quant::Type>(hdr.dn_type), src, wrow.data(), static_cast<int64_t>(inter));
-            }
+
+        const auto qt = static_cast<strata::quant::Type>(hdr.dn_type);
+        const auto* ti = strata::quant::type_info(qt);
+        const auto arith = strata::quant::default_arith();
+        const auto* dk = (ti && ti->has_dot) ? strata::quant::dot_kernel(qt, arith) : nullptr;
+        const auto* dk4 = (ti && ti->has_dot) ? strata::quant::dot_x4_kernel(qt, arith) : nullptr;
+        const auto* ak = (dk && ti && ti->act != qt) ? strata::quant::act_kernel(ti->act, arith) : nullptr;
+        const size_t act_rb = ak ? strata::quant::row_bytes(static_cast<int>(ti->act), static_cast<int64_t>(inter)) : 0;
+
+        if (dk && ak && act_rb > 0 && row_b > 0) {
+            std::vector<uint8_t> qa(m * act_rb);
             for (size_t t = 0; t < m; ++t) {
-                y_out[t * hidden + r] = dot_f32(wrow.data(), act.data() + t * inter, inter) * hdr.dn_scale;
+                ak->fn(act.data() + t * inter, qa.data() + t * act_rb, static_cast<int64_t>(inter));
+            }
+            size_t r = 0;
+            if (dk4) {
+                for (; r + 4 <= hidden; r += 4) {
+                    const uint8_t* wr = w2_base + r * row_b;
+                    for (size_t t = 0; t < m; ++t) {
+                        float s4[4];
+                        dk4->fn(static_cast<int>(inter), s4, wr, row_b, qa.data() + t * act_rb);
+                        float* dst = y_out + t * hidden + r;
+                        dst[0] = s4[0] * hdr.dn_scale;
+                        dst[1] = s4[1] * hdr.dn_scale;
+                        dst[2] = s4[2] * hdr.dn_scale;
+                        dst[3] = s4[3] * hdr.dn_scale;
+                    }
+                }
+            }
+            for (; r < hidden; ++r) {
+                const uint8_t* wr = w2_base + r * row_b;
+                for (size_t t = 0; t < m; ++t) {
+                    float s = 0.0f;
+                    dk->fn(static_cast<int>(inter), &s, wr, qa.data() + t * act_rb);
+                    y_out[t * hidden + r] = s * hdr.dn_scale;
+                }
+            }
+        } else {
+            std::vector<float> wrow(inter);
+            for (size_t r = 0; r < hidden; ++r) {
+                const uint8_t* src = w2_base + r * row_b;
+                if (hdr.dn_type == 0) {
+                    std::memcpy(wrow.data(), src, inter * 4);
+                } else if (hdr.dn_type == 1) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                    for (size_t c = 0; c < inter; ++c) wrow[c] = fp16_bits_to_f32(p[c]);
+                } else if (hdr.dn_type == 30) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(src);
+                    for (size_t c = 0; c < inter; ++c) {
+                        uint32_t u = static_cast<uint32_t>(p[c]) << 16;
+                        std::memcpy(&wrow[c], &u, 4);
+                    }
+                } else {
+                    strata::quant::dequant_row(qt, src, wrow.data(), static_cast<int64_t>(inter));
+                }
+                for (size_t t = 0; t < m; ++t) {
+                    y_out[t * hidden + r] = dot_f32(wrow.data(), act.data() + t * inter, inter) * hdr.dn_scale;
+                }
             }
         }
     } else if (dn_code == SkCode::SF4) {

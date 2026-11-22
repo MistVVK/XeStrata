@@ -56,6 +56,253 @@ inline void sk_q8_sy(const uint8_t* pl, int j, int* q) {
 }
 
 // ============================================================================
+// 0B. Native Lossless Unsloth GGUF_RAW (code 20) SG16 Decoders (All 14 GGML Types)
+//     Priority: Q4_K(12), Q5_K(13), Q6_K(14), Q8_0(8), IQ4_XS(23), IQ3_XXS(18)
+//     Plus: IQ4_NL(20), Q4_0(2), Q3_K(11), Q2_K(10), MXFP4(39), BF16(30), F16(1), F32(0)
+// ============================================================================
+struct InkSyGgufExpertHeader {
+    uint32_t magic;      // 0x47475546 ('GGUF')
+    uint32_t gu_type;
+    uint32_t dn_type;
+    uint32_t flags;      // bit 0 = interleaved (2j=gate, 2j+1=up)
+    float gate_scale;
+    float up_scale;
+    float dn_scale;
+    uint32_t reserved;
+};
+
+inline size_t sy_gguf_row_bytes(uint32_t t, int K) {
+    switch (t) {
+        case 0:  return (size_t)K * 4u;
+        case 1:  return (size_t)K * 2u;
+        case 2:  return (size_t)(K >> 5) * 18u;
+        case 8:  return (size_t)(K >> 5) * 34u;
+        case 10: return (size_t)(K >> 8) * 84u;
+        case 11: return (size_t)(K >> 8) * 110u;
+        case 12: return (size_t)(K >> 8) * 144u;
+        case 13: return (size_t)(K >> 8) * 176u;
+        case 14: return (size_t)(K >> 8) * 210u;
+        case 18: return (size_t)(K >> 8) * 98u;
+        case 20: return (size_t)(K >> 5) * 18u;
+        case 23: return (size_t)(K >> 8) * 136u;
+        case 30: return (size_t)K * 2u;
+        case 39: return (size_t)(K >> 5) * 17u;
+        default: return 0u;
+    }
+}
+
+inline uint32_t sy_ld32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+inline float sy_iq4_nl(uint32_t i) {
+    constexpr float kLut[16] = {
+        -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+           1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
+    };
+    return kLut[i & 15u];
+}
+
+inline uint8_t sy_iq3_xxs_sign(uint32_t i) {
+    constexpr uint8_t kSigns[128] = {
+          0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+        144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+        160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+         48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+        192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+         80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+         96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+        240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
+    };
+    return kSigns[i & 127u];
+}
+
+inline uint32_t sy_iq3_xxs_grid(uint32_t i) {
+    constexpr uint32_t kGrid[256] = {
+        0x00000000u, 0x00000002u, 0x00000200u, 0x00000202u, 0x00020000u, 0x00020002u, 0x00020200u, 0x00020202u,
+        0x02000000u, 0x02000002u, 0x02000200u, 0x02000202u, 0x02020000u, 0x02020002u, 0x02020200u, 0x02020202u,
+        0x00000004u, 0x00000204u, 0x00020004u, 0x00020204u, 0x02000004u, 0x02000204u, 0x02020004u, 0x02020204u,
+        0x00000400u, 0x00000402u, 0x00000404u, 0x00020400u, 0x00020402u, 0x00020404u, 0x02000400u, 0x02000402u,
+        0x02000404u, 0x02020400u, 0x02020402u, 0x02020404u, 0x00040000u, 0x00040002u, 0x00040004u, 0x00040200u,
+        0x00040202u, 0x00040204u, 0x00040400u, 0x00040402u, 0x00040404u, 0x02040000u, 0x02040002u, 0x02040004u,
+        0x02040200u, 0x02040202u, 0x02040204u, 0x02040400u, 0x02040402u, 0x02040404u, 0x04000000u, 0x04000002u,
+        0x04000004u, 0x04000200u, 0x04000202u, 0x04000204u, 0x04000400u, 0x04000402u, 0x04000404u, 0x04020000u,
+        0x04020002u, 0x04020004u, 0x04020200u, 0x04020202u, 0x04020204u, 0x04020400u, 0x04020402u, 0x04020404u,
+        0x04040000u, 0x04040002u, 0x04040004u, 0x04040200u, 0x04040202u, 0x04040204u, 0x04040400u, 0x04040402u,
+        0x04040404u, 0x00000006u, 0x00000206u, 0x00000406u, 0x00020006u, 0x00020206u, 0x00020406u, 0x00040006u,
+        0x00040206u, 0x00040406u, 0x02000006u, 0x02000206u, 0x02000406u, 0x02020006u, 0x02020206u, 0x02020406u,
+        0x02040006u, 0x02040206u, 0x02040406u, 0x04000006u, 0x04000206u, 0x04000406u, 0x04020006u, 0x04020206u,
+        0x04020406u, 0x04040006u, 0x04040206u, 0x04040406u, 0x00000600u, 0x00000602u, 0x00000604u, 0x00000606u,
+        0x00020600u, 0x00020602u, 0x00020604u, 0x00020606u, 0x00040600u, 0x00040602u, 0x00040604u, 0x00040606u,
+        0x02000600u, 0x02000602u, 0x02000604u, 0x02000606u, 0x02020600u, 0x02020602u, 0x02020604u, 0x02020606u,
+        0x02040600u, 0x02040602u, 0x02040604u, 0x02040606u, 0x04000600u, 0x04000602u, 0x04000604u, 0x04000606u,
+        0x04020600u, 0x04020602u, 0x04020604u, 0x04020606u, 0x04040600u, 0x04040602u, 0x04040604u, 0x04040606u,
+        0x00060000u, 0x00060002u, 0x00060004u, 0x00060006u, 0x00060200u, 0x00060202u, 0x00060204u, 0x00060206u,
+        0x00060400u, 0x00060402u, 0x00060404u, 0x00060406u, 0x00060600u, 0x00060602u, 0x00060604u, 0x00060606u,
+        0x02060000u, 0x02060002u, 0x02060004u, 0x02060006u, 0x02060200u, 0x02060202u, 0x02060204u, 0x02060206u,
+        0x02060400u, 0x02060402u, 0x02060404u, 0x02060406u, 0x02060600u, 0x02060602u, 0x02060604u, 0x02060606u,
+        0x04060000u, 0x04060002u, 0x04060004u, 0x04060006u, 0x04060200u, 0x04060202u, 0x04060204u, 0x04060206u,
+        0x04060400u, 0x04060402u, 0x04060404u, 0x04060406u, 0x04060600u, 0x04060602u, 0x04060604u, 0x04060606u,
+        0x06000000u, 0x06000002u, 0x06000004u, 0x06000006u, 0x06000200u, 0x06000202u, 0x06000204u, 0x06000206u,
+        0x06000400u, 0x06000402u, 0x06000404u, 0x06000406u, 0x06000600u, 0x06000602u, 0x06000604u, 0x06000606u,
+        0x06020000u, 0x06020002u, 0x06020004u, 0x06020006u, 0x06020200u, 0x06020202u, 0x06020204u, 0x06020206u,
+        0x06020400u, 0x06020402u, 0x06020404u, 0x06020406u, 0x06020600u, 0x06020602u, 0x06020604u, 0x06020606u,
+        0x06040000u, 0x06040002u, 0x06040004u, 0x06040006u, 0x06040200u, 0x06040202u, 0x06040204u, 0x06040206u,
+        0x06040400u, 0x06040402u, 0x06040404u, 0x06040406u, 0x06040600u, 0x06040602u, 0x06040604u, 0x06040606u,
+        0x06060000u, 0x06060002u, 0x06060004u, 0x06060006u, 0x06060200u, 0x06060202u, 0x06060204u, 0x06060206u,
+        0x06060400u, 0x06060402u, 0x06060404u, 0x06060406u, 0x06060600u, 0x06060602u, 0x06060604u, 0x06060606u
+    };
+    return kGrid[i & 255u];
+}
+
+inline int sy_gguf_q3k_scale(const uint8_t* sc, int is) {
+    const uint32_t a0 = sy_ld32(sc + 0);
+    const uint32_t a1 = sy_ld32(sc + 4);
+    const uint32_t a2 = sy_ld32(sc + 8);
+    constexpr uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu;
+    const uint32_t u0 = (a0 & km2) | (((a2 >> 0) & km1) << 4);
+    const uint32_t u1 = (a1 & km2) | (((a2 >> 2) & km1) << 4);
+    const uint32_t u2 = ((a0 >> 4) & km2) | (((a2 >> 4) & km1) << 4);
+    const uint32_t u3 = ((a1 >> 4) & km2) | (((a2 >> 6) & km1) << 4);
+    const uint32_t w = (is < 4) ? u0 : (is < 8) ? u1 : (is < 12) ? u2 : u3;
+    return (int)((w >> ((is & 3) * 8)) & 0xFFu) - 32;
+}
+
+inline void sy_gguf_decode_8(uint32_t t, const uint8_t* row, int col, float ext_sc, float* out) {
+    if (t == 12u) {  // Q4_K (144 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 144u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const float dmin = h2f_bits(ld16(b + 2)) * ext_sc;
+        const int j = col & 255, g = j >> 6, is_hi = (j >> 5) & 1, is = g * 2 + is_hi;
+        const uint8_t* sc = b + 4;
+        uint32_t s, m;
+        if (is < 4) { s = sc[is] & 63u; m = sc[is + 4] & 63u; }
+        else { s = (sc[is + 4] & 0xFu) | ((sc[is - 4] >> 6) << 4); m = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+        const float d1 = d * (float)s, m1 = dmin * (float)m;
+        const uint8_t* qs = b + 16 + g * 32 + (j & 31);
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t q = is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu);
+            out[i] = d1 * (float)q - m1;
+        }
+    } else if (t == 13u) {  // Q5_K (176 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 176u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const float dmin = h2f_bits(ld16(b + 2)) * ext_sc;
+        const int j = col & 255, g = j >> 6, is_hi = (j >> 5) & 1, is = g * 2 + is_hi;
+        const uint8_t* sc = b + 4;
+        uint32_t s, m;
+        if (is < 4) { s = sc[is] & 63u; m = sc[is + 4] & 63u; }
+        else { s = (sc[is + 4] & 0xFu) | ((sc[is - 4] >> 6) << 4); m = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+        const float d1 = d * (float)s, m1 = dmin * (float)m;
+        const uint8_t* qh = b + 16 + (j & 31);
+        const uint8_t* qs = b + 48 + g * 32 + (j & 31);
+        const uint32_t hmask = 1u << is;
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t q = (is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu)) | ((qh[i] & hmask) ? 16u : 0u);
+            out[i] = d1 * (float)q - m1;
+        }
+    } else if (t == 14u) {  // Q6_K (210 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 210u;
+        const float d = h2f_bits(ld16(b + 208)) * ext_sc;
+        const int j = col & 255, h = j >> 7, q4 = (j >> 5) & 3, l0 = j & 31;
+        const uint8_t* ql = b + h * 64 + ((q4 & 1) ? 32 : 0) + l0;
+        const uint8_t* qh = b + 128 + h * 32 + l0;
+        const float sc = d * (float)((int8_t)b[192 + h * 8 + q4 * 2 + (l0 >> 4)]);
+        const int sh_ql = (q4 >= 2) ? 4 : 0;
+        const int sh_qh = q4 * 2;
+        for (int i = 0; i < 8; ++i) {
+            const int q = (int)(((ql[i] >> sh_ql) & 0xFu) | (((qh[i] >> sh_qh) & 3u) << 4)) - 32;
+            out[i] = sc * (float)q;
+        }
+    } else if (t == 8u) {  // Q8_0 (34 B / 32)
+        const uint8_t* b = row + (size_t)(col >> 5) * 34u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const int8_t* qs = reinterpret_cast<const int8_t*>(b + 2 + (col & 31));
+        for (int i = 0; i < 8; ++i) out[i] = d * (float)qs[i];
+    } else if (t == 23u) {  // IQ4_XS (136 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 136u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const uint16_t sh = ld16(b + 2);
+        const int j = col & 255, ib = j >> 5, l = j & 31;
+        const int ls = (int)(((b[4 + (ib >> 1)] >> ((ib & 1) * 4)) & 0xFu) | (((sh >> (2 * ib)) & 3u) << 4)) - 32;
+        const float dl = d * (float)ls;
+        const uint8_t* qs = b + 8 + ib * 16 + (l & 15);
+        const int is_hi = (l >= 16);
+        for (int i = 0; i < 8; ++i) {
+            out[i] = dl * sy_iq4_nl(is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu));
+        }
+    } else if (t == 18u) {  // IQ3_XXS (98 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 98u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const int j = col & 255, ib = j >> 5, l = (j & 31) >> 3;
+        const uint32_t aux = sy_ld32(b + 66 + ib * 4);
+        const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        const uint8_t signs = sy_iq3_xxs_sign((aux >> (7 * l)) & 127u);
+        const uint32_t g0 = sy_iq3_xxs_grid(b[2 + ib * 8 + l * 2 + 0]);
+        const uint32_t g1 = sy_iq3_xxs_grid(b[2 + ib * 8 + l * 2 + 1]);
+        for (int i = 0; i < 4; ++i) {
+            const float v0 = (float)((g0 >> (i * 8)) & 0xFFu) * db;
+            const float v1 = (float)((g1 >> (i * 8)) & 0xFFu) * db;
+            out[i]     = (signs & (1u << i)) ? -v0 : v0;
+            out[i + 4] = (signs & (1u << (i + 4))) ? -v1 : v1;
+        }
+    } else if (t == 20u) {  // IQ4_NL (18 B / 32)
+        const uint8_t* b = row + (size_t)(col >> 5) * 18u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const int l = col & 31, is_hi = (l >= 16);
+        const uint8_t* qs = b + 2 + (l & 15);
+        for (int i = 0; i < 8; ++i) out[i] = d * sy_iq4_nl(is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu));
+    } else if (t == 2u) {  // Q4_0 (18 B / 32)
+        const uint8_t* b = row + (size_t)(col >> 5) * 18u;
+        const float d = h2f_bits(ld16(b)) * ext_sc;
+        const int l = col & 31, is_hi = (l >= 16);
+        const uint8_t* qs = b + 2 + (l & 15);
+        for (int i = 0; i < 8; ++i) {
+            const int q = (int)(is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu)) - 8;
+            out[i] = d * (float)q;
+        }
+    } else if (t == 11u) {  // Q3_K (110 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 110u;
+        const float d_all = h2f_bits(ld16(b + 108)) * ext_sc;
+        const int j = col & 255, h = j >> 7, q4 = (j >> 5) & 3, l0 = j & 31;
+        const float dl = d_all * (float)sy_gguf_q3k_scale(b + 96, h * 8 + q4 * 2 + (l0 >> 4));
+        const uint8_t* qs = b + 32 + h * 32 + l0;
+        const uint8_t* hm = b + l0;
+        const int shift = q4 * 2;
+        const uint32_t mbit = 1u << (h * 4 + q4);
+        for (int i = 0; i < 8; ++i) {
+            const int q = (int)((qs[i] >> shift) & 3u) - ((hm[i] & mbit) ? 0 : 4);
+            out[i] = dl * (float)q;
+        }
+    } else if (t == 10u) {  // Q2_K (84 B / 256)
+        const uint8_t* b = row + (size_t)(col >> 8) * 84u;
+        const float d = h2f_bits(ld16(b + 80)) * ext_sc;
+        const float dmin = h2f_bits(ld16(b + 82)) * ext_sc;
+        const int j = col & 255, h = j >> 7, q4 = (j >> 5) & 3, l0 = j & 31;
+        const uint8_t scb = b[h * 8 + q4 * 2 + (l0 >> 4)];
+        const float dl = d * (float)(scb & 0xFu), ml = dmin * (float)(scb >> 4);
+        const uint8_t* qs = b + 16 + h * 32 + l0;
+        const int shift = q4 * 2;
+        for (int i = 0; i < 8; ++i) out[i] = dl * (float)((qs[i] >> shift) & 3u) - ml;
+    } else if (t == 39u) {  // MXFP4 (17 B / 32)
+        const uint8_t* b = row + (size_t)(col >> 5) * 17u;
+        const float d = ue8m0_to_f32(b[0]) * 2.0f * ext_sc;
+        const int l = col & 31, is_hi = (l >= 16);
+        const uint8_t* qs = b + 1 + (l & 15);
+        for (int i = 0; i < 8; ++i) out[i] = d * e2m1_lut(is_hi ? (qs[i] >> 4) : (qs[i] & 0xFu));
+    } else if (t == 30u) {  // BF16
+        const uint8_t* p = row + (size_t)col * 2u;
+        for (int i = 0; i < 8; ++i) out[i] = bf16_to_f32(ld16(p + i * 2)) * ext_sc;
+    } else if (t == 1u) {   // F16
+        const uint8_t* p = row + (size_t)col * 2u;
+        for (int i = 0; i < 8; ++i) out[i] = h2f_bits(ld16(p + i * 2)) * ext_sc;
+    } else {                // F32
+        const float* p = reinterpret_cast<const float*>(row) + col;
+        for (int i = 0; i < 8; ++i) out[i] = p[i] * ext_sc;
+    }
+}
+
+// ============================================================================
 // 1. Dense Trunk & DSpark Linear Kernels (SG16: BF16, Q8_ROW w/ dp4a, F32, S_K)
 // ============================================================================
 
@@ -356,7 +603,7 @@ inline void k_moe_gu_situ_sg16_q(
         const int e = uexp[y], off = uoff[y], n = ucnt[y];
         const InkSyExpertDev ed = ex_layer[e];
         const uint8_t* body = ed.body_ptr;
-        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
         const float inv_sq = is_sk_dn ? (1.0f / h2f_bits(ld16(body + 2 * r))) : 1.0f;
 
         for (int t0 = 0; t0 < n; t0 += 4) {
@@ -408,6 +655,25 @@ inline void k_moe_gu_situ_sg16_q(
                         float dg = 0.0f, du = 0.0f;
                         for (int j = 0; j < 32; ++j) { dg += e4m3_to_f32(bg[j]) * xp[j]; du += e4m3_to_f32(bu[j]) * xp[j]; }
                         ag[i] += dg * scg; au[i] += du * scu;
+                    }
+                }
+            } else if (ed.gu_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t gt = hdr->gu_type;
+                const size_t rb = sy_gguf_row_bytes(gt, 2304);
+                const bool ilv = (hdr->flags & 1u) != 0;
+                const uint8_t* rg = body + 32 + (size_t)(ilv ? (2 * r) : r) * rb;
+                const uint8_t* ru = body + 32 + (size_t)(ilv ? (2 * r + 1) : (1152 + r)) * rb;
+                for (int unit = lane; unit < 288; unit += 16) {
+                    const int col = unit << 3;
+                    float wg[8], wu[8];
+                    sy_gguf_decode_8(gt, rg, col, hdr->gate_scale, wg);
+                    sy_gguf_decode_8(gt, ru, col, hdr->up_scale, wu);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + col;
+                        float dg = 0.0f, du = 0.0f;
+                        for (int t = 0; t < 8; ++t) { dg += wg[t] * xp[t]; du += wu[t] * xp[t]; }
+                        ag[i] += dg; au[i] += du;
                     }
                 }
             } else {
@@ -515,6 +781,24 @@ inline void k_moe_dn_sg16_q(
                         float d0 = 0.0f, d1 = 0.0f;
                         for (int j = 0; j < 32; ++j) { d0 += e4m3_to_f32(b0[j]) * xp[j]; d1 += e4m3_to_f32(b1[j]) * xp[j]; }
                         a0[i] += d0 * sc0; a1[i] += d1 * sc1;
+                    }
+                }
+            } else if (ed.dn_code == FMT_GGUF_RAW) {
+                const InkSyGgufExpertHeader* hdr = reinterpret_cast<const InkSyGgufExpertHeader*>(body);
+                const uint32_t dt = hdr->dn_type;
+                const size_t rb = sy_gguf_row_bytes(dt, 1152);
+                const uint8_t* r0 = body + ed.dn_off + (size_t)(2 * rp) * rb;
+                const uint8_t* r1 = body + ed.dn_off + (size_t)(2 * rp + 1) * rb;
+                for (int unit = lane; unit < 144; unit += 16) {
+                    const int col = unit << 3;
+                    float w0[8], w1[8];
+                    sy_gguf_decode_8(dt, r0, col, hdr->dn_scale, w0);
+                    sy_gguf_decode_8(dt, r1, col, hdr->dn_scale, w1);
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = h_act + (size_t)pid[i] * 1152 + col;
+                        float d0 = 0.0f, d1 = 0.0f;
+                        for (int t = 0; t < 8; ++t) { d0 += w0[t] * xp[t]; d1 += w1[t] * xp[t]; }
+                        a0[i] += d0; a1[i] += d1;
                     }
                 }
             } else {

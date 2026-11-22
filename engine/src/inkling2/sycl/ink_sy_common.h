@@ -334,9 +334,31 @@ inline float situ_act(float g, float u) {
 // ---- Format IDs & Manifest ----
 enum InkFmt : int32_t {
     FMT_S2 = 2, FMT_S3 = 3, FMT_S4 = 4, FMT_S5 = 5, FMT_S6 = 6, FMT_S8 = 8,
-    FMT_SF4 = 15, FMT_MX8 = 16,
+    FMT_SF4 = 15, FMT_MX8 = 16, FMT_GGUF_RAW = 20,
     FMT_Q8ROW = 100, FMT_F32 = 101, FMT_BF16 = 102,
 };
+
+inline bool gguf_type_has_sycl_kernel(uint32_t t) noexcept {
+    switch (t) {
+        case 0:   // F32
+        case 1:   // F16
+        case 2:   // Q4_0
+        case 8:   // Q8_0
+        case 10:  // Q2_K
+        case 11:  // Q3_K
+        case 12:  // Q4_K
+        case 13:  // Q5_K
+        case 14:  // Q6_K
+        case 18:  // IQ3_XXS
+        case 20:  // IQ4_NL
+        case 23:  // IQ4_XS
+        case 30:  // BF16
+        case 39:  // MXFP4
+            return true;
+        default:
+            return false;
+    }
+}
 
 constexpr int sk_sb_bytes(int f) {
     return f == FMT_S2 ? 70 : f == FMT_S3 ? 102 : f == FMT_S4 ? 134 : f == FMT_S5 ? 166 : f == FMT_S6 ? 198 : f == FMT_S8 ? 262 : 0;
@@ -357,6 +379,7 @@ inline int fmt_from_name(const std::string& s) {
     if (s == "S8_K") return FMT_S8;
     if (s == "SF4") return FMT_SF4;
     if (s == "MX8") return FMT_MX8;
+    if (s == "GGUF_RAW") return FMT_GGUF_RAW;
     return FMT_F32;
 }
 
@@ -1075,10 +1098,52 @@ struct InkSyclModel {
         sec1.shrink_to_fit();
         prepare_preoriented_tables(host_tmp);
 
-        // 3. Plan transcoded expert directory & 3x loop-weighted VRAM vs Host-USM placement
+        // 3. Plan expert directory (preserving native lossless FMT_GGUF_RAW for all 14 supported GGML types!)
+        //    & 3x loop-weighted VRAM vs Host-USM placement
         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
-        std::vector<strata::artifact::StrataExpertEntry> adj_dir;
-        ink2::transcode::plan_transcoded_expert_directory(mf, adj_dir);
+        const bool force_sk_tc = (std::getenv("INK_SYCL_FORCE_SK_TRANSCODE") && std::atoi(std::getenv("INK_SYCL_FORCE_SK_TRANSCODE")) != 0);
+        std::vector<strata::artifact::StrataExpertEntry> adj_dir = mf.expert_directory();
+        std::vector<uint8_t> native_gguf(adj_dir.size(), 0);
+        size_t n_native_gguf = 0;
+        if (mf.kind == ink2::ModelSourceKind::Gguf && mf.gguf_adapter) {
+            const size_t h_sz = (size_t)man.c.hidden;
+            const size_t i_sz = (size_t)man.c.inter;
+            for (size_t i = 0; i < adj_dir.size(); ++i) {
+                auto& e = adj_dir[i];
+                if (e.gu_code_id != FMT_GGUF_RAW && e.dn_code_id != FMT_GGUF_RAW) continue;
+                const int il = (int)(i / (size_t)man.c.n_experts);
+                if (il < 0 || il >= (int)mf.gguf_adapter->layers.size()) continue;
+                const auto& lm = mf.gguf_adapter->layers[il];
+                if (!force_sk_tc && gguf_type_has_sycl_kernel(lm.gu_type) && gguf_type_has_sycl_kernel(lm.dn_type)) {
+                    native_gguf[i] = 1;
+                    ++n_native_gguf;
+                } else {
+                    const auto gu_c = ink2::transcode::choose_sk_code_for_ggml(lm.gu_type);
+                    const auto dn_c = ink2::transcode::choose_sk_code_for_ggml(lm.dn_type);
+                    uint32_t dn_off = 0, body_b = 0;
+                    ink2::transcode::transcoded_sk_expert_layout(gu_c, dn_c, h_sz, i_sz, dn_off, body_b);
+                    e.gu_code_id = (uint8_t)gu_c;
+                    e.dn_code_id = (uint8_t)dn_c;
+                    e.dn_offset  = dn_off;
+                    e.body_bytes = body_b;
+                }
+            }
+            if (n_native_gguf > 0) {
+                fprintf(stderr, "[ink_sycl] native lossless GGUF_RAW SG16+XMX kernels active for %zu/%zu experts (zero S_K transcode)\n",
+                        n_native_gguf, adj_dir.size());
+            }
+        }
+        auto read_expert_sy = [&](size_t di, std::vector<uint8_t>& out_b,
+                                  uint32_t& out_dn, uint8_t& out_gu, uint8_t& out_dnc, std::string& lerr) -> bool {
+            if (di < native_gguf.size() && native_gguf[di]) {
+                if (!mf.read_expert_body(di, out_b, lerr)) return false;
+                out_dn  = adj_dir[di].dn_offset;
+                out_gu  = adj_dir[di].gu_code_id;
+                out_dnc = adj_dir[di].dn_code_id;
+                return true;
+            }
+            return ink2::transcode::read_or_transcode_expert(mf, di, out_b, out_dn, out_gu, out_dnc, lerr);
+        };
 
         std::vector<strata::artifact::StrataExpertEntry> ents_by_gid(n_total);
         std::vector<size_t> dir_idx_by_gid(n_total, (size_t)-1);
@@ -1177,8 +1242,7 @@ struct InkSyclModel {
                     bool ok = ink2::transcode::parallel_run(n_in_slab, n_threads, [&](size_t k, std::string& lerr) -> bool {
                         const size_t gid = gids[start + k];
                         std::vector<uint8_t> tmp;
-                        if (!ink2::transcode::read_or_transcode_expert(
-                                mf, dir_idx_by_gid[gid], tmp, dn_offs[k], gu_codes[k], dn_codes[k], lerr)) {
+                        if (!read_expert_sy(dir_idx_by_gid[gid], tmp, dn_offs[k], gu_codes[k], dn_codes[k], lerr)) {
                             return false;
                         }
                         if (tmp.size() > ents_by_gid[gid].body_bytes) {
@@ -1206,8 +1270,7 @@ struct InkSyclModel {
                         std::vector<uint8_t> gu_codes(bn, 0), dn_codes(bn, 0);
                         bool ok = ink2::transcode::parallel_run(bn, n_threads, [&](size_t j, std::string& lerr) -> bool {
                             const size_t gid = gids[start + b0 + j];
-                            return ink2::transcode::read_or_transcode_expert(
-                                mf, dir_idx_by_gid[gid], bufs[j], dn_offs[j], gu_codes[j], dn_codes[j], lerr);
+                            return read_expert_sy(dir_idx_by_gid[gid], bufs[j], dn_offs[j], gu_codes[j], dn_codes[j], lerr);
                         }, err);
                         if (!ok) return false;
                         for (size_t j = 0; j < bn; ++j) {

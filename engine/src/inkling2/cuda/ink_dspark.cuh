@@ -1130,26 +1130,37 @@ struct InkDSpark {
         const int glob_init = (init_glob_ctx > 0) ? std::min(max_ctx, std::max(256, init_glob_ctx)) : std::min(max_ctx, 8192);
         frnn_cap = std::max(64, r.max_batch + 32);
 
-        // Pre-check free VRAM so DSpark NEVER crashes with CUDA error 2 (exit 3) on tight 4-8 GB GPUs!
+        // Pre-check free VRAM so DSpark NEVER crashes with CUDA error 2 (exit 3) on tight 4-16 GB GPUs!
+        // Shrink initial global DSpark KV cap (8192 -> 2048 -> 512) before giving up (#6633)!
+        int eff_glob_init = glob_init;
         {
             size_t vf = 0, vt = 0;
             if (ink_cuda_mem_info(&vf, &vt) == cudaSuccess) {
-                size_t kv_need = 0;
-                for (int il = 0; il < 3; ++il) {
-                    const int c = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : glob_init;
-                    kv_need += (size_t)c * kInkKVHeads * kInkHeadDim * 4;
+                auto calc_need = [&](int gcap) -> size_t {
+                    size_t kv_need = 0;
+                    for (int il = 0; il < 3; ++il) {
+                        const int c = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : gcap;
+                        kv_need += (size_t)c * kInkKVHeads * kInkHeadDim * 4;
+                    }
+                    return kv_need + (size_t)frnn_cap * kInkHidden * 4 + (80ull << 20);
+                };
+                if (vf < calc_need(eff_glob_init) + (96ull << 20) && eff_glob_init > 2048) {
+                    eff_glob_init = 2048;
                 }
-                const size_t base_need = kv_need + (size_t)frnn_cap * kInkHidden * 4 + (80ull << 20);
-                if (vf < base_need + (96ull << 20)) {
+                if (vf < calc_need(eff_glob_init) + (96ull << 20) && eff_glob_init > 512) {
+                    eff_glob_init = 512;
+                }
+                const size_t base_need = calc_need(eff_glob_init);
+                if (vf < base_need + (64ull << 20)) {
                     std::fprintf(stderr, "[InkCUDA] Skipping DSpark drafter: tight VRAM (%.0f MiB free < %.0f MiB needed)\n",
-                                 (double)vf / 1048576.0, (double)(base_need + (96ull << 20)) / 1048576.0);
+                                 (double)vf / 1048576.0, (double)(base_need + (64ull << 20)) / 1048576.0);
                     ready = false;
                     return;
                 }
             }
         }
         for (int il = 0; il < 3; ++il) {
-            ctx_cap[il] = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : glob_init;
+            ctx_cap[il] = (m.man.c.dspark_is_swa[il] != 0) ? swa_cap : eff_glob_init;
             d_ctx_k[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
             d_ctx_v[il] = dalloc<__half>((size_t)ctx_cap[il] * kInkKVHeads * kInkHeadDim);
         }

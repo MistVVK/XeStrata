@@ -80,15 +80,22 @@ target_compile_options(strata_inkling_cuda PRIVATE
 if(WIN32)
   target_compile_definitions(strata_inkling_cuda PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_definitions(strata_inkling_cuda_sm120 PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND STRATA_ISA_FLOOR STREQUAL "avx")
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX>)
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-  target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mfma>)
+  # #6618: Keep host code in ink_cuda_backend.cu free of AVX2/FMA; hot host loops dispatch at runtime
+  # into ink_host_avx2.cpp and strata_quant (AVX-512 VNNI / AVX2 / AVX1 / Scalar) via CPUID!
+  if(STRATA_ISA_FLOOR STREQUAL "avx")
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx,-mno-avx2,-mno-fma,-mno-f16c>)
+  else()
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-msse4.2,-mno-avx,-mno-avx2,-mno-fma,-mno-f16c>)
+  endif()
 endif()
 
 target_link_libraries(strata_inkling_cuda PUBLIC
   strata_inkling_cuda_sm120
+  strata_quant
   CUDA::cudart
   CUDA::cublas
 )

@@ -23,8 +23,375 @@ constexpr int CODE_S4_K  = 4;
 constexpr int CODE_S5_K  = 5;
 constexpr int CODE_S6_K  = 6;
 constexpr int CODE_S8_K  = 8;
-constexpr int CODE_SF4   = 15;
-constexpr int CODE_MX8   = 16;
+constexpr int CODE_SF4      = 15;
+constexpr int CODE_MX8      = 16;
+constexpr int CODE_GGUF_RAW = 20;
+
+// Native Lossless GGUF_RAW (code=20) expert header matching strata::quant::sk::GgufExpertHeader (32 B)
+struct HipGgufExpertHeader {
+    uint32_t magic;      // 0x47475546 ('GGUF')
+    uint32_t gu_type;    // ggml_type for gate/up
+    uint32_t dn_type;    // ggml_type for down
+    uint32_t flags;      // bit 0: 1=interleaved, 0=split [gate 0..inter-1, up inter..2*inter-1]
+    float    gate_scale;
+    float    up_scale;
+    float    dn_scale;
+    uint32_t reserved;
+};
+static_assert(sizeof(HipGgufExpertHeader) == 32, "HipGgufExpertHeader must be 32 B");
+
+__host__ __device__ inline bool gguf_type_has_hip_kernel(uint32_t t) noexcept {
+    switch (t) {
+        case 0: case 1: case 2: case 8:
+        case 10: case 11: case 12: case 13: case 14:
+        case 18: case 20: case 23: case 30: case 39:
+            return true;
+        default:
+            return false;
+    }
+}
+
+__host__ __device__ inline size_t hip_gguf_row_bytes(uint32_t t, int K) noexcept {
+    switch (t) {
+        case 12: return static_cast<size_t>(K >> 8) * 144u;
+        case 13: return static_cast<size_t>(K >> 8) * 176u;
+        case 14: return static_cast<size_t>(K >> 8) * 210u;
+        case 8:  return static_cast<size_t>(K >> 5) * 34u;
+        case 23: return static_cast<size_t>(K >> 8) * 136u;
+        case 18: return static_cast<size_t>(K >> 8) * 98u;
+        case 20:
+        case 2:  return static_cast<size_t>(K >> 5) * 18u;
+        case 11: return static_cast<size_t>(K >> 8) * 110u;
+        case 10: return static_cast<size_t>(K >> 8) * 84u;
+        case 39: return static_cast<size_t>(K >> 5) * 17u;
+        case 1:
+        case 30: return static_cast<size_t>(K) * 2u;
+        case 0:  return static_cast<size_t>(K) * 4u;
+        default: return 0u;
+    }
+}
+
+__device__ __constant__ float kHipIq4NlF32[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+       1.0f,   13.0f,  25.0f,  38.0f,  53.0f,  69.0f,  89.0f, 113.0f
+};
+
+__device__ __constant__ uint8_t kHipIq3XxsSigns[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
+};
+
+__device__ __constant__ uint32_t kHipIq3XxsGrid[256] = {
+    0x04040404u, 0x04040414u, 0x04040424u, 0x04040c0cu, 0x04040c1cu, 0x04040c3eu, 0x04041404u, 0x04041414u,
+    0x04041c0cu, 0x04042414u, 0x04043e1cu, 0x04043e2cu, 0x040c040cu, 0x040c041cu, 0x040c0c04u, 0x040c0c14u,
+    0x040c140cu, 0x040c142cu, 0x040c1c04u, 0x040c1c14u, 0x040c240cu, 0x040c2c24u, 0x040c3e04u, 0x04140404u,
+    0x04140414u, 0x04140424u, 0x04140c0cu, 0x04141404u, 0x04141414u, 0x04141c0cu, 0x04141c1cu, 0x04141c3eu,
+    0x04142c0cu, 0x04142c3eu, 0x04143e2cu, 0x041c040cu, 0x041c043eu, 0x041c0c04u, 0x041c0c14u, 0x041c142cu,
+    0x041c3e04u, 0x04240c1cu, 0x04241c3eu, 0x04242424u, 0x04242c3eu, 0x04243e1cu, 0x04243e2cu, 0x042c040cu,
+    0x042c043eu, 0x042c1c14u, 0x042c2c14u, 0x04341c2cu, 0x04343424u, 0x043e0c04u, 0x043e0c24u, 0x043e0c34u,
+    0x043e241cu, 0x043e340cu, 0x0c04040cu, 0x0c04041cu, 0x0c040c04u, 0x0c040c14u, 0x0c04140cu, 0x0c04141cu,
+    0x0c041c04u, 0x0c041c14u, 0x0c041c24u, 0x0c04243eu, 0x0c042c04u, 0x0c0c0404u, 0x0c0c0414u, 0x0c0c0c0cu,
+    0x0c0c1404u, 0x0c0c1414u, 0x0c14040cu, 0x0c14041cu, 0x0c140c04u, 0x0c140c14u, 0x0c14140cu, 0x0c141c04u,
+    0x0c143e14u, 0x0c1c0404u, 0x0c1c0414u, 0x0c1c1404u, 0x0c1c1c0cu, 0x0c1c2434u, 0x0c1c3434u, 0x0c24040cu,
+    0x0c24042cu, 0x0c242c04u, 0x0c2c1404u, 0x0c2c1424u, 0x0c2c2434u, 0x0c2c3e0cu, 0x0c34042cu, 0x0c3e1414u,
+    0x0c3e2404u, 0x14040404u, 0x14040414u, 0x14040c0cu, 0x14040c1cu, 0x14041404u, 0x14041414u, 0x14041434u,
+    0x14041c0cu, 0x14042414u, 0x140c040cu, 0x140c041cu, 0x140c042cu, 0x140c0c04u, 0x140c0c14u, 0x140c140cu,
+    0x140c1c04u, 0x140c341cu, 0x140c343eu, 0x140c3e04u, 0x14140404u, 0x14140414u, 0x14140c0cu, 0x14140c3eu,
+    0x14141404u, 0x14141414u, 0x14141c3eu, 0x14142404u, 0x14142c2cu, 0x141c040cu, 0x141c0c04u, 0x141c0c24u,
+    0x141c3e04u, 0x141c3e24u, 0x14241c2cu, 0x14242c1cu, 0x142c041cu, 0x142c143eu, 0x142c240cu, 0x142c3e24u,
+    0x143e040cu, 0x143e041cu, 0x143e0c34u, 0x143e242cu, 0x1c04040cu, 0x1c040c04u, 0x1c040c14u, 0x1c04140cu,
+    0x1c04141cu, 0x1c042c04u, 0x1c04342cu, 0x1c043e14u, 0x1c0c0404u, 0x1c0c0414u, 0x1c0c1404u, 0x1c0c1c0cu,
+    0x1c0c2424u, 0x1c0c2434u, 0x1c14040cu, 0x1c14041cu, 0x1c140c04u, 0x1c14142cu, 0x1c142c14u, 0x1c143e14u,
+    0x1c1c0c0cu, 0x1c1c1c1cu, 0x1c241c04u, 0x1c24243eu, 0x1c243e14u, 0x1c2c0404u, 0x1c2c0434u, 0x1c2c1414u,
+    0x1c2c2c2cu, 0x1c340c24u, 0x1c341c34u, 0x1c34341cu, 0x1c3e1c1cu, 0x1c3e3404u, 0x24040424u, 0x24040c3eu,
+    0x24041c2cu, 0x24041c3eu, 0x24042c1cu, 0x24042c3eu, 0x240c3e24u, 0x24141404u, 0x24141c3eu, 0x24142404u,
+    0x24143404u, 0x24143434u, 0x241c043eu, 0x241c242cu, 0x24240424u, 0x24242c0cu, 0x24243424u, 0x242c142cu,
+    0x242c241cu, 0x242c3e04u, 0x243e042cu, 0x243e0c04u, 0x243e0c14u, 0x243e1c04u, 0x2c040c14u, 0x2c04240cu,
+    0x2c043e04u, 0x2c0c0404u, 0x2c0c0434u, 0x2c0c1434u, 0x2c0c2c2cu, 0x2c140c24u, 0x2c141c14u, 0x2c143e14u,
+    0x2c1c0414u, 0x2c1c2c1cu, 0x2c240c04u, 0x2c24141cu, 0x2c24143eu, 0x2c243e14u, 0x2c2c0414u, 0x2c2c1c0c,
+    0x2c342c04u, 0x2c3e1424u, 0x2c3e2414u, 0x34041424u, 0x34042424u, 0x34042434u, 0x34043424u, 0x340c140cu,
+    0x340c340cu, 0x34140c3eu, 0x34143424u, 0x341c1c04u, 0x341c1c34u, 0x34242424u, 0x342c042cu, 0x342c2c14u,
+    0x34341c1cu, 0x343e041cu, 0x343e140cu, 0x3e04041cu, 0x3e04042cu, 0x3e04043eu, 0x3e040c04u, 0x3e041c14u,
+    0x3e042c14u, 0x3e0c1434u, 0x3e0c2404u, 0x3e140c14u, 0x3e14242cu, 0x3e142c14u, 0x3e1c0404u, 0x3e1c0c2cu,
+    0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu, 0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u
+};
+
+__device__ __forceinline__ float hip_gguf_q3k_scale(const uint8_t* sc, int is) {
+    int s = 0;
+    if (is < 4)       s = static_cast<int>(sc[is] & 0xFu) | (static_cast<int>((sc[8 + is] >> 0) & 3u) << 4);
+    else if (is < 8)  s = static_cast<int>(sc[is] & 0xFu) | (static_cast<int>((sc[8 + (is - 4)] >> 2) & 3u) << 4);
+    else if (is < 12) s = static_cast<int>(sc[is - 8] >> 4) | (static_cast<int>((sc[8 + (is - 8)] >> 4) & 3u) << 4);
+    else              s = static_cast<int>(sc[is - 8] >> 4) | (static_cast<int>((sc[8 + (is - 12)] >> 6) & 3u) << 4);
+    return static_cast<float>(s - 32);
+}
+
+// Decode 8 consecutive weights starting at 8-aligned `col` from a single GGUF row into uint4 (8 x FP16 for fdot2/WMMA)
+__device__ __forceinline__ uint4 hip_gguf_decode_8_f16(uint32_t t, const uint8_t* __restrict__ row, int col, float ext_scale) {
+    float w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (t == 12u) {  // Q4_K: 256 elems = 144 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 144u;
+        const float d = ld_fp16_as_f32(blk);
+        const float dmin = ld_fp16_as_f32(blk + 2);
+        const uint8_t* sc = blk + 4;
+        const uint8_t* qs = blk + 16;
+        const int j64 = idx >> 6, in64 = idx & 63, sub = j64 * 2 + (in64 >> 5);
+        uint8_t sd, sm;
+        if (sub < 4) { sd = sc[sub] & 63u; sm = sc[sub + 4] & 63u; }
+        else { sd = (sc[sub + 4] & 0xFu) | ((sc[sub - 4] >> 6) << 4); sm = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4); }
+        const float dl = d * static_cast<float>(sd) * ext_scale;
+        const float ml = -dmin * static_cast<float>(sm) * ext_scale;
+        const uint8_t* qp = qs + j64 * 32 + (in64 & 31);
+        const uint32_t sh = (in64 < 32) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = static_cast<float>((qp[k] >> sh) & 15u) * dl + ml;
+    } else if (t == 13u) {  // Q5_K: 256 elems = 176 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 176u;
+        const float d = ld_fp16_as_f32(blk);
+        const float dmin = ld_fp16_as_f32(blk + 2);
+        const uint8_t* sc = blk + 4;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* qs = blk + 48;
+        const int j64 = idx >> 6, in64 = idx & 63, sub = j64 * 2 + (in64 >> 5), l = in64 & 31;
+        uint8_t sd, sm;
+        if (sub < 4) { sd = sc[sub] & 63u; sm = sc[sub + 4] & 63u; }
+        else { sd = (sc[sub + 4] & 0xFu) | ((sc[sub - 4] >> 6) << 4); sm = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4); }
+        const float dl = d * static_cast<float>(sd) * ext_scale;
+        const float ml = -dmin * static_cast<float>(sm) * ext_scale;
+        const uint8_t* qp = qs + j64 * 32 + l;
+        const uint8_t* hp = qh + l;
+        const uint32_t sh = (in64 < 32) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint32_t ql = (static_cast<uint32_t>(qp[k]) >> sh) & 15u;
+            const uint32_t hb = (static_cast<uint32_t>(hp[k]) >> static_cast<uint32_t>(sub)) & 1u;
+            w[k] = static_cast<float>(ql | (hb << 4)) * dl + ml;
+        }
+    } else if (t == 14u) {  // Q6_K: 256 elems = 210 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 210u;
+        const float d = ld_fp16_as_f32(blk + 208);
+        const int hf = idx >> 7, r = idx & 127, qg = r >> 5, l = r & 31, is = l >> 4;
+        const uint8_t* qlh = blk + hf * 64 + ((qg & 1) ? 32 : 0) + l;
+        const uint8_t* qhh = blk + 128 + hf * 32 + l;
+        const int8_t* sch = reinterpret_cast<const int8_t*>(blk + 192 + hf * 8);
+        const float dl = d * static_cast<float>(sch[is + qg * 2]) * ext_scale;
+        const uint32_t qsh = (qg >= 2) ? 4u : 0u;
+        const uint32_t hsh = static_cast<uint32_t>(qg * 2);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int q = static_cast<int>(((static_cast<uint32_t>(qlh[k]) >> qsh) & 15u) |
+                                           (((static_cast<uint32_t>(qhh[k]) >> hsh) & 3u) << 4)) - 32;
+            w[k] = dl * static_cast<float>(q);
+        }
+    } else if (t == 8u) {  // Q8_0: 32 elems = 34 B
+        const int b = col >> 5, in32 = col & 31;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 34u;
+        const float d = ld_fp16_as_f32(blk) * ext_scale;
+        const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2 + in32);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = static_cast<float>(qs[k]) * d;
+    } else if (t == 23u) {  // IQ4_XS: 256 elems = 136 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 136u;
+        const float d = ld_fp16_as_f32(blk);
+        const uint16_t sh = static_cast<uint16_t>(blk[2]) | (static_cast<uint16_t>(blk[3]) << 8);
+        const uint8_t* sl = blk + 4;
+        const uint8_t* qs = blk + 8;
+        const int ib = idx >> 5, in32 = idx & 31;
+        const int ls = static_cast<int>((sl[ib >> 1] >> (4 * (ib & 1))) & 15u) |
+                       (static_cast<int>((sh >> (2 * ib)) & 3u) << 4);
+        const float dl = d * static_cast<float>(ls - 32) * ext_scale;
+        const uint8_t* qp = qs + ib * 16 + (in32 & 15);
+        const uint32_t qsh = (in32 < 16) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = kHipIq4NlF32[(qp[k] >> qsh) & 15u] * dl;
+    } else if (t == 18u) {  // IQ3_XXS: 256 elems = 98 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 98u;
+        const float d = ld_fp16_as_f32(blk);
+        const uint8_t* qs = blk + 2;
+        const uint8_t* ss = blk + 66;
+        const int ib32 = idx >> 5, l = (idx & 31) >> 3;
+        const uint32_t aux32 = static_cast<uint32_t>(ss[4 * ib32 + 0]) |
+                               (static_cast<uint32_t>(ss[4 * ib32 + 1]) << 8) |
+                               (static_cast<uint32_t>(ss[4 * ib32 + 2]) << 16) |
+                               (static_cast<uint32_t>(ss[4 * ib32 + 3]) << 24);
+        const float db = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f * ext_scale;
+        const uint8_t signs = kHipIq3XxsSigns[(aux32 >> static_cast<uint32_t>(7 * l)) & 127u];
+        const uint32_t g1 = kHipIq3XxsGrid[qs[ib32 * 8 + 2 * l + 0]];
+        const uint32_t g2 = kHipIq3XxsGrid[qs[ib32 * 8 + 2 * l + 1]];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            w[k]     = static_cast<float>((g1 >> (k * 8)) & 255u) * ((signs & (1u << k)) ? -db : db);
+            w[k + 4] = static_cast<float>((g2 >> (k * 8)) & 255u) * ((signs & (1u << (k + 4))) ? -db : db);
+        }
+    } else if (t == 20u) {  // IQ4_NL: 32 elems = 18 B
+        const int b = col >> 5, in32 = col & 31;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 18u;
+        const float d = ld_fp16_as_f32(blk) * ext_scale;
+        const uint8_t* qp = blk + 2 + (in32 & 15);
+        const uint32_t qsh = (in32 < 16) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = kHipIq4NlF32[(qp[k] >> qsh) & 15u] * d;
+    } else if (t == 2u) {  // Q4_0: 32 elems = 18 B
+        const int b = col >> 5, in32 = col & 31;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 18u;
+        const float d = ld_fp16_as_f32(blk) * ext_scale;
+        const uint8_t* qp = blk + 2 + (in32 & 15);
+        const uint32_t qsh = (in32 < 16) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = (static_cast<float>((qp[k] >> qsh) & 15u) - 8.0f) * d;
+    } else if (t == 11u) {  // Q3_K: 256 elems = 110 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 110u;
+        const uint8_t* hm = blk;
+        const uint8_t* qs = blk + 32;
+        const uint8_t* sc = blk + 96;
+        const float d_all = ld_fp16_as_f32(blk + 108);
+        const int n128 = idx >> 7, in128 = idx & 127, j = in128 >> 5, l32 = in128 & 31;
+        const int is = n128 * 8 + j * 2 + (l32 >> 4);
+        const float dl = d_all * hip_gguf_q3k_scale(sc, is) * ext_scale;
+        const uint32_t shift = static_cast<uint32_t>(j * 2);
+        const uint8_t mask = static_cast<uint8_t>(1u << static_cast<uint32_t>(n128 * 4 + j));
+        const uint8_t* qp = qs + n128 * 32 + l32;
+        const uint8_t* hp = hm + l32;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int q2 = static_cast<int>((qp[k] >> shift) & 3u);
+            const int hbit = (hp[k] & mask) ? 0 : 4;
+            w[k] = dl * static_cast<float>(q2 - hbit);
+        }
+    } else if (t == 10u) {  // Q2_K: 256 elems = 84 B
+        const int b = col >> 8, idx = col & 255;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 84u;
+        const uint8_t* sc = blk;
+        const uint8_t* qs = blk + 16;
+        const float d = ld_fp16_as_f32(blk + 80);
+        const float dmin = ld_fp16_as_f32(blk + 82);
+        const int n128 = idx >> 7, in128 = idx & 127, j = in128 >> 5, l32 = in128 & 31;
+        const int is = n128 * 8 + j * 2 + (l32 >> 4);
+        const uint8_t scb = sc[is];
+        const float dl = d * static_cast<float>(scb & 15u) * ext_scale;
+        const float ml = -dmin * static_cast<float>(scb >> 4) * ext_scale;
+        const uint32_t shift = static_cast<uint32_t>(j * 2);
+        const uint8_t* qp = qs + n128 * 32 + l32;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = static_cast<float>((qp[k] >> shift) & 3u) * dl + ml;
+    } else if (t == 39u) {  // MXFP4: 32 elems = 17 B
+        const int b = col >> 5, in32 = col & 31;
+        const uint8_t* blk = row + static_cast<size_t>(b) * 17u;
+        const uint32_t e = blk[0];
+        const float d = (e < 2u) ? __builtin_bit_cast(float, 0x00200000u << e)
+                                 : __builtin_bit_cast(float, (e - 1u) << 23);
+        const float d2 = 2.0f * d * ext_scale;
+        const uint8_t* qp = blk + 1 + (in32 & 15);
+        const uint32_t qsh = (in32 < 16) ? 0u : 4u;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = sf4_e2m1_f32((qp[k] >> qsh) & 15u) * d2;
+    } else if (t == 30u) {  // BF16
+        const uint16_t* wp = reinterpret_cast<const uint16_t*>(row + static_cast<size_t>(col) * 2u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = bf16_to_f32(wp[k]) * ext_scale;
+    } else if (t == 1u) {   // F16
+        const half_t* wp = reinterpret_cast<const half_t*>(row + static_cast<size_t>(col) * 2u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = static_cast<float>(wp[k]) * ext_scale;
+    } else if (t == 0u) {   // F32
+        const float* wp = reinterpret_cast<const float*>(row + static_cast<size_t>(col) * 4u);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) w[k] = wp[k] * ext_scale;
+    }
+    return make_uint4(h2_pack(w[0], w[1]), h2_pack(w[2], w[3]), h2_pack(w[4], w[5]), h2_pack(w[6], w[7]));
+}
+
+// Fast GGUF_RAW -> FP16 unpack kernel (for hipBLASLt L3-resident expert GEMM)
+__global__ void __launch_bounds__(256) k_unpack_gguf_f16(
+    const uint8_t* __restrict__ body_dev,
+    uint32_t dn_offset,
+    bool is_w13,
+    half_t* __restrict__ out_f16,
+    int N, int K, int inter) {
+    const int k8_tot = K >> 3;
+    const int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= N * k8_tot) return;
+    const int r = idx / k8_tot;
+    const int k8 = idx - r * k8_tot;
+    const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(body_dev);
+    const uint32_t ggml_type = is_w13 ? hdr->gu_type : hdr->dn_type;
+    const size_t rb = hip_gguf_row_bytes(ggml_type, K);
+    const uint8_t* base = body_dev + (is_w13 ? 32u : dn_offset);
+    int src_r = r;
+    float sc = hdr->dn_scale;
+    if (is_w13) {
+        src_r = (hdr->flags & 1u) ? r : (((r & 1) ? inter : 0) + (r >> 1));
+        sc = (r & 1) ? hdr->up_scale : hdr->gate_scale;
+    }
+    const uint4 wv = hip_gguf_decode_8_f16(ggml_type, base + static_cast<size_t>(src_r) * rb, k8 << 3, sc);
+    *reinterpret_cast<uint4*>(out_f16 + static_cast<size_t>(r) * K + (k8 << 3)) = wv;
+}
+
+// Direct Wave32 fdot2 GGUF_RAW linear kernel (used by Fast Path B2 hybrid streaming when hipBLASLt is off / m_e < 8)
+__global__ void __launch_bounds__(256) k_gguf_linear_fdot2(
+    const uint8_t* __restrict__ body_dev,
+    uint32_t dn_offset,
+    bool is_w13,
+    const half_t* __restrict__ X_f16,
+    float* __restrict__ Y_f32,
+    int M, int N, int K, int inter) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int r = blockIdx.x * 8 + wave;
+    if (r >= N) return;
+    const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(body_dev);
+    const uint32_t ggml_type = is_w13 ? hdr->gu_type : hdr->dn_type;
+    const size_t rb = hip_gguf_row_bytes(ggml_type, K);
+    const uint8_t* base = body_dev + (is_w13 ? 32u : dn_offset);
+    int src_r = r;
+    float sc = hdr->dn_scale;
+    if (is_w13) {
+        src_r = (hdr->flags & 1u) ? r : (((r & 1) ? inter : 0) + (r >> 1));
+        sc = (r & 1) ? hdr->up_scale : hdr->gate_scale;
+    }
+    const uint8_t* row_p = base + static_cast<size_t>(src_r) * rb;
+    const int n8 = K >> 3;
+    for (int m0 = blockIdx.y * 8; m0 < M; m0 += gridDim.y * 8) {
+        const int mm = (M - m0 < 8) ? (M - m0) : 8;
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(ggml_type, row_p, u << 3, sc);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < mm) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(m0 + i) * K + (u << 3));
+                    float d = fdot2_f32(wv.x, xv.x, acc[i]);
+                    d = fdot2_f32(wv.y, xv.y, d);
+                    d = fdot2_f32(wv.z, xv.z, d);
+                    acc[i] = fdot2_f32(wv.w, xv.w, d);
+                }
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            const float v = wave32_sum(acc[i]);
+            if (lane == 0) Y_f32[static_cast<size_t>(m0 + i) * N + r] = v;
+        }
+    }
+}
+
+inline void launch_gguf_linear(
+    const uint8_t* body_dev, uint32_t dn_offset, bool is_w13,
+    const half_t* X_f16, float* Y_f32, int M, int N, int K, int inter, hipStream_t stream) {
+    const dim3 grid((N + 7) / 8, (M + 7) / 8);
+    k_gguf_linear_fdot2<<<grid, 256, 0, stream>>>(body_dev, dn_offset, is_w13, X_f16, Y_f32, M, N, K, inter);
+}
 
 __host__ __device__ constexpr int sk_sb_bytes(int code) noexcept {
     switch (code) {
@@ -2555,6 +2922,22 @@ __global__ void __launch_bounds__(256) k_moe_direct_w13_situ(
             }
             acc = fmaf(d, sc, acc);
         }
+    } else if (desc.gu_code == CODE_GGUF_RAW) {
+        const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+        const uint32_t gt = hdr->gu_type;
+        const size_t rb = hip_gguf_row_bytes(gt, D);
+        const int src_row = (hdr->flags & 1u) ? row : (((row & 1) ? inter : 0) + (row >> 1));
+        const float ext_sc = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+        const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+        const int n8 = D >> 3;
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(gt, wr, u << 3, ext_sc);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (u << 3));
+            float d = fdot2_f32(wv.x, xv.x, acc);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            acc = fdot2_f32(wv.w, xv.w, d);
+        }
     } else if (desc.gu_code == CODE_S2_K) {
         const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
         const int nsb = D >> 8;
@@ -2617,7 +3000,7 @@ __global__ void __launch_bounds__(256) k_moe_direct_w13_situ(
         const float g = s_gu[wave];
         const float u = s_gu[wave + 1];
         float v = situ_f32(g, u, beta, lb);
-        if (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8) {
+        if (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW) {
             const float sq = static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j]);
             v /= sq;
         }
@@ -2718,6 +3101,20 @@ __global__ void __launch_bounds__(256) k_moe_direct_w2_par(
                 d = fdot2_f32(__builtin_bit_cast(uint32_t, h3), xv.w, d);
             }
             acc = fmaf(d, sc, acc);
+        }
+    } else if (desc.dn_code == CODE_GGUF_RAW) {
+        const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+        const uint32_t dt = hdr->dn_type;
+        const size_t rb = hip_gguf_row_bytes(dt, inter);
+        const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(row) * rb;
+        const int n8 = inter >> 3;
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(dt, wr, u << 3, hdr->dn_scale);
+            const uint4 xv = *reinterpret_cast<const uint4*>(asrc + (u << 3));
+            float d = fdot2_f32(wv.x, xv.x, acc);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            acc = fdot2_f32(wv.w, xv.w, d);
         }
     } else if (desc.dn_code == CODE_S2_K) {
         const uint8_t* W = desc.body + desc.dn_offset;
@@ -2929,6 +3326,20 @@ __global__ void __launch_bounds__(256) k_moe_direct_w2_reduce(
                     d = fdot2_f32(__builtin_bit_cast(uint32_t, h3), xv.w, d);
                 }
                 acc = fmaf(d, sc, acc);
+            }
+        } else if (desc.dn_code == CODE_GGUF_RAW) {
+            const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+            const uint32_t dt = hdr->dn_type;
+            const size_t rb = hip_gguf_row_bytes(dt, inter);
+            const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(row) * rb;
+            const int n8 = inter >> 3;
+            for (int u = lane; u < n8; u += 32) {
+                const uint4 wv = hip_gguf_decode_8_f16(dt, wr, u << 3, hdr->dn_scale);
+                const uint4 xv = *reinterpret_cast<const uint4*>(arow + (u << 3));
+                float d = fdot2_f32(wv.x, xv.x, acc);
+                d = fdot2_f32(wv.y, xv.y, d);
+                d = fdot2_f32(wv.z, xv.z, d);
+                acc = fdot2_f32(wv.w, xv.w, d);
             }
         } else {
             // Paired 2-row S_K: 4 subgroups (256 weights) per wave iter via 8-weight fast 32-bit unpack + uint4 loads!
@@ -3172,7 +3583,23 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
                 }
                 acc = fmaf(d, sc, acc);
             }
-        } else if (desc.gu_code == CODE_S2_K) {
+        } else if (desc.gu_code == CODE_GGUF_RAW) {
+        const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+        const uint32_t gt = hdr->gu_type;
+        const size_t rb = hip_gguf_row_bytes(gt, D);
+        const int src_row = (hdr->flags & 1u) ? row : (((row & 1) ? inter : 0) + (row >> 1));
+        const float ext_sc = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+        const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+        const int n8 = D >> 3;
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(gt, wr, u << 3, ext_sc);
+            const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (u << 3));
+            float d = fdot2_f32(wv.x, xv.x, acc);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            acc = fdot2_f32(wv.w, xv.w, d);
+        }
+    } else if (desc.gu_code == CODE_S2_K) {
             const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
             const int nsb = D >> 8;
             const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 70;
@@ -3229,7 +3656,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
         if (lane == 0) s_gu[wave * 8] = sum;
         __syncthreads();
         if (lane == 0 && (wave & 1) == 0) {
-            const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8);
+            const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
             const float inv_sq = need_sq ? (1.0f / static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j])) : 1.0f;
             bucket_act[static_cast<size_t>(beg) * inter + j] =
                 static_cast<half_t>(situ_f32(s_gu[wave * 8], s_gu[(wave + 1) * 8], beta, lb) * inv_sq);
@@ -3306,6 +3733,25 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
                 }
                 for (int t = 0; t < tm; ++t) acc[t] = fmaf(dt[t], sc, acc[t]);
             }
+        } else if (desc.gu_code == CODE_GGUF_RAW) {
+            const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+            const uint32_t gt = hdr->gu_type;
+            const size_t rb = hip_gguf_row_bytes(gt, D);
+            const int src_row = (hdr->flags & 1u) ? row : (((row & 1) ? inter : 0) + (row >> 1));
+            const float ext_sc = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+            const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+            const int n8 = D >> 3;
+            for (int u = lane; u < n8; u += 32) {
+                const uint4 wv = hip_gguf_decode_8_f16(gt, wr, u << 3, ext_sc);
+                const int k0 = u << 3;
+                for (int t = 0; t < tm; ++t) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[t]) * D + k0);
+                    float d = fdot2_f32(wv.x, xv.x, acc[t]);
+                    d = fdot2_f32(wv.y, xv.y, d);
+                    d = fdot2_f32(wv.z, xv.z, d);
+                    acc[t] = fdot2_f32(wv.w, xv.w, d);
+                }
+            }
         } else if (desc.gu_code == CODE_S2_K) {
             const uint8_t* gu_ptr = desc.body + static_cast<size_t>(inter) * 2;
             const int nsb = D >> 8;
@@ -3369,7 +3815,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
         }
         __syncthreads();
         if (lane == 0 && (wave & 1) == 0) {
-            const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8);
+            const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
             const float inv_sq = need_sq ? (1.0f / static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j])) : 1.0f;
             for (int t = 0; t < tm; ++t) {
                 const float g = s_gu[wave * 8 + t];
@@ -3478,7 +3924,21 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
                 }
                 acc = fmaf(d, sc, acc);
             }
-        } else if (desc.dn_code == CODE_S2_K) {
+        } else if (desc.dn_code == CODE_GGUF_RAW) {
+        const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+        const uint32_t dt = hdr->dn_type;
+        const size_t rb = hip_gguf_row_bytes(dt, inter);
+        const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(row) * rb;
+        const int n8 = inter >> 3;
+        for (int u = lane; u < n8; u += 32) {
+            const uint4 wv = hip_gguf_decode_8_f16(dt, wr, u << 3, hdr->dn_scale);
+            const uint4 xv = *reinterpret_cast<const uint4*>(asrc + (u << 3));
+            float d = fdot2_f32(wv.x, xv.x, acc);
+            d = fdot2_f32(wv.y, xv.y, d);
+            d = fdot2_f32(wv.z, xv.z, d);
+            acc = fdot2_f32(wv.w, xv.w, d);
+        }
+    } else if (desc.dn_code == CODE_S2_K) {
             const uint8_t* W = desc.body + desc.dn_offset;
             const int pair = row >> 1;
             const int is_odd = row & 1;
@@ -3619,6 +4079,23 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
                     }
                 }
                 for (int t = 0; t < tm; ++t) acc[t] = fmaf(dt[t], sc, acc[t]);
+            }
+        } else if (desc.dn_code == CODE_GGUF_RAW) {
+            const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+            const uint32_t dt = hdr->dn_type;
+            const size_t rb = hip_gguf_row_bytes(dt, inter);
+            const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(row) * rb;
+            const int n8 = inter >> 3;
+            for (int u = lane; u < n8; u += 32) {
+                const uint4 wv = hip_gguf_decode_8_f16(dt, wr, u << 3, hdr->dn_scale);
+                const int col0 = u << 3;
+                for (int t = 0; t < tm; ++t) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + t) * inter + col0);
+                    float d = fdot2_f32(wv.x, xv.x, acc[t]);
+                    d = fdot2_f32(wv.y, xv.y, d);
+                    d = fdot2_f32(wv.z, xv.z, d);
+                    acc[t] = fdot2_f32(wv.w, xv.w, d);
+                }
             }
         } else if (desc.dn_code == CODE_S2_K) {
             const uint8_t* W = desc.body + desc.dn_offset;
@@ -3805,7 +4282,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma(
     const uint8_t* sk_w  = desc.body + static_cast<size_t>(inter) * 2;
     const int nsb = D >> 8;
     const int sb_b = sk_sb_bytes(desc.gu_code);
-    const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8);
+    const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
     const half_t* sq_xd = reinterpret_cast<const half_t*>(desc.body);
     const float out_scale = (desc.gu_code == CODE_SF4) ? (sf4_outer * 16.0f) : 1.0f;
     const int t_stride = gridDim.z * BM;
@@ -3877,6 +4354,27 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma(
                         }
                     } else {
                         for (int q = 0; q < 4; ++q) *reinterpret_cast<uint4*>(dst + q * 8) = make_uint4(0, 0, 0, 0);
+                    }
+                }
+            } else if (desc.gu_code == CODE_GGUF_RAW) {
+                const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+                const uint32_t gt = hdr->gu_type;
+                const size_t rb = hip_gguf_row_bytes(gt, D);
+                const bool interleaved = (hdr->flags & 1u) != 0;
+                for (int idx = tid; idx < BN * 4; idx += 256) {
+                    const int r = idx >> 2, q16 = idx & 3;
+                    const int gn = n_blk + r;
+                    half_t* dst = &sW[r * LD + q16 * 16];
+                    if (gn < N) {
+                        const int src_row = interleaved ? gn : (((gn & 1) ? inter : 0) + (gn >> 1));
+                        const float ext_sc = (gn & 1) ? hdr->up_scale : hdr->gate_scale;
+                        const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+                        const int col = k0 + q16 * 16;
+                        *reinterpret_cast<uint4*>(dst)     = hip_gguf_decode_8_f16(gt, wr, col, ext_sc);
+                        *reinterpret_cast<uint4*>(dst + 8) = hip_gguf_decode_8_f16(gt, wr, col + 8, ext_sc);
+                    } else {
+                        *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
+                        *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                     }
                 }
             } else {
@@ -4066,6 +4564,24 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma(
                         }
                     } else {
                         for (int q = 0; q < 4; ++q) *reinterpret_cast<uint4*>(dst + q * 8) = make_uint4(0, 0, 0, 0);
+                    }
+                }
+            } else if (desc.dn_code == CODE_GGUF_RAW) {
+                const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+                const uint32_t dt = hdr->dn_type;
+                const size_t rb = hip_gguf_row_bytes(dt, inter);
+                for (int idx = tid; idx < BN * 4; idx += 256) {
+                    const int r = idx >> 2, q16 = idx & 3;
+                    const int gn = n_blk + r;
+                    half_t* dst = &sW[r * LD + q16 * 16];
+                    if (gn < D) {
+                        const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(gn) * rb;
+                        const int col = k0 + q16 * 16;
+                        *reinterpret_cast<uint4*>(dst)     = hip_gguf_decode_8_f16(dt, wr, col, hdr->dn_scale);
+                        *reinterpret_cast<uint4*>(dst + 8) = hip_gguf_decode_8_f16(dt, wr, col + 8, hdr->dn_scale);
+                    } else {
+                        *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
+                        *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                     }
                 }
             } else {
@@ -5736,7 +6252,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
     const uint8_t* sk_w  = desc.body + static_cast<size_t>(inter) * 2;
     const int nsb = D >> 8;
     const int sb_b = sk_sb_bytes(desc.gu_code);
-    const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8);
+    const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
     const half_t* sq_xd = reinterpret_cast<const half_t*>(desc.body);
     const float out_scale = (desc.gu_code == CODE_SF4) ? (sf4_outer * 16.0f) : 1.0f;
     const int t_stride = gridDim.z * BM;
@@ -5803,6 +6319,25 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128(
                         }
                         *reinterpret_cast<uint4*>(dst + q * 8) = make_uint4(o[0], o[1], o[2], o[3]);
                     }
+                } else {
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+                }
+            } else if (desc.gu_code == CODE_GGUF_RAW) {
+                const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+                const uint32_t gt = hdr->gu_type;
+                const size_t rb = hip_gguf_row_bytes(gt, D);
+                const bool interleaved = (hdr->flags & 1u) != 0;
+                const int r = tid >> 1, q16 = tid & 1;
+                const int gn = n_blk + r;
+                half_t* dst = &sW[r * LD + q16 * 16];
+                if (gn < N) {
+                    const int src_row = interleaved ? gn : (((gn & 1) ? inter : 0) + (gn >> 1));
+                    const float ext_sc = (gn & 1) ? hdr->up_scale : hdr->gate_scale;
+                    const uint8_t* wr = desc.body + 32 + static_cast<size_t>(src_row) * rb;
+                    const int col = k0 + q16 * 16;
+                    *reinterpret_cast<uint4*>(dst)     = hip_gguf_decode_8_f16(gt, wr, col, ext_sc);
+                    *reinterpret_cast<uint4*>(dst + 8) = hip_gguf_decode_8_f16(gt, wr, col + 8, ext_sc);
                 } else {
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
@@ -5992,6 +6527,22 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2_wmma_128(
                     *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
                     *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
                 }
+            } else if (desc.dn_code == CODE_GGUF_RAW) {
+                const HipGgufExpertHeader* hdr = reinterpret_cast<const HipGgufExpertHeader*>(desc.body);
+                const uint32_t dt = hdr->dn_type;
+                const size_t rb = hip_gguf_row_bytes(dt, inter);
+                const int r = tid >> 1, q16 = tid & 1;
+                const int gn = n_blk + r;
+                half_t* dst = &sW[r * LD + q16 * 16];
+                if (gn < D) {
+                    const uint8_t* wr = desc.body + desc.dn_offset + static_cast<size_t>(gn) * rb;
+                    const int col = k0 + q16 * 16;
+                    *reinterpret_cast<uint4*>(dst)     = hip_gguf_decode_8_f16(dt, wr, col, hdr->dn_scale);
+                    *reinterpret_cast<uint4*>(dst + 8) = hip_gguf_decode_8_f16(dt, wr, col + 8, hdr->dn_scale);
+                } else {
+                    *reinterpret_cast<uint4*>(dst)     = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0, 0, 0, 0);
+                }
             } else {
                 const int sg = k0 >> 6;
                 const int half_off = (k0 & 32);
@@ -6121,7 +6672,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ_wmma_128_spec(
     const uint8_t* sk_w  = desc.body + static_cast<size_t>(inter) * 2;
     const int nsb = D >> 8;
     const int sb_b = (CODEC_KIND == 0) ? sk_sb_bytes(desc.gu_code) : 0;
-    const bool need_sq = (CODEC_KIND == 0) && (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8);
+    const bool need_sq = (CODEC_KIND == 0) && (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
     const half_t* sq_xd = reinterpret_cast<const half_t*>(desc.body);
     const float out_scale = (CODEC_KIND == 1) ? (sf4_outer * 16.0f) : 1.0f;
     const int t_stride = gridDim.z * BM;
