@@ -130,6 +130,12 @@ FALLBACK_MODELS = {
                    "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
     "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
                    "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
+    "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
+                "arena_gb": 20.47, "families": ("sync",), "vision": True},
+    "Sync-S": {"about": "the middle Sync pack", "download_gb": 61.7, "ram_gb": 32,
+               "arena_gb": 24.07, "families": ("sync",), "vision": True},
+    "Sync-M": {"about": "the largest Sync pack", "download_gb": 68.1, "ram_gb": 48,
+               "arena_gb": 30.08, "families": ("sync",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -169,10 +175,16 @@ FALLBACK_FAMILIES = {
     "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)",
                    "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
                             "at 5 or 8 bits; 94 and 110 GB downloads", "tag": "atomicchat-"},
+    "sync": {"title": "Qwen3.8-Flash-Next (Sync)", "about": "Sync-XS, Sync-S and Sync-M pre-built packs",
+             "tag": "sync-"},
     "edge0": {"title": "Edge0 (latent MoE)",
               "about": "145B and 120B latent sparse MoE, Q3_K or NVFP4 experts; a pre-built pack, ~86 to ~105 GB "
                        "on disk",
               "tag": "edge0-", "vision": False},
+    "inkling": {"title": "Inkling-2-Mini",
+                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; mainline GGUF layout; "
+                         "text only, no picture reader in the text engine",
+                "tag": "inkling-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",
@@ -190,6 +202,11 @@ FALLBACK_FAMILIES = {
     "qwen35": {"title": "Qwen3.5-9B",
                "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
                "tag": "qwen35-"},
+    "sensenova-loop-qsa": {"title": "SenseNova-Loop-9B (QSA)",
+                           "about": "9B dense, 32 layers executed 56 times with two-stream mHC; block-sparse QSA "
+                                    "attention, text and images, 512K context; the official GGUFs with trained QSA "
+                                    "indexers",
+                           "tag": "sensenova-qsa-"},
     "qwen35-2b": {"title": "Qwen3.5-2B",
                   "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of "
                            "the 9B's", "tag": "qwen35-2b-"},
