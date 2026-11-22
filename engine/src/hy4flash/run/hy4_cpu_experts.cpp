@@ -1,5 +1,6 @@
 // hy4_cpu_experts.cpp - see hy4_cpu_experts.h
 #include "hy4_cpu_experts.h"
+#include "hy4_cpu_k512.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,9 @@ static inline float _cvtsh_ss(unsigned short h) {
 #endif
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -42,14 +46,14 @@ static inline float _cvtsh_ss(unsigned short h) {
 #include <deque>
 #include <unordered_map>
 
-// Fast kernels. Both are compiled into every x86-64 build (no -march / -mavx2 flags needed) and chosen at init by CPUID + XGETBV:
-//   k512 = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4 and later),
-//   k2   = AVX2 + FMA + F16C (Haswell / Zen 1-3 and later).
-// GCC / Clang: each kernel region is compiled under a target pragma (the generic code around it keeps the baseline ISA, so a
-// binary built for plain x86-64 never executes an instruction the CPU lacks); MSVC needs no flags for intrinsics.
-// Order of preference: k512, k2, library gemm_sk_q8_1 (also the path when an S1.5 / S8 expert is resident or
-// STRATA_CPUEXP_KERNEL=lib). Override: STRATA_CPUEXP_KERNEL=avx512|avx2|lib; STRATA_FORCE_ISA=avx2 (as in the main engine) forbids
-// AVX-512. Compile-time: -DHY4_NO_FAST drops both fast kernels (library only; non-x86 targets get that automatically).
+// Fast kernels:
+//   k512    = AVX-512 BW + VNNI + VBMI + F16C (Ice Lake / Rocket Lake / Zen 4+), compiled in hy4_cpu_k512.cpp
+//             so MSVC builds ONLY that TU with /arch:AVX512 while THIS TU compiles strictly with /arch:AVX2
+//             (zero EVEX 0x62 instructions in AVX2, AVX-VNNI, or dispatch paths on Alder/Raptor/Arrow Lake).
+//   k2_vnni = AVX2 + FMA + F16C + VEX AVX-VNNI (_mm256_dpbusd_avx_epi32, Alder/Raptor/Meteor/Arrow Lake).
+//   k2      = AVX2 + FMA + F16C (Haswell / Zen 1-3+).
+// Chosen at init by CPUID + XGETBV; order of preference: k512, k2_vnni, k2, library gemm_sk_q8_1.
+// Override: STRATA_CPUEXP_KERNEL=avx512|avx2-vnni|avx2|lib; STRATA_FORCE_ISA=avx2|avx2-vnni|no-avx512|avx|sse.
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(HY4_NO_FAST)
 #define HY4_KERNELS 1
 #define HY4_NEON_KERNELS 0
@@ -74,17 +78,14 @@ static inline float _cvtsh_ss(unsigned short h) {
 #define HY4_AVX_VNNI 0
 #endif
 #if defined(__clang__)
-#define HY4_PUSH_AVX512 _Pragma("clang attribute push (__attribute__((target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\"))), apply_to=function)")
 #define HY4_PUSH_AVX2_VNNI _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c,avxvnni\"))), apply_to=function)")
 #define HY4_PUSH_AVX2 _Pragma("clang attribute push (__attribute__((target(\"avx2,fma,f16c\"))), apply_to=function)")
 #define HY4_POP_TARGET _Pragma("clang attribute pop")
 #elif defined(__GNUC__)
-#define HY4_PUSH_AVX512 _Pragma("GCC push_options") _Pragma("GCC target(\"avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,f16c,fma,avx2\")")
 #define HY4_PUSH_AVX2_VNNI _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma,f16c,avxvnni\")")
 #define HY4_PUSH_AVX2 _Pragma("GCC push_options") _Pragma("GCC target(\"avx2,fma,f16c\")")
 #define HY4_POP_TARGET _Pragma("GCC pop_options")
 #else
-#define HY4_PUSH_AVX512
 #define HY4_PUSH_AVX2_VNNI
 #define HY4_PUSH_AVX2
 #define HY4_POP_TARGET
@@ -315,305 +316,10 @@ struct alignas(64) TScratch {
     int sense = 0;
 };
 
-// ==================================================================================================== fast kernel
-// Activation row (K = 1536 = 6 super-blocks of 256) in a "transposed" layout so that the weight planes of every S_K format
-// can be unpacked with a handful of in-register ops and dotted with dpbusd, without any per-64-weights horizontal reduction:
-//   xj[sb][j][L*16 + k] = int8 x[(sb*4 + L)*64 + 4*k + j]      (j = 0..3, L = 64-block within the super-block, k = 0..15)
-//   xd[sb][L*4 + i]     = d of block sb*4+L                     (replicated x4: one float per dword lane)
-//   xs4[sb][L*4 + i]    = 0.25 * s of that block                (s = d * sum(qs); the x4 replication is undone by the 0.25)
-// Weight plane P_j of one super-block is the byte vector with lane L, byte k = q[64*L + 4*k + j] (0..2^bits-1). Then
-//   sum_lanes( cvt(dpbusd chain of P_j . xj) * eff * xd ) - half * sum_lanes( eff * xs4 )  ==  sum_g eff_g (xd_g*isum_g - half*xs_g)
-// i.e. exactly the library's dot_sk_q8_1_row, with float accumulation in 16 lanes and a single horizontal sum per row.
-// Optional high-precision mode (STRATA_CPUEXP_ACT=hi): x = da*qa + db*qb, qb = Q8_1 of the residual x - da*qa. The second term
-// lives in xjb/xdb (only touched in hi mode, so q8 mode streams the first 2304 bytes only); xs4 then holds 0.25*(s_a + s_b).
-struct alignas(64) ActRow {
-    int8_t xj[6][4][64];
-    float xd[6][16];
-    float xs4[6][16];
-    int8_t xjb[6][4][64];
-    float xdb[6][16];
-};
-static_assert(sizeof(ActRow) == 4224, "ActRow");
-
-#if HY4_KERNELS
-namespace k512 {
-struct FastConsts {
-    alignas(64) uint8_t idx4[4][64];    // vpermi2b index: plane j of the 128-byte nibble array (S4/S5/S6)
-    alignas(64) uint8_t ctrl3[4][64];   // vpmultishiftqb control: bit n -> bit 2 of the byte (S3 high plane)
-    alignas(64) uint8_t ctrl5[4][64];   // ... -> bit 4 (S5 high plane)
-    alignas(64) uint8_t tr[64];         // store_block: dst[16*j+k] = src[4*k+j]
-    alignas(64) int32_t effidx[16];
-    alignas(64) int64_t qidx[8];
-    alignas(64) uint8_t cb125[4][64];   // S1.25: codebook column c (+2 bias -> unsigned 0..4), 32 entries, as a vpermb table
-    alignas(64) uint8_t ctrl125[64];    // S1.25: multishift control, byte b -> 5*(b&7)
-    alignas(64) uint8_t perm125[64];    // S1.25: dest byte 8g+i <- payload byte 5g+i (i < 5)
-    FastConsts() {
-        static const int8_t cbk[32][4] = {  // = S125_CODEBOOK of sk_codecs.cpp / tools/squant/codecs.py
-            {-1, -1, -1, -1}, {-1, -1, -1, 1}, {-1, -1, 1, -1}, {-1, -1, 1, 1}, {-1, 1, -1, -1}, {-1, 1, -1, 1}, {-1, 1, 1, -1}, {-1, 1, 1, 1},
-            {1, -1, -1, -1},  {1, -1, -1, 1},  {1, -1, 1, -1},  {1, -1, 1, 1},  {1, 1, -1, -1},  {1, 1, -1, 1},  {1, 1, 1, -1},  {1, 1, 1, 1},
-            {2, 0, 0, 0},     {-2, 0, 0, 0},   {0, 2, 0, 0},    {0, -2, 0, 0},   {0, 0, 2, 0},    {0, 0, -2, 0},   {0, 0, 0, 2},    {0, 0, 0, -2},
-            {0, 0, 0, 0},     {2, 2, 0, 0},    {-2, -2, 0, 0},  {0, 0, 2, 2},    {0, 0, -2, -2},  {2, -2, 0, 0},   {0, 0, 2, -2},   {2, 0, 2, 0}};
-        std::memset(cb125, 0, sizeof(cb125));
-        for (int c = 0; c < 4; ++c)
-            for (int e = 0; e < 32; ++e) cb125[c][e] = (uint8_t)(cbk[e][c] + 2);
-        for (int b = 0; b < 64; ++b) {
-            ctrl125[b] = (uint8_t)(5 * (b & 7));
-            perm125[b] = (uint8_t)((b >> 3) * 5 + (b & 7) < 40 ? (b >> 3) * 5 + (b & 7) : 0);
-        }
-        for (int j = 0; j < 4; ++j)
-            for (int b = 0; b < 64; ++b) {
-                const int L = b >> 4, k = b & 15, q = k >> 3, kk = k & 7;
-                idx4[j][b] = (uint8_t)(32 * L + 2 * k + (j >> 1));
-                ctrl3[j][b] = (uint8_t)((32 * q + 4 * kk + j - 2) & 63);
-                ctrl5[j][b] = (uint8_t)((32 * q + 4 * kk + j - 4) & 63);
-            }
-        for (int j = 0; j < 4; ++j)
-            for (int k = 0; k < 16; ++k) tr[16 * j + k] = (uint8_t)(4 * k + j);
-        for (int i = 0; i < 16; ++i) effidx[i] = i >> 2;
-        for (int i = 0; i < 8; ++i) qidx[i] = i >> 1;
-    }
-};
-static const FastConsts kc;
-HY4_PUSH_AVX512
-
-// block b (0..23) of a row from the library's Q8_1_G64 block
-static inline void store_block(ActRow* a, int b, const BlockQ8_1_G64& blk) {
-    const int sb = b >> 2, L = b & 3;
-    const __m512i R = _mm512_permutexvar_epi8(_mm512_load_si512((const void*)kc.tr), _mm512_load_si512((const void*)blk.qs));
-    _mm_store_si128((__m128i*)&a->xj[sb][0][L * 16], _mm512_castsi512_si128(R));
-    _mm_store_si128((__m128i*)&a->xj[sb][1][L * 16], _mm512_extracti32x4_epi32(R, 1));
-    _mm_store_si128((__m128i*)&a->xj[sb][2][L * 16], _mm512_extracti32x4_epi32(R, 2));
-    _mm_store_si128((__m128i*)&a->xj[sb][3][L * 16], _mm512_extracti32x4_epi32(R, 3));
-    _mm_store_ps(&a->xd[sb][L * 4], _mm_set1_ps(blk.d));
-    _mm_store_ps(&a->xs4[sb][L * 4], _mm_set1_ps(0.25f * blk.s));
-}
-
-// hi mode: first term from blk, residual term from blk2 (both Q8_1_G64 blocks of the same 64 values)
-static inline void store_block_hi(ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
-    const int sb = b >> 2, L = b & 3;
-    const __m512i idx = _mm512_load_si512((const void*)kc.tr);
-    const __m512i R = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)blk.qs));
-    const __m512i R2 = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)blk2.qs));
-    _mm_store_si128((__m128i*)&a->xj[sb][0][L * 16], _mm512_castsi512_si128(R));
-    _mm_store_si128((__m128i*)&a->xj[sb][1][L * 16], _mm512_extracti32x4_epi32(R, 1));
-    _mm_store_si128((__m128i*)&a->xj[sb][2][L * 16], _mm512_extracti32x4_epi32(R, 2));
-    _mm_store_si128((__m128i*)&a->xj[sb][3][L * 16], _mm512_extracti32x4_epi32(R, 3));
-    _mm_store_si128((__m128i*)&a->xjb[sb][0][L * 16], _mm512_castsi512_si128(R2));
-    _mm_store_si128((__m128i*)&a->xjb[sb][1][L * 16], _mm512_extracti32x4_epi32(R2, 1));
-    _mm_store_si128((__m128i*)&a->xjb[sb][2][L * 16], _mm512_extracti32x4_epi32(R2, 2));
-    _mm_store_si128((__m128i*)&a->xjb[sb][3][L * 16], _mm512_extracti32x4_epi32(R2, 3));
-    _mm_store_ps(&a->xd[sb][L * 4], _mm_set1_ps(blk.d));
-    _mm_store_ps(&a->xdb[sb][L * 4], _mm_set1_ps(blk2.d));
-    _mm_store_ps(&a->xs4[sb][L * 4], _mm_set1_ps(0.25f * (blk.s + blk2.s)));
-}
-
-#define HY4_HI3(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl3[J]), src), m4)
-#define HY4_HI5(J) _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl5[J]), src), m16)
-#define HY4_NIB(J) _mm512_permutex2var_epi8(n0, _mm512_load_si512((const void*)kc.idx4[J]), n1)
-
-// P[j] lane L byte k = q[64*L + 4*k + j] of one super-block payload
-template <int FMT>
-static inline void unpack_planes(const uint8_t* pl, __m512i (&P)[4]) {
-    const __m512i m3 = _mm512_set1_epi8(3), m4 = _mm512_set1_epi8(4), m15 = _mm512_set1_epi8(15), m16 = _mm512_set1_epi8(16),
-                  m30 = _mm512_set1_epi8(0x30);
-    (void)m3; (void)m4; (void)m16; (void)m30;
-    if constexpr (FMT == 0) {
-        // S1.25: 40 payload bytes = 64 five-bit codebook indices (idx[m], m = 8g + j from the 40-bit group g, bits 5j..5j+4);
-        // weights 4m..4m+3 = codebook[idx[m]][0..3], so plane P_j (lane L byte k = q[64L+4k+j]) is codebook column j looked up
-        // with idx[16L+k]: four vpermb on the index vector.
-        const __m512i raw = _mm512_maskz_loadu_epi8((__mmask64)0xFFFFFFFFFFull, (const void*)pl);
-        const __m512i q40 = _mm512_maskz_permutexvar_epi8((__mmask64)0x1F1F1F1F1F1F1F1Full, _mm512_load_si512((const void*)kc.perm125), raw);
-        const __m512i idx = _mm512_and_si512(_mm512_multishift_epi64_epi8(_mm512_load_si512((const void*)kc.ctrl125), q40), _mm512_set1_epi8(31));
-        P[0] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[0]));
-        P[1] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[1]));
-        P[2] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[2]));
-        P[3] = _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)kc.cb125[3]));
-    } else if constexpr (FMT == 2 || FMT == 3) {
-        const __m512i w = _mm512_loadu_si512((const void*)pl);
-        if constexpr (FMT == 2) {
-            P[0] = _mm512_and_si512(w, m3);
-            P[1] = _mm512_and_si512(_mm512_srli_epi16(w, 2), m3);
-            P[2] = _mm512_and_si512(_mm512_srli_epi16(w, 4), m3);
-            P[3] = _mm512_and_si512(_mm512_srli_epi16(w, 6), m3);
-        } else {
-            const __m512i src = _mm512_permutexvar_epi64(_mm512_load_si512((const void*)kc.qidx), _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)(pl + 64))));
-            P[0] = _mm512_ternarylogic_epi32(w, HY4_HI3(0), m3, 0xEC);
-            P[1] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 2), HY4_HI3(1), m3, 0xEC);
-            P[2] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 4), HY4_HI3(2), m3, 0xEC);
-            P[3] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(w, 6), HY4_HI3(3), m3, 0xEC);
-        }
-    } else {
-        const __m512i n0 = _mm512_loadu_si512((const void*)pl), n1 = _mm512_loadu_si512((const void*)(pl + 64));
-        const __m512i v0 = HY4_NIB(0), v1 = _mm512_srli_epi16(HY4_NIB(1), 4), v2 = HY4_NIB(2), v3 = _mm512_srli_epi16(HY4_NIB(3), 4);
-        if constexpr (FMT == 4) {
-            P[0] = _mm512_and_si512(v0, m15);
-            P[1] = _mm512_and_si512(v1, m15);
-            P[2] = _mm512_and_si512(v2, m15);
-            P[3] = _mm512_and_si512(v3, m15);
-        } else if constexpr (FMT == 5) {
-            const __m512i src = _mm512_permutexvar_epi64(_mm512_load_si512((const void*)kc.qidx), _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)(pl + 128))));
-            P[0] = _mm512_ternarylogic_epi32(v0, HY4_HI5(0), m15, 0xEC);
-            P[1] = _mm512_ternarylogic_epi32(v1, HY4_HI5(1), m15, 0xEC);
-            P[2] = _mm512_ternarylogic_epi32(v2, HY4_HI5(2), m15, 0xEC);
-            P[3] = _mm512_ternarylogic_epi32(v3, HY4_HI5(3), m15, 0xEC);
-        } else {  // S6: 2-bit high planes, byte i -> q[4i+j] in bits 2j
-            const __m512i w6 = _mm512_loadu_si512((const void*)(pl + 128));
-            P[0] = _mm512_ternarylogic_epi32(v0, _mm512_and_si512(_mm512_slli_epi16(w6, 4), m30), m15, 0xEC);
-            P[1] = _mm512_ternarylogic_epi32(v1, _mm512_and_si512(_mm512_slli_epi16(w6, 2), m30), m15, 0xEC);
-            P[2] = _mm512_ternarylogic_epi32(v2, _mm512_and_si512(w6, m30), m15, 0xEC);
-            P[3] = _mm512_ternarylogic_epi32(v3, _mm512_and_si512(_mm512_srli_epi16(w6, 2), m30), m15, 0xEC);
-        }
-    }
-}
-
-// S8_K specialization for k512: 256 signed int8 weights -> 4 planes of unsigned (q + 128 = q ^ 0x80)
-template <>
-inline void unpack_planes<8>(const uint8_t* pl, __m512i (&P)[4]) {
-    const __m512i tr = _mm512_load_si512((const void*)kc.tr);
-    const __m512i x80 = _mm512_set1_epi8((char)0x80);
-    const __m512i q0 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl)));
-    const __m512i q1 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 64)));
-    const __m512i q2 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 128)));
-    const __m512i q3 = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)(pl + 192)));
-    const __m512i t0 = _mm512_shuffle_i32x4(q0, q1, 0x44);
-    const __m512i t1 = _mm512_shuffle_i32x4(q0, q1, 0xEE);
-    const __m512i t2 = _mm512_shuffle_i32x4(q2, q3, 0x44);
-    const __m512i t3 = _mm512_shuffle_i32x4(q2, q3, 0xEE);
-    P[0] = _mm512_xor_si512(_mm512_shuffle_i32x4(t0, t2, 0x88), x80);
-    P[1] = _mm512_xor_si512(_mm512_shuffle_i32x4(t0, t2, 0xDD), x80);
-    P[2] = _mm512_xor_si512(_mm512_shuffle_i32x4(t1, t3, 0x88), x80);
-    P[3] = _mm512_xor_si512(_mm512_shuffle_i32x4(t1, t3, 0xDD), x80);
-}
-
-template <int FMT>
-struct FmtInfo;
-template <> struct FmtInfo<0> { static constexpr int SB = 48;  static constexpr float HALF = 2.0f; };  // S1.25: q+2 in 0..4, (P-2)*eff
-template <> struct FmtInfo<2> { static constexpr int SB = 70;  static constexpr float HALF = 1.5f; };
-template <> struct FmtInfo<3> { static constexpr int SB = 102; static constexpr float HALF = 3.5f; };
-template <> struct FmtInfo<4> { static constexpr int SB = 134; static constexpr float HALF = 7.5f; };
-template <> struct FmtInfo<5> { static constexpr int SB = 166; static constexpr float HALF = 15.5f; };
-template <> struct FmtInfo<6> { static constexpr int SB = 198; static constexpr float HALF = 31.5f; };
-template <> struct FmtInfo<8> { static constexpr int SB = 262; static constexpr float HALF = 128.0f; };  // S8_K: signed int8 q -> unsigned q^0x80 = q+128
-
-static inline float cvt_f16_f32(uint16_t h) {
-#ifdef _MSC_VER
-    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
-#else
-    return _cvtsh_ss(h);
-#endif
-}
-
-// M tokens x 1 weight row (6 super-blocks of format FMT) -> out[t]
-template <int FMT, int M, bool HI>
-static inline void row_dot(const uint8_t* row, const ActRow* const* X, float* out) {
-    constexpr int SB = FmtInfo<FMT>::SB;
-    __m512 facc[M];
-    for (int t = 0; t < M; ++t) facc[t] = _mm512_setzero_ps();
-    const __m128 inv255 = _mm_set1_ps(255.0f);
-    const __m512 halfv = _mm512_set1_ps(FmtInfo<FMT>::HALF);
-    const __m512i effidx = _mm512_load_si512((const void*)kc.effidx);
-    for (int s = 0; s < 6; ++s) {
-        const uint8_t* blk = row + (size_t)s * SB;
-        uint16_t dh;
-        uint32_t u32;
-        std::memcpy(&dh, blk, 2);
-        std::memcpy(&u32, blk + 2, 4);
-        // eff_g = D * (u_g / 255) exactly as in sk_codecs (float division, then multiply), replicated x4 per group
-        __m128 u4 = _mm_div_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)u32))), inv255);
-        u4 = _mm_mul_ps(u4, _mm_set1_ps(cvt_f16_f32(dh)));
-        if constexpr (FMT == 0) {  // S1.25: x fine[g], fine = 0.5 + nibble/15 (nibbles at payload bytes 40, 41)
-            uint16_t fn;
-            std::memcpy(&fn, blk + 46, 2);
-            __m128i fv = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32((int)fn), _mm_setr_epi32(0, 4, 8, 12)), _mm_set1_epi32(15));
-            u4 = _mm_mul_ps(u4, _mm_add_ps(_mm_div_ps(_mm_cvtepi32_ps(fv), _mm_set1_ps(15.0f)), _mm_set1_ps(0.5f)));
-        }
-        const __m512 effv = _mm512_permutexvar_ps(effidx, _mm512_castps128_ps512(u4));
-        const __m512 effh = _mm512_mul_ps(effv, halfv);
-        __m512i P[4];
-        unpack_planes<FMT>(blk + 6, P);
-        for (int t = 0; t < M; ++t) {
-            const ActRow* a = X[t];
-            __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), P[0], _mm512_load_si512((const void*)a->xj[s][0]));
-            acc = _mm512_dpbusd_epi32(acc, P[1], _mm512_load_si512((const void*)a->xj[s][1]));
-            acc = _mm512_dpbusd_epi32(acc, P[2], _mm512_load_si512((const void*)a->xj[s][2]));
-            acc = _mm512_dpbusd_epi32(acc, P[3], _mm512_load_si512((const void*)a->xj[s][3]));
-            const __m512 sc = _mm512_mul_ps(effv, _mm512_load_ps(a->xd[s]));
-            facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), sc, facc[t]);
-            if constexpr (HI) {  // residual term: same unpacked weights, second dpbusd chain
-                __m512i accb = _mm512_dpbusd_epi32(_mm512_setzero_si512(), P[0], _mm512_load_si512((const void*)a->xjb[s][0]));
-                accb = _mm512_dpbusd_epi32(accb, P[1], _mm512_load_si512((const void*)a->xjb[s][1]));
-                accb = _mm512_dpbusd_epi32(accb, P[2], _mm512_load_si512((const void*)a->xjb[s][2]));
-                accb = _mm512_dpbusd_epi32(accb, P[3], _mm512_load_si512((const void*)a->xjb[s][3]));
-                facc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(accb), _mm512_mul_ps(effv, _mm512_load_ps(a->xdb[s])), facc[t]);
-            }
-            facc[t] = _mm512_fnmadd_ps(effh, _mm512_load_ps(a->xs4[s]), facc[t]);
-        }
-    }
-    for (int t = 0; t < M; ++t) out[t] = _mm512_reduce_add_ps(facc[t]);
-}
-
-// nrows rows x M tokens; out[i*nrows + r]
-template <int FMT, int M, bool HI>
-static void rows_m(const uint8_t* W, int nrows, const ActRow* const* X, float* out) {
-    constexpr size_t RBYTES = 6 * (size_t)FmtInfo<FMT>::SB;
-    const int pf = g_pf_rows;
-    for (int r = 0; r < nrows; ++r) {
-        if (pf && r + pf < nrows) {  // pull in the row `pf` rows ahead (crosses 4 KiB page boundaries, which the hardware prefetcher does not)
-            const char* pp = (const char*)(W + (size_t)(r + pf) * RBYTES);
-            for (size_t o = 0; o < RBYTES; o += 64) _mm_prefetch(pp + o, _MM_HINT_T0);
-        }
-        float o[M];
-        row_dot<FMT, M, HI>(W + r * RBYTES, X, o);
-        for (int i = 0; i < M; ++i) out[(size_t)i * nrows + r] = o[i];
-    }
-}
-
-template <int FMT, bool HI>
-static void rows_fmt(const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out) {
-    for (int g0 = 0; g0 < m; g0 += 8) {
-        const int mg = std::min(8, m - g0);
-        const ActRow* const* x = X + g0;
-        float* o = out + (size_t)g0 * nrows;
-        switch (mg) {
-            case 1: rows_m<FMT, 1, HI>(W, nrows, x, o); break;
-            case 2: rows_m<FMT, 2, HI>(W, nrows, x, o); break;
-            case 3: rows_m<FMT, 3, HI>(W, nrows, x, o); break;
-            case 4: rows_m<FMT, 4, HI>(W, nrows, x, o); break;
-            case 5: rows_m<FMT, 5, HI>(W, nrows, x, o); break;
-            case 6: rows_m<FMT, 6, HI>(W, nrows, x, o); break;
-            case 7: rows_m<FMT, 7, HI>(W, nrows, x, o); break;
-            default: rows_m<FMT, 8, HI>(W, nrows, x, o); break;
-        }
-    }
-}
-
-// W: nrows rows of K=1536 in format `code` (0, 2..6, 8); X[m] activation rows; out[m][nrows]
-static void rows_gemm(int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi = false) {
-    if (hi) {
-        switch (code) {
-            case 0: rows_fmt<0, true>(W, nrows, X, m, out); break;
-            case 2: rows_fmt<2, true>(W, nrows, X, m, out); break;
-            case 3: rows_fmt<3, true>(W, nrows, X, m, out); break;
-            case 4: rows_fmt<4, true>(W, nrows, X, m, out); break;
-            case 5: rows_fmt<5, true>(W, nrows, X, m, out); break;
-            case 8: rows_fmt<8, true>(W, nrows, X, m, out); break;
-            default: rows_fmt<6, true>(W, nrows, X, m, out); break;
-        }
-        return;
-    }
-    switch (code) {
-        case 0: rows_fmt<0, false>(W, nrows, X, m, out); break;
-        case 2: rows_fmt<2, false>(W, nrows, X, m, out); break;
-        case 3: rows_fmt<3, false>(W, nrows, X, m, out); break;
-        case 4: rows_fmt<4, false>(W, nrows, X, m, out); break;
-        case 5: rows_fmt<5, false>(W, nrows, X, m, out); break;
-        case 8: rows_fmt<8, false>(W, nrows, X, m, out); break;
-        default: rows_fmt<6, false>(W, nrows, X, m, out); break;
-    }
-}
-HY4_POP_TARGET
-}  // namespace k512
-#endif  // HY4_KERNELS (k512)
+// ==================================================================================================== fast kernels
+// ActRow (4224 bytes) and hy4::k512 AVX-512 kernels live in hy4_cpu_k512.h / hy4_cpu_k512.cpp so this TU compiles
+// strictly with /arch:AVX2 under MSVC (zero EVEX 0x62 instructions anywhere in hy4_cpu_experts.obj).
+using hy4::ActRow;
 
 #if HY4_KERNELS
 namespace k2 {
@@ -1030,10 +736,11 @@ static inline float hsum256(__m256 v) {
 
 template <int FMT>
 static inline __m256i dot_half(const __m256i (&P)[4], const int8_t* xj) {
-    __m256i acc = _mm256_dpbusd_epi32(_mm256_setzero_si256(), P[0], _mm256_load_si256((const __m256i*)(xj)));
-    acc = _mm256_dpbusd_epi32(acc, P[1], _mm256_load_si256((const __m256i*)(xj + 64)));
-    acc = _mm256_dpbusd_epi32(acc, P[2], _mm256_load_si256((const __m256i*)(xj + 128)));
-    acc = _mm256_dpbusd_epi32(acc, P[3], _mm256_load_si256((const __m256i*)(xj + 192)));
+    // VEX-encoded AVX-VNNI ({vex} vpdpbusd, 0xC4 prefix) — NEVER _mm256_dpbusd_epi32 which emits EVEX (0x62, AVX512-VNNI+VL) on MSVC!
+    __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), P[0], _mm256_load_si256((const __m256i*)(xj)));
+    acc = _mm256_dpbusd_avx_epi32(acc, P[1], _mm256_load_si256((const __m256i*)(xj + 64)));
+    acc = _mm256_dpbusd_avx_epi32(acc, P[2], _mm256_load_si256((const __m256i*)(xj + 128)));
+    acc = _mm256_dpbusd_avx_epi32(acc, P[3], _mm256_load_si256((const __m256i*)(xj + 192)));
     return acc;
 }
 
@@ -1458,23 +1165,23 @@ static KernCaps probe_kernel_caps() {
         (void)maxsub;
 #endif
     }
-    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {  // as in the main engine: avx2 = no AVX-512/VNNI, avx / sse = no AVX2 kernels either
+    if (const char* f = std::getenv("STRATA_FORCE_ISA")) {  // as in the main engine: avx2 = no AVX-512/VNNI, no-avx512 / avx2-vnni = no AVX-512, avx / sse = no AVX2 kernels either
         if (!std::strcmp(f, "avx2")) { c.avx512 = false; c.avx_vnni = false; }
-        else if (!std::strcmp(f, "avx2-vnni")) c.avx512 = false;
+        else if (!std::strcmp(f, "avx2-vnni") || !std::strcmp(f, "no-avx512")) c.avx512 = false;
         else if (!std::strcmp(f, "avx") || !std::strcmp(f, "sse")) c.avx512 = c.avx_vnni = c.avx2 = false;
     }
     return c;
 }
 static inline void kern_store(int k, ActRow* a, int b, const BlockQ8_1_G64& blk) {
-    if (k == 2) k512::store_block(a, b, blk);
+    if (k == 2) hy4::k512::store_block(a, b, blk);
     else k2::store_block(a, b, blk);
 }
 static inline void kern_store_hi(int k, ActRow* a, int b, const BlockQ8_1_G64& blk, const BlockQ8_1_G64& blk2) {
-    if (k == 2) k512::store_block_hi(a, b, blk, blk2);
+    if (k == 2) hy4::k512::store_block_hi(a, b, blk, blk2);
     else k2::store_block_hi(a, b, blk, blk2);
 }
 static void kern_gemm(int k, int code, const uint8_t* W, int nrows, const ActRow* const* X, int m, float* out, bool hi) {
-    if (k == 2) k512::rows_gemm(code, W, nrows, X, m, out, hi);
+    if (k == 2) hy4::k512::rows_gemm(code, W, nrows, X, m, out, hi, g_pf_rows);
 #if HY4_AVX_VNNI
     else if (k == 4) k2_vnni::rows_gemm(code, W, nrows, X, m, out, hi);
 #endif
@@ -1804,6 +1511,14 @@ struct CpuExperts::Impl {
     // ---- stats (written by thread 0 only, read after wait())
     CpuExpertStats st;
     std::atomic<uint64_t> posted{0};
+    // ---- next-layer L3 prefetch (STRATA_L3_PF, preempted immediately when gen != seen)
+    bool l3_pf_enabled = true;
+    std::atomic<uint64_t> pf_gen{0};
+    std::atomic<int> pf_cursor{0};
+    int pf_layer = -1;
+    int pf_n = 0;
+    int32_t pf_experts[64] = {};
+    void do_l3_prefetch(int tid, uint64_t seen);
 
     ~Impl() {
         stop.store(true);
@@ -1858,6 +1573,15 @@ struct CpuExperts::Impl {
 };
 
 // ==================================================================================================== load
+namespace {
+struct CpuTarget {
+    uint16_t group = 0;
+    int cpu = 0;
+};
+std::vector<CpuTarget> pin_list(int want);
+void pin_current_thread(const CpuTarget& t);
+}  // namespace
+
 // header + Section 3 directory of a .strata (no zstd needed)
 static bool read_dir(const std::string& path, std::vector<DirE>& dir, uint64_t& s4_off, uint64_t& s4_len, std::string& err) {
     std::FILE* fp = std::fopen(path.c_str(), "rb");
@@ -1964,8 +1688,16 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
         }
     };
     const int nr = (int)std::min<size_t>(4, std::max<size_t>(1, runs.size()));
+    std::vector<CpuTarget> rpins;
+    const char* numa_env = std::getenv("STRATA_NUMA_ARENA");
+    if (!numa_env || numa_env[0] != '0') rpins = pin_list(nr);
     std::vector<std::thread> rt;
-    for (int i = 0; i < nr; ++i) rt.emplace_back(reader);
+    for (int i = 0; i < nr; ++i) {
+        rt.emplace_back([&, i]() {
+            if ((size_t)i < rpins.size()) pin_current_thread(rpins[i]);
+            reader();
+        });
+    }
     for (auto& t : rt) t.join();
     if (fail.load()) { err = "short read while loading expert bodies"; return false; }
     for (size_t i = 0; i < ndir; ++i) {
@@ -2066,30 +1798,92 @@ bool CpuExperts::Impl::load(const std::string& path, int n_threads, const std::v
 
 // ==================================================================================================== pool
 namespace {
-// physical-core-first list of logical CPU ids to pin to, spread round-robin across L3/CCD domains so multi-CCD CPUs (EPYC / Threadripper) engage all memory channels
-std::vector<int> pin_list(int want) {
+static inline int total_logical_cpus() {
+#ifdef _WIN32
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (n > 0) return (int)n;
+#endif
+    return (int)std::max(1u, std::thread::hardware_concurrency());
+}
+
+static inline void pin_native_thread(std::thread::native_handle_type h, const CpuTarget& t) {
+#ifdef _WIN32
+    GROUP_AFFINITY ga{};
+    ga.Group = t.group;
+    ga.Mask = (KAFFINITY)1ull << t.cpu;
+    SetThreadGroupAffinity((HANDLE)h, &ga, nullptr);
+#else
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    if (t.cpu >= 0 && t.cpu < CPU_SETSIZE) {
+        CPU_SET(t.cpu, &cs);
+        pthread_setaffinity_np(h, sizeof(cs), &cs);
+    }
+#endif
+}
+
+void pin_current_thread(const CpuTarget& t) {
+#ifdef _WIN32
+    pin_native_thread((std::thread::native_handle_type)GetCurrentThread(), t);
+#else
+    pin_native_thread(pthread_self(), t);
+#endif
+}
+
+// physical-core-first list of logical CPU targets to pin to, spread round-robin across L3/CCD/NUMA domains
+// so multi-CCD / multi-socket CPUs (EPYC / Threadripper / dual Xeon, including Windows >64 logical CPUs) engage all memory channels.
+std::vector<CpuTarget> pin_list(int want) {
     const char* pe = std::getenv("STRATA_CPUEXP_PIN");
     const bool linear = pe && !std::strcmp(pe, "linear");
-    std::vector<std::vector<int>> prim_g, sec_g;
+    std::vector<std::vector<CpuTarget>> prim_g, sec_g;
 #ifdef _WIN32
-    DWORD len = 0;
-    GetLogicalProcessorInformation(nullptr, &len);
-    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
-    std::vector<ULONG_PTR> l3_masks;
-    if (len && GetLogicalProcessorInformation(info.data(), &len)) {
-        for (auto& i : info)
-            if (i.Relationship == RelationCache && i.Cache.Level == 3) l3_masks.push_back(i.ProcessorMask);
-        const size_t ng = std::max<size_t>(1, l3_masks.size());
+    auto get_ex = [](LOGICAL_PROCESSOR_RELATIONSHIP rel, std::vector<uint8_t>& buf) -> bool {
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(rel, nullptr, &len);
+        if (!len) return false;
+        buf.resize(len);
+        return GetLogicalProcessorInformationEx(rel, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &len) != FALSE;
+    };
+    struct L3Dom { uint16_t group; KAFFINITY mask; };
+    std::vector<L3Dom> l3_doms;
+    std::vector<uint8_t> cbuf, pbuf;
+    if (!linear && get_ex(RelationCache, cbuf)) {
+        size_t off = 0;
+        while (off < cbuf.size()) {
+            auto* ex = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(cbuf.data() + off);
+            if (ex->Size == 0) break;
+            if (ex->Relationship == RelationCache && ex->Cache.Level == 3) {
+                l3_doms.push_back({ex->Cache.GroupMask.Group, ex->Cache.GroupMask.Mask});
+            }
+            off += ex->Size;
+        }
+    }
+    if (get_ex(RelationProcessorCore, pbuf)) {
+        const size_t ng = std::max<size_t>(1, l3_doms.size());
         prim_g.resize(ng);
         sec_g.resize(ng);
-        for (auto& i : info) {
-            if (i.Relationship != RelationProcessorCore) continue;
-            size_t g = 0;
-            for (size_t k = 0; k < l3_masks.size(); ++k)
-                if (l3_masks[k] & i.ProcessorMask) { g = k; break; }
-            bool first = true;
-            for (int b = 0; b < (int)(8 * sizeof(ULONG_PTR)); ++b)
-                if ((i.ProcessorMask >> b) & 1) { (first ? prim_g[g] : sec_g[g]).push_back(b); first = false; }
+        size_t off = 0;
+        while (off < pbuf.size()) {
+            auto* ex = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(pbuf.data() + off);
+            if (ex->Size == 0) break;
+            if (ex->Relationship == RelationProcessorCore) {
+                const uint16_t gc = std::max<uint16_t>(1, ex->Processor.GroupCount);
+                for (uint16_t gi = 0; gi < gc; ++gi) {
+                    const GROUP_AFFINITY& gm = ex->Processor.GroupMask[gi];
+                    size_t g = 0;
+                    for (size_t k = 0; k < l3_doms.size(); ++k) {
+                        if (l3_doms[k].group == gm.Group && (l3_doms[k].mask & gm.Mask)) { g = k; break; }
+                    }
+                    bool first = true;
+                    for (int b = 0; b < (int)(8 * sizeof(KAFFINITY)); ++b) {
+                        if ((gm.Mask >> b) & 1ull) {
+                            (first ? prim_g[g] : sec_g[g]).push_back({gm.Group, b});
+                            first = false;
+                        }
+                    }
+                }
+            }
+            off += ex->Size;
         }
     }
 #else
@@ -2134,11 +1928,11 @@ std::vector<int> pin_list(int want) {
             std::fclose(f);
         }
         const size_t g = domain_of(c);
-        (first == c ? prim_g[g] : sec_g[g]).push_back(c);
+        (first == c ? prim_g[g] : sec_g[g]).push_back({0, c});
     }
 #endif
-    std::vector<int> all;
-    auto spread = [&](const std::vector<std::vector<int>>& groups) {
+    std::vector<CpuTarget> all;
+    auto spread = [&](const std::vector<std::vector<CpuTarget>>& groups) {
         if (linear) {
             for (const auto& v : groups) all.insert(all.end(), v.begin(), v.end());
             return;
@@ -2204,9 +1998,10 @@ void CpuExperts::Impl::start_threads(int n) {
         s.tu.alloc((size_t)MGF * RB);
     }
     if (const char* e = std::getenv("STRATA_CPUEXP_SPIN_US")) spin_us = std::atoi(e);
-    std::vector<int> pins;
+    if (const char* e = std::getenv("STRATA_L3_PF")) l3_pf_enabled = (e[0] != '0');
+    std::vector<CpuTarget> pins;
     const char* pe = std::getenv("STRATA_CPUEXP_PIN");
-    const int host_cpus = (int)std::max(1u, std::thread::hardware_concurrency());
+    const int host_cpus = total_logical_cpus();
     const double cg_cpus = cgroup_cpu_limit();
     const bool cg_constrained = (cg_cpus > 0.0 && cg_cpus < (double)host_cpus);
     // In a CFS-quota container (cgroup_cpus < host_cpus), rigid pinning hurts scheduling across unthrottled cores; skip unless explicitly enabled.
@@ -2221,27 +2016,63 @@ void CpuExperts::Impl::start_threads(int n) {
     threads.reserve(nth);
     for (int i = 0; i < nth; ++i) {
         threads.emplace_back([this, i]() { worker(i); });
-        if (!pins.empty()) {
-#ifdef _WIN32
-            SetThreadAffinityMask((HANDLE)threads.back().native_handle(), (DWORD_PTR)1 << pins[i]);
-#else
-            cpu_set_t cs;
-            CPU_ZERO(&cs);
-            CPU_SET(pins[i], &cs);
-            pthread_setaffinity_np(threads.back().native_handle(), sizeof(cs), &cs);
-#endif
-        }
+        if (!pins.empty()) pin_native_thread(threads.back().native_handle(), pins[i]);
     }
     const char* pin_note = !pins.empty() ? " (pinned, physical cores first)" : (cg_constrained ? " (not pinned: cgroup CPU quota)" : " (not pinned)");
-    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us, sched=%d, pf=%d rows\n", nth, pin_note, spin_us, sched, g_pf_rows);
+    std::fprintf(stderr, "[cpuexp] %d pool threads%s, spin %d us, sched=%d, pf=%d rows, l3_pf=%s\n",
+                 nth, pin_note, spin_us, sched, g_pf_rows, l3_pf_enabled ? "on" : "off");
+}
+
+void CpuExperts::Impl::do_l3_prefetch(int, uint64_t seen) {
+    const int layer = pf_layer;
+    const int n = pf_n;
+    if (layer < 0 || layer >= nlayers || n <= 0) return;
+    const Rec* lr = &recs[(size_t)layer * E];
+    // Prefetch 16 KiB stripes per claimed unit using T1 (L2/L3 cache) so we warm L3 without thrashing L1,
+    // checking gen != seen every stripe so a real compute job preempts immediately (<1 us).
+    constexpr size_t STRIPE = 16384;
+    for (;;) {
+        if (gen.load(std::memory_order_acquire) != seen || stop.load(std::memory_order_relaxed)) return;
+        const int u = pf_cursor.fetch_add(1, std::memory_order_relaxed);
+        int rem = u;
+        const uint8_t* ptr = nullptr;
+        size_t len = 0;
+        for (int i = 0; i < n; ++i) {
+            const Rec& r = lr[pf_experts[i]];
+            if (!r.body || !r.body_bytes) continue;
+            const int nstripes = (int)((r.body_bytes + STRIPE - 1) / STRIPE);
+            if (rem < nstripes) {
+                const size_t off = (size_t)rem * STRIPE;
+                ptr = r.body + off;
+                len = std::min(STRIPE, (size_t)r.body_bytes - off);
+                break;
+            }
+            rem -= nstripes;
+        }
+        if (!ptr) return;
+#if defined(__x86_64__) || defined(_M_X64)
+        for (size_t o = 0; o < len; o += 64) _mm_prefetch((const char*)(ptr + o), _MM_HINT_T1);
+#elif defined(__GNUC__) || defined(__clang__)
+        for (size_t o = 0; o < len; o += 64) __builtin_prefetch((const char*)(ptr + o), 0, 2);
+#endif
+    }
 }
 
 void CpuExperts::Impl::worker(int tid) {
     uint64_t seen = 0;
+    uint64_t pf_seen = 0;
     for (;;) {
         const double t_spin = now_s();
         uint32_t it = 0;
         while (gen.load(std::memory_order_acquire) == seen && !stop.load(std::memory_order_relaxed)) {
+            if (l3_pf_enabled) {
+                const uint64_t pg = pf_gen.load(std::memory_order_acquire);
+                if (pg != pf_seen) {
+                    pf_seen = pg;
+                    do_l3_prefetch(tid, seen);
+                    continue;
+                }
+            }
             HY4_RELAX();
             if ((++it & 255) == 0 && (now_s() - t_spin) * 1e6 > spin_us) break;
         }
@@ -2385,6 +2216,9 @@ void CpuExperts::Impl::gu_unit(int tid, const Job& J, int a, int b) {
 #if HY4_ANY_FAST
         if (fast) {
             const ActRow* xp[MGF];
+#ifdef _MSC_VER
+#pragma loop(no_vector)
+#endif
             for (int i = 0; i < mg; ++i) xp[i] = tokA.p + (size_t)pair_tok[p0 + g0 + i];
             kern_gemm_dispatch(kern, r.gu, wg, RB, xp, mg, S.tg.p, J.hi);
             kern_gemm_dispatch(kern, r.gu, wu, RB, xp, mg, S.tu.p, J.hi);
@@ -2465,7 +2299,11 @@ void CpuExperts::Impl::dn_unit(int tid, const Job& J, int a, int c) {
 #if HY4_ANY_FAST
         if (fast) {
             const ActRow* xp[MGF];
-            for (int i = 0; i < mg; ++i) xp[i] = h2A.p + (size_t)(p0 + g0 + i);
+            const ActRow* base = h2A.p + (size_t)(p0 + g0);
+#ifdef _MSC_VER
+#pragma loop(no_vector)
+#endif
+            for (int i = 0; i < mg; ++i) xp[i] = base + i;
             kern_gemm_dispatch(kern, r.dn, wd, RB, xp, mg, S.tg.p, J.hi);
         } else
 #endif
@@ -2831,11 +2669,83 @@ uint64_t CpuExperts::ram_budget_bytes() {
 #endif
 }
 
+uint64_t CpuExperts::ram_available_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullAvailPhys : 0;
+#else
+    uint64_t avail = 0, mfree = 0, mbuf = 0, mcache = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) avail = kb * 1024ull;
+            else if (std::sscanf(line, "MemFree: %llu kB", &kb) == 1) mfree = kb * 1024ull;
+            else if (std::sscanf(line, "Buffers: %llu kB", &kb) == 1) mbuf = kb * 1024ull;
+            else if (std::sscanf(line, "Cached: %llu kB", &kb) == 1) mcache = kb * 1024ull;
+        }
+        std::fclose(f);
+    }
+    if (avail == 0) avail = mfree + mbuf + mcache;
+    // Cap by cgroup v2 headroom: memory.max - (memory.current - inactive_file)
+    if (std::FILE* fm = std::fopen("/sys/fs/cgroup/memory.max", "r")) {
+        char buf[64] = {0};
+        if (std::fgets(buf, sizeof(buf), fm) && buf[0] >= '0' && buf[0] <= '9') {
+            const uint64_t lim = std::strtoull(buf, nullptr, 10);
+            uint64_t cur = 0, inact_file = 0;
+            if (std::FILE* fc = std::fopen("/sys/fs/cgroup/memory.current", "r")) {
+                if (std::fscanf(fc, "%llu", (unsigned long long*)&cur) != 1) cur = 0;
+                std::fclose(fc);
+            }
+            if (std::FILE* fs = std::fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                char line[256];
+                unsigned long long v = 0;
+                while (std::fgets(line, sizeof(line), fs))
+                    if (std::sscanf(line, "inactive_file %llu", &v) == 1) { inact_file = v; break; }
+                std::fclose(fs);
+            }
+            const uint64_t used = cur > inact_file ? (cur - inact_file) : 0;
+            const uint64_t cg_avail = lim > used ? (lim - used) : 0;
+            if (lim > 0 && (avail == 0 || cg_avail < avail)) avail = cg_avail;
+        }
+        std::fclose(fm);
+    }
+    // Cap by cgroup v1 headroom if present
+    if (std::FILE* fm = std::fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r")) {
+        char buf[64] = {0};
+        if (std::fgets(buf, sizeof(buf), fm) && buf[0] >= '0' && buf[0] <= '9') {
+            const uint64_t lim = std::strtoull(buf, nullptr, 10);
+            if (lim > 0 && lim < (1ull << 60)) {
+                uint64_t cur = 0, inact_file = 0;
+                if (std::FILE* fc = std::fopen("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r")) {
+                    if (std::fscanf(fc, "%llu", (unsigned long long*)&cur) != 1) cur = 0;
+                    std::fclose(fc);
+                }
+                if (std::FILE* fs = std::fopen("/sys/fs/cgroup/memory/memory.stat", "r")) {
+                    char line[256];
+                    unsigned long long v = 0;
+                    while (std::fgets(line, sizeof(line), fs))
+                        if (std::sscanf(line, "total_inactive_file %llu", &v) == 1) { inact_file = v; break; }
+                    std::fclose(fs);
+                }
+                const uint64_t used = cur > inact_file ? (cur - inact_file) : 0;
+                const uint64_t cg_avail = lim > used ? (lim - used) : 0;
+                if (avail == 0 || cg_avail < avail) avail = cg_avail;
+            }
+        }
+        std::fclose(fm);
+    }
+    return avail;
+#endif
+}
+
 int CpuExperts::default_threads() {
-    const int host_cpus = (int)std::max(1u, std::thread::hardware_concurrency());
+    const int host_cpus = total_logical_cpus();
+    const int phys_cap = std::max(1, host_cpus / 2);
     const double cg = cgroup_cpu_limit();
-    if (cg > 0.0 && cg < (double)host_cpus) return std::max(1, (int)std::floor(cg) - 2);
-    return std::max(1, host_cpus / 2);
+    if (cg > 0.0 && cg < (double)host_cpus) return std::max(1, std::min(phys_cap, (int)std::floor(cg) - 2));
+    return phys_cap;
 }
 
 bool CpuExperts::read_rank_table(const std::string& path, std::vector<uint16_t>& expert_of_rank, std::vector<uint16_t>& codes, std::string& err) {
@@ -3115,6 +3025,26 @@ void CpuExperts::wait() {
             break;
         }
     }
+}
+
+void CpuExperts::prefetch_experts(int layer, const int32_t* experts, int n_experts) {
+    Impl& I = *p_;
+    if (!I.l3_pf_enabled || !experts || n_experts <= 0 || layer < 0 || layer >= I.nlayers) return;
+    if (!done()) return;  // never contend with an active compute job
+    const Rec* lr = &I.recs[(size_t)layer * E];
+    int n = 0;
+    for (int i = 0; i < n_experts && n < 64; ++i) {
+        const int32_t e = experts[i];
+        if (e < 0 || e >= E || !lr[e].body) continue;
+        bool dup = false;
+        for (int j = 0; j < n; ++j) if (I.pf_experts[j] == e) { dup = true; break; }
+        if (!dup) I.pf_experts[n++] = e;
+    }
+    if (n == 0) return;
+    I.pf_layer = layer;
+    I.pf_n = n;
+    I.pf_cursor.store(0, std::memory_order_relaxed);
+    I.pf_gen.fetch_add(1, std::memory_order_release);
 }
 
 void CpuExperts::set_hi_activations(bool on) {

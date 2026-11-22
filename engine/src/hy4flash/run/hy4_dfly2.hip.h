@@ -449,9 +449,15 @@ struct DFly2 {
         cudaGraphExec_t exec = nullptr;
     };
     std::vector<DgEntry> dg_cache;
+    cudaGraphExec_t dg_eval[DFLY_KMAX + 1] = {};
+    int dg_eval_rv = -1;
+    uint64_t dg_eval_kv_gen = ~0ull;
     void dg_clear() {
         for (auto& e : dg_cache) if (e.exec) (void)cudaGraphExecDestroy(e.exec);
         dg_cache.clear();
+        for (int j = 0; j <= DFLY_KMAX; ++j)
+            if (dg_eval[j]) { (void)cudaGraphExecDestroy(dg_eval[j]); dg_eval[j] = nullptr; }
+        dg_eval_rv = -1;
     }
     ~DFly2() { dg_clear(); }
 #endif
@@ -1006,6 +1012,43 @@ struct DFly2 {
         const void* lmw = r.tw("lm_head.weight");
         h_chain[0] = prev_tok;
         HCK(hipMemcpyAsync(d_prev_one, h_chain, 4, hipMemcpyHostToDevice, st));
+#if HY4_CUDA
+        if (N > 0 && j >= 1 && j <= DFLY_KMAX && r.cuda_graph_on && !r.prof && !r.prof2 && !r.dump) {
+            if (dg_eval_rv != N || dg_eval_kv_gen != r.kv_gen) {
+                for (int k = 0; k <= DFLY_KMAX; ++k)
+                    if (dg_eval[k]) { (void)cudaGraphExecDestroy(dg_eval[k]); dg_eval[k] = nullptr; }
+                dg_eval_rv = N;
+                dg_eval_kv_gen = r.kv_gen;
+            }
+            if (!dg_eval[j]) {
+                cudaGraph_t gr = nullptr;
+                HCK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_prev_one, Ec, 1);
+                hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
+                                   wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);
+                if (lm_hc.d_jobs) {
+                    linear_h_multi(st, lm_hc, hcin, 1);
+                } else {
+                    r.lin(pf + "hidden_correction.gate_proj.weight", hcin, G, 1);
+                    r.lin(pf + "hidden_correction.up_proj.weight", hcin, U, 1);
+                }
+                hipLaunchKernelGGL(k_swiglu_h, dim3((HID + 255) / 256), dim3(256), 0, st, (const float*)G, (const float*)U, act, (size_t)HID);
+                r.lin(pf + "hidden_correction.down_proj.weight", act, Dn, 1);
+                hipLaunchKernelGGL(k_dfly_corr, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), (const float*)Dn, wf(pf + "confidence_head.proj.weight"),
+                                   wf(pf + "confidence_head.proj.bias"), hc_h, d_conf);
+                hipLaunchKernelGGL(k_dfly_cand_score, dim3((N + 7) / 8), dim3(256), 0, st, (const uint8_t*)lmw, (const int32_t*)(d_cand + (size_t)(j - 1) * N), (const __half*)hc_h, d_cscore, N);
+                HCK(cudaStreamEndCapture(st, &gr));
+                HCK(cudaGraphInstantiate(&dg_eval[j], gr, nullptr, nullptr, 0));
+                HCK(cudaGraphDestroy(gr));
+            }
+            HCK(cudaGraphLaunch(dg_eval[j], st));
+            HCK(hipMemcpyAsync(h_cscore, d_cscore, (size_t)N * 4, hipMemcpyDeviceToHost, st));
+            HCK(hipMemcpyAsync(h_conf, d_conf, 4, hipMemcpyDeviceToHost, st));
+            HCK(hipStreamSynchronize(st));
+            ++n_chain_evals;
+            return h_conf[0];
+        }
+#endif
         embed_rows(st, emb.fmt, r.tw("model.embed_tokens.weight"), (int)emb.rows(), (int)emb.cols(), d_prev_one, Ec, 1);
         hipLaunchKernelGGL(k_dfly_cat2, dim3(1), dim3(256), 0, st, (const float*)(Hf + (size_t)j * HID), wf(pf + "hidden_correction.hidden_norm.weight"), (const float*)Ec,
                            wf(pf + "hidden_correction.embed_norm.weight"), hcin, c.rms_eps);

@@ -70,7 +70,10 @@ public:
     bool cold_expert(int layer, int expert) const;
     // RAM the process may use: min(MemTotal, cgroup memory.max / memory.limit_in_bytes) on Linux, total physical memory on Windows.
     static uint64_t ram_budget_bytes();
-    // Default pool thread count: respects Linux cgroup cpu.max / cfs_quota_us (leaves ~2 cores for CUDA/Engram when cgroup-constrained).
+    // Currently available host RAM (Linux MemAvailable capped by cgroup free + reclaimable file cache; Windows ullAvailPhys).
+    static uint64_t ram_available_bytes();
+    // Default pool thread count: respects Linux cgroup cpu.max / cfs_quota_us (leaves ~2 cores for CUDA/Engram when cgroup-constrained)
+    // and Windows multi-group processor counts (GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)).
     static int default_threads();
 
     // ---- directory helpers (read only the 4 KiB header + Section 3; no model load, no zstd) ------------------------------------
@@ -120,6 +123,9 @@ public:
     // waits for the previous one. T may be 1..any (T > 512 runs in chunks of 512 tokens).
     void submit(int layer, int T, const float* z, const int32_t* idx, const float* w, const uint8_t* use_pair, float* zout,
                 bool accumulate = false);
+    // Non-blocking next-layer CPU L3 cache prefetch (STRATA_L3_PF): wakes idle workers to stream the specified resident
+    // experts of `layer` into CPU L2/L3 caches while the GPU computes attention; preempts immediately on next submit().
+    void prefetch_experts(int layer, const int32_t* experts, int n_experts);
     void wait();          // blocks (spin, then sleep) until the last submit() has finished
     bool done() const;    // non-blocking poll
 

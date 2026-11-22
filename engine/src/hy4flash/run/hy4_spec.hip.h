@@ -27,7 +27,7 @@ struct SpecCfg {
     bool sabotage = false;   // test only: replace every draft token by a random id with conf 0.9 (acceptance ~0): the worst case for the controller
     int rv = 256;            // reduced-vocabulary draft chain: candidates per slot (0 = full lm_head per drafted token)
     bool tree = true;        // Tree-8 speculative verification (top-2 branching at uncertain slots within M <= 8 verify tile)
-    float early_cut = 0.08f; // early-exit draft chain when best remaining frontier reach prob < early_cut (0 = disabled)
+    float early_cut = 0.04f; // early-exit draft chain when best remaining frontier reach prob < early_cut (0 = disabled)
 };
 
 struct SpecStats {
@@ -50,7 +50,10 @@ public:
     // cost model
     double tp = 0;      // plain step ms (EMA)
     double tv[9] = {};  // verify ms by m (EMA), 0 = not measured
+    long tv_step[9] = {};  // spec_iters at last tv[m] measurement (for cold-start stale refresh)
+    int tv_cnt[9] = {};
     static constexpr double DM[8] = {16.0, 26.5, 35.6, 43.9, 51.4, 58.2, 64.8, 70.8};
+    static double dm_scale(int m) { return (5.1 + 0.127 * DM[std::max(1, std::min(m, 8)) - 1]) / 7.13; }
     // confidence calibration, buckets by conf
     static constexpr float EDGE[5] = {0.2f, 0.4f, 0.6f, 0.8f, 0.9f};
     static constexpr float MID[6] = {0.1f, 0.3f, 0.5f, 0.7f, 0.85f, 0.95f};
@@ -92,10 +95,23 @@ public:
         const int b = bucket(c);
         return cy[b] / cn[b];
     }
-    double tver(int m) const {  // verify ms for m tokens
-        if (tv[m] > 0) return tv[m];
-        const double base = tp > 0 ? tp : 46.0;
-        return base * (5.1 + 0.127 * DM[m - 1]) / 7.13;
+    double tver(int m) const {  // verify ms for m tokens (with stale cold-start refresh so early cold-vcache m=8 never locks out large windows)
+        // Find most recently measured m' != m to derive a fresh scale anchor if tv[m] is missing or stale
+        int ref_m = 0;
+        long best_st = -1;
+        for (int k = 2; k <= 8; ++k) {
+            if (tv[k] > 0 && tv_step[k] > best_st) { best_st = tv_step[k]; ref_m = k; }
+        }
+        const double est = (ref_m > 0) ? (tv[ref_m] * dm_scale(m) / dm_scale(ref_m))
+                                       : ((tp > 0 ? tp : 30.0) * dm_scale(m));
+        if (tv[m] <= 0) return est;
+        const long age = S.spec_iters - tv_step[m];
+        if (age > 12 && tv[m] > est * 1.15) {
+            // Smoothly decay stale cold measurement toward fresh estimate so choose_m re-probes m
+            const double w = std::min(0.85, (double)(age - 12) / 24.0);
+            return tv[m] * (1.0 - w) + est * w;
+        }
+        return tv[m];
     }
     int choose_k(int K) const {
         if (!cfg.adaptive) return K;
@@ -454,7 +470,10 @@ public:
                 cy[b] += accepted_primary ? 1.0 : 0.0;
                 if (cn[b] > 200) { cn[b] *= 0.5; cy[b] *= 0.5; }
             }
-            tv[T] = tv[T] > 0 ? 0.7 * tv[T] + 0.3 * tver_ms : tver_ms;
+            const double alpha = (tv_cnt[T] < 4 || S.spec_iters < 16) ? 0.5 : 0.3;
+            tv[T] = tv[T] > 0 ? (1.0 - alpha) * tv[T] + alpha * tver_ms : tver_ms;
+            tv_step[T] = S.spec_iters;
+            ++tv_cnt[T];
             S.t_verify += tver_ms;
             S.verified_slots += Kp;
             S.accepted += n;

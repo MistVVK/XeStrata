@@ -226,9 +226,10 @@ struct InkCudaModel {
                 }
             }
             INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
+            uint8_t* h_arena_base = nullptr;
             if (host_used > 0) {
-                INK_CK(cudaHostAlloc(&hybrid.h_sec4_pinned, host_used, cudaHostAllocDefault));
-                hybrid.h_sec4_bytes = host_used;
+                h_arena_base = hybrid.alloc_host_arena(host_used);
+                if (!h_arena_base) { err = "cannot allocate host expert arena"; return false; }
                 hybrid.host_meta.assign((size_t)man.c.n_phys * man.c.n_experts, {});
                 hybrid.orig_host_off.assign((size_t)man.c.n_phys * man.c.n_experts, 0);
             }
@@ -248,7 +249,7 @@ struct InkCudaModel {
                     dev.tier = 0;
                     v_cur += e.body_bytes;
                 } else {
-                    uint8_t* hdst = hybrid.h_sec4_pinned + h_cur;
+                    uint8_t* hdst = h_arena_base + h_cur;
                     std::memcpy(hdst, tmp_body.data(), e.body_bytes);
                     hybrid.host_meta[key].body       = hdst;
                     hybrid.host_meta[key].body_bytes = e.body_bytes;

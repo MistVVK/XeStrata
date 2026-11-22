@@ -374,9 +374,12 @@ inline int plan_memory(int max_ctx, int chunk, size_t total, const std::string& 
         return arena + c * 0.195e6 / GB + 0.22 + 30.0 * (512.0 + c) * 1152.0 / GB;
     };
     if (chunk <= 0) {
-        // 16 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes 32->16 at 128K; capped to 4096 for <=4K sessions to maximize expert cache!).
+        // 16..32 GB cards default to Tc = 4096 (maximizes AdaptiveExpertCache by +1.6 GB / +450-600 VRAM slots over Tc = 8192);
+        // 48 GB+ cards default to Tc = 8192 when ctx >= 8192 (halves PCIe passes at 128K).
         // Multi-GPU 32 GB static EP at >=96K context uses Tc = 2048 so 100% of SQ-64 experts + full 128K KV fit in HBM2 (e.g. 2x V100 32 GB).
-        int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048 : ((tot >= 15.0) ? ((max_ctx >= 8192) ? 8192 : 4096) : (tot >= 11.0 ? 2048 : 1024));
+        int c = (multi_gpu && max_ctx >= 98304 && tot < 40.0) ? 2048
+              : (tot >= 44.0 ? ((max_ctx >= 8192) ? 8192 : 4096)
+              : (tot >= 15.0 ? 4096 : (tot >= 11.0 ? 2048 : 1024)));
         const double work_cap = (tot >= 15.0) ? 0.22 : 0.16;
         while (c > 256 && est_work_gb(c) > work_cap * tot) c >>= 1;
         while (c > 256 && trunk + est_work_gb(c) + kv_init_gb + wkv + cublas_gb + 0.55 > tot) c >>= 1;
@@ -472,6 +475,73 @@ inline double host_mem_gb() {
 #endif
 }
 
+// Available host RAM right now (MemAvailable / ullAvailPhys, capped by cgroup free headroom), in GiB
+inline double ram_avail_gb() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) return (double)ms.ullAvailPhys / 1073741824.0;
+    return 0.0;
+#else
+    double avail_kb = 0.0, free_kb = 0.0, buf_kb = 0.0, cache_kb = 0.0;
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char ln[256];
+        double v = 0.0;
+        while (fgets(ln, sizeof ln, f)) {
+            if (sscanf(ln, "MemAvailable: %lf kB", &v) == 1) avail_kb = v;
+            else if (sscanf(ln, "MemFree: %lf kB", &v) == 1) free_kb = v;
+            else if (sscanf(ln, "Buffers: %lf kB", &v) == 1) buf_kb = v;
+            else if (sscanf(ln, "Cached: %lf kB", &v) == 1) cache_kb = v;
+        }
+        fclose(f);
+    }
+    double gb = (avail_kb > 0.0 ? avail_kb : (free_kb + buf_kb + cache_kb)) / 1048576.0;
+    if (FILE* fm = fopen("/sys/fs/cgroup/memory.max", "r")) {
+        char buf[64] = {0};
+        double lim = 0.0;
+        if (fgets(buf, sizeof buf, fm) && sscanf(buf, "%lf", &lim) == 1 && lim > 1e9 && lim < 1e15) {
+            double cur = 0.0, inact = 0.0;
+            if (FILE* fc = fopen("/sys/fs/cgroup/memory.current", "r")) {
+                if (fscanf(fc, "%lf", &cur) != 1) cur = 0.0;
+                fclose(fc);
+            }
+            if (FILE* fs = fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                char ln[256];
+                double v = 0.0;
+                while (fgets(ln, sizeof ln, fs))
+                    if (sscanf(ln, "inactive_file %lf", &v) == 1) { inact = v; break; }
+                fclose(fs);
+            }
+            const double cg_avail = std::max(0.0, lim - std::max(0.0, cur - inact)) / 1073741824.0;
+            gb = (gb > 0.0) ? std::min(gb, cg_avail) : cg_avail;
+        }
+        fclose(fm);
+    }
+    if (FILE* fm = fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r")) {
+        char buf[64] = {0};
+        double lim = 0.0;
+        if (fgets(buf, sizeof buf, fm) && sscanf(buf, "%lf", &lim) == 1 && lim > 1e9 && lim < 1e15) {
+            double cur = 0.0, inact = 0.0;
+            if (FILE* fc = fopen("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r")) {
+                if (fscanf(fc, "%lf", &cur) != 1) cur = 0.0;
+                fclose(fc);
+            }
+            if (FILE* fs = fopen("/sys/fs/cgroup/memory/memory.stat", "r")) {
+                char ln[256];
+                double v = 0.0;
+                while (fgets(ln, sizeof ln, fs))
+                    if (sscanf(ln, "total_inactive_file %lf", &v) == 1) { inact = v; break; }
+                fclose(fs);
+            }
+            const double cg_avail = std::max(0.0, lim - std::max(0.0, cur - inact)) / 1073741824.0;
+            gb = (gb > 0.0) ? std::min(gb, cg_avail) : cg_avail;
+        }
+        fclose(fm);
+    }
+    return gb;
+#endif
+}
+
 // Expert tiering for cards that cannot hold Section 4: the hottest ranks (rank-major over the 41 layers, Section 4 is stored hot to cold) go to a device arena,
 // every other expert goes to pinned, device-mapped host memory that the GPU reads directly (zero-copy over PCIe). Each expert's body_off is rewritten as the
 // (wrapping) distance of its final address from g.d_sec4, so the kernels keep their `sec4 + body_off` addressing and need no change.
@@ -487,15 +557,18 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     std::vector<uint64_t> vcap(ng, 0), vb_gpu(ng, 0), nv_gpu(ng, 0);
     // Adaptive VRAM expert cache (single-GPU cpu_mode): when host RAM fits all experts (e.g. 64 GB+ Hero cards), use 100% dynamic slots;
     // when multi-GPU (--gpus 0,1...), distribute static experts across all GPUs (e.g. 2x V100 32 GB = 64 GB HBM2).
-    const double host_gb = host_mem_gb(), lim_gb = ram_limit_gb();
+    const double host_gb = host_mem_gb(), lim_gb = ram_limit_gb(), avail_gb = ram_avail_gb();
     const bool cgroup_limited = (lim_gb < host_gb - 1.0);
     double ram_budget_gb = 0.0;
     if (cpu_mode) {
-        if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = atof(getenv("HY4_RAM_BUDGET_GB"));
+        if (getenv("HY4_RAM_BUDGET_GB")) ram_budget_gb = std::max(0.0, atof(getenv("HY4_RAM_BUDGET_GB")));
         else {
             const double need = getenv("HY4_HOST_NEED_GB") ? atof(getenv("HY4_HOST_NEED_GB")) : 0.0;
+            const double engram_gb = getenv("HY4_ENGRAM_CACHE_MIB") ? std::max(0.0, atof(getenv("HY4_ENGRAM_CACHE_MIB")) / 1024.0) : 0.85;
             const double vis_extra = (cgroup_limited && g.has_vision) ? 1.5 : 0.0;  // vision shard (0.93 GB) + serve/server.py RSS inside cgroup limit
-            ram_budget_gb = lim_gb - 3.5 - need - 1.5 - vis_extra;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+            const double by_total = lim_gb - 3.5 - need - engram_gb - 0.65 - vis_extra;  // OS and runtime, host KV / kv_b copies, engram cache + pinned staging
+            const double by_avail = avail_gb - 2.0 - need - engram_gb - 0.50 - vis_extra;  // live MemAvailable / ullAvailPhys headroom (prevents swapping on 64 GB hosts)
+            ram_budget_gb = std::max(0.0, (avail_gb > 0.5) ? std::min(by_total, by_avail) : by_total);
         }
     }
     const uint64_t ram_budget_bytes = ram_budget_gb > 0 ? (uint64_t)(ram_budget_gb * 1e9) : 0;
@@ -635,7 +708,18 @@ inline bool load_experts_tiered(GpuModel& g, const std::string& path, size_t vra
     uint8_t* hdev = nullptr;
     if (hb) {
         double t0 = now_s();
-        HCK(hipHostMalloc((void**)&hbase, hb, hipHostMallocMapped));
+        if (hipHostMalloc((void**)&hbase, hb, hipHostMallocMapped) != hipSuccess) {
+            (void)hipGetLastError();
+            fprintf(stderr, "[load] pinned host arena %.2f GB failed (WDDM/commit limit); retrying with CPU-expert mode\n", hb / 1e9);
+            if (g.d_sec4) { (void)hipFree(g.d_sec4); g.d_sec4 = nullptr; }
+            for (auto* sl : g.vcache_slabs) if (sl) (void)hipFree(sl);
+            g.vcache_slabs.clear();
+            g.vcache_nslots = 0;
+            for (auto& pr : g.peers) if (pr.d_sec4) { (void)hipSetDevice(pr.dev); (void)hipFree(pr.d_sec4); pr.d_sec4 = nullptr; }
+            g.peers.clear();
+            HCK(hipSetDevice(g.primary_gpu));
+            return load_experts_tiered(g, path, vram_budget, true, err);
+        }
         HCK(hipHostGetDevicePointer((void**)&hdev, hbase, 0));
         fprintf(stderr, "[load] pinned host arena %.2f GB in %.1f s\n", hb / 1e9, now_s() - t0);
     }
@@ -891,11 +975,17 @@ inline bool load_gpu_model(GpuModel& g, const std::string& path, bool with_exper
 #endif
         }
         if (!loaded_full) {
-            // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces, default: CPU when they would use > 45% of the RAM or the CPU has AVX-512 VBMI+VNNI
+            // host-resident experts: pinned + read by the GPU (needs the RAM) or computed by the CPU. HY4_CPU_EXPERTS=1/0 forces;
+            // default: CPU when they would use > 45% of RAM (or > 25% / > 12 GB on Windows WDDM) or the CPU has AVX-512 VBMI+VNNI.
             bool cpu_mode = false;
             {
                 double host_gb = (g.sec4_bytes - std::max(0.0, std::min(budget, (double)g.sec4_bytes))) / 1e9, mem_gb = host_mem_gb();
-                cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : (host_gb > 0.45 * mem_gb || host_cpu_fast());
+#ifdef _WIN32
+                const bool default_cpu = (host_gb > 0.25 * mem_gb || host_gb > 12.0 || host_cpu_fast());
+#else
+                const bool default_cpu = (host_gb > 0.45 * mem_gb || host_cpu_fast());
+#endif
+                cpu_mode = getenv("HY4_CPU_EXPERTS") ? atoi(getenv("HY4_CPU_EXPERTS")) != 0 : default_cpu;
             }
             if (!load_experts_tiered(g, path, budget < 0 ? 0 : (size_t)budget, cpu_mode, err)) {
                 fprintf(stderr, "experts: %s\n", err.c_str());

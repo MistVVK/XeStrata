@@ -613,6 +613,9 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Hy4-Flash (HY-4-Flash-200B): HuggingFace model card defaults when request/config omits sampling
+    "hy4flash": {"thinking": {"temperature": 0.9, "top_p": 1.0},
+                 "instruct": {"temperature": 0.9, "top_p": 1.0}},
 }
 
 

@@ -417,7 +417,18 @@ int main(int argc, char** argv) {
         else if (a == "--vision") vision_path = nxt();           // HY4-VISION: the Vision shard; loaded on the first request that carries a picture
         else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): a picture file per image-pad token of --tokens, in order (the engine expands each pad)
         else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
-        else if (a == "--vram-experts-gb" || a == "--ram-experts-gb" || a == "--engram-cache-mib") fprintf(stderr, "[args] %s %s: not used by this runner yet\n", a.c_str(), nxt().c_str());
+        else if (a == "--vram-experts-gb") {
+            const std::string v = nxt();
+            if (atof(v.c_str()) >= 0.0) hy4_setenv("HY4_EXPERT_VRAM_GB", v.c_str(), 1);
+        }
+        else if (a == "--ram-experts-gb") {
+            const std::string v = nxt();
+            if (atof(v.c_str()) >= 0.0) hy4_setenv("HY4_RAM_BUDGET_GB", v.c_str(), 1);
+        }
+        else if (a == "--engram-cache-mib") {
+            const std::string v = nxt();
+            if (atof(v.c_str()) >= 0.0) hy4_setenv("HY4_ENGRAM_CACHE_MIB", v.c_str(), 1);
+        }
         else if (a == "--kv") {
             std::string kv = nxt();
             if (kv != "fp16") {
