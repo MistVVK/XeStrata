@@ -62,6 +62,14 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     g.head_dim = key_length;
     if (family == strata::ModelFamily::Qwen35Moe) {
         num("nextn_predict_layers", g.n_mtp_layers);
+        // #6522: Ollama/llama.cpp GGUFs may encode attention.head_count_kv (and head_count) as a per-layer array
+        // (e.g. [0,0,0,2] x 10); resolve via the shared helper so we never fall back to entry 0 or defaults.
+        std::string per_err = strata::read_qwen35moe_layer_int(meta, "qwen35moe.attention.head_count", block_count,
+                                                               g.n_mtp_layers, g.qsa_interval, g.n_head);
+        if (!per_err.empty()) { err = per_err; return false; }
+        per_err = strata::read_qwen35moe_layer_int(meta, "qwen35moe.attention.head_count_kv", block_count,
+                                                  g.n_mtp_layers, g.qsa_interval, g.n_head_kv);
+        if (!per_err.empty()) { err = per_err; return false; }
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
     } else {

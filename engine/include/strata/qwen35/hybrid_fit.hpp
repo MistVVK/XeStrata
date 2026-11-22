@@ -32,6 +32,7 @@ struct HybridIn {
     bool mtp_only = false;   // the main layers all in VRAM, only the MTP block hybrid
     size_t total_main = 0;   // the main layers' experts with tails (mtp_only)
     size_t mtp_stride = 0;   // the MTP block's stride (mtp_only)
+    size_t headroom = 0;     // driver / slot-table / portable-pinned page-table headroom on card 0
 };
 
 struct HybridPlan {
@@ -58,7 +59,7 @@ inline HybridPlan hybrid_plan_with(const HybridIn& in, size_t staging) {
     p.need = staging + in.outputs;
     if (in.mtp_only) p.need += in.total_main + (S > 0 ? (size_t) S * in.mtp_stride + in.tail : 0);
     else p.need += S > 0 ? (size_t) S * in.per_slot + in.n_layers * in.tail : 0;
-    p.fits = p.need <= in.fr;
+    p.fits = p.need + in.headroom <= in.fr;
     return p;
 }
 

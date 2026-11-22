@@ -381,10 +381,11 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        const uint64_t keep = (v.elem != MetaType::STRING && v.elem != MetaType::ARRAY && v.count <= 1024) ? v.count : 64;
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, keep));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < keep) v.items.push_back(std::move(e)); // keep full per-layer numeric arrays; sample huge arrays
         }
         break;
     }
@@ -640,27 +641,94 @@ inline ModelFamily model_family(const GgufFile& g) {
     return arch ? model_family_from_arch(arch->s) : ModelFamily::Unknown;
 }
 
+/// True when `t` is a GGUF integer scalar type (not string, array, float, or bool).
+inline bool meta_is_int_type(MetaType t) {
+    return t == MetaType::U8 || t == MetaType::I8 || t == MetaType::U16 || t == MetaType::I16 ||
+           t == MetaType::U32 || t == MetaType::I32 || t == MetaType::U64 || t == MetaType::I64;
+}
+
+/// Reads a `qwen35moe` attention head-count key (`attention.head_count_kv`, `attention.head_count`) that may be stored
+/// either as a positive integer scalar OR as a per-layer integer array of length `block_count` (Ollama / llama.cpp
+/// convention for hybrid GDN + full-attention checkpoints, e.g. `[0, 0, 0, 2] x 10`, or a uniform array `[2, ...]`).
+/// Validates length == `block_count`, checks that every trunk full-attention layer (`l % interval == interval - 1`) has
+/// a positive entry, requires all non-zero entries to agree, and never blindly reads entry 0.
+/// Returns "" on success (writing `out`), or a precise error message.
+inline std::string read_qwen35moe_layer_int(const GgufFile& g, const char* key, int64_t block_count,
+                                            int64_t n_mtp_layers, int64_t full_attn_interval, int64_t& out) {
+    const MetaValue* v = g.get(key);
+    if (!v) return std::string("missing ") + key;
+    if (v->is_num()) {
+        if (!meta_is_int_type(v->type)) return std::string(key) + " is not an integer";
+        const int64_t val = (int64_t) v->u;
+        if (val <= 0) return std::string(key) + " must be positive";
+        out = val;
+        return {};
+    }
+    if (v->type != MetaType::ARRAY) return std::string(key) + " is not a number or per-layer array";
+    if (!meta_is_int_type(v->elem)) return std::string(key) + " array elements must be integers";
+    if (block_count <= 0 || v->count != (uint64_t) block_count || v->items.size() != v->count) {
+        return std::string(key) + " array length is " + std::to_string(v->count) + ", expected " +
+               std::to_string(block_count) + " (qwen35moe.block_count)";
+    }
+    const int64_t n_trunk = block_count - n_mtp_layers;
+    int64_t common = 0;
+    for (int64_t l = 0; l < block_count; ++l) {
+        const int64_t val = (int64_t) v->items[(size_t) l].u;
+        if (val < 0)
+            return std::string(key) + "[" + std::to_string(l) + "] = " + std::to_string(val) + " must be non-negative";
+        const bool trunk_attn = l < n_trunk && full_attn_interval >= 2 && (l % full_attn_interval == full_attn_interval - 1);
+        if (trunk_attn && val <= 0)
+            return std::string(key) + "[" + std::to_string(l) + "] is 0 on a full-attention layer";
+        if (val > 0) {
+            if (common == 0) common = val;
+            else if (val != common)
+                return std::string(key) + "[" + std::to_string(l) + "] = " + std::to_string(val) +
+                       " disagrees with full-attention value " + std::to_string(common);
+        }
+    }
+    if (common <= 0) return std::string(key) + " has no positive full-attention entry";
+    out = common;
+    return {};
+}
+
 /// Qwen3.6-35B-A3B's guard: every key the geometry is read from must be present (core::geometry_from_gguf),
 /// and the few that the layer pattern depends on must have the values the model has.
+/// Accepts `qwen35moe.attention.head_count_kv` (and `attention.head_count`) as either a scalar or a per-layer array
+/// of length `block_count` (#6522), tolerates `qwen35moe.feed_forward_length == 0` for MoE-only checkpoints, and treats
+/// `qwen35moe.nextn_predict_layers` as optional (defaulting to 0 when absent).
 inline std::string check_architecture_qwen35moe(const GgufFile& g) {
-    static const char* const keys[] = {
-        "qwen35moe.block_count", "qwen35moe.embedding_length", "qwen35moe.attention.head_count",
-        "qwen35moe.attention.head_count_kv", "qwen35moe.attention.key_length", "qwen35moe.attention.value_length",
+    static const char* const scalar_keys[] = {
+        "qwen35moe.block_count", "qwen35moe.embedding_length",
+        "qwen35moe.attention.key_length", "qwen35moe.attention.value_length",
         "qwen35moe.expert_count", "qwen35moe.expert_used_count", "qwen35moe.expert_feed_forward_length",
         "qwen35moe.expert_shared_feed_forward_length", "qwen35moe.ssm.conv_kernel", "qwen35moe.ssm.state_size",
         "qwen35moe.ssm.group_count", "qwen35moe.ssm.time_step_rank", "qwen35moe.ssm.inner_size",
-        "qwen35moe.full_attention_interval", "qwen35moe.nextn_predict_layers",
+        "qwen35moe.full_attention_interval",
     };
-    for (const char* k : keys) {
+    for (const char* k : scalar_keys) {
         const MetaValue* v = g.get(k);
         if (!v) return std::string("missing ") + k;
         if (!v->is_num()) return std::string(k) + " is not a number";
     }
     const MetaValue* nl = g.get("qwen35moe.block_count");
-    const MetaValue* mtp = g.get("qwen35moe.nextn_predict_layers");
-    if (mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
-    if (g.get("qwen35moe.full_attention_interval")->u < 2)
+    const int64_t block_count = (int64_t) nl->u;
+    if (block_count <= 0) return "qwen35moe.block_count must be positive";
+    int64_t n_mtp = 0;
+    if (const MetaValue* mtp = g.get("qwen35moe.nextn_predict_layers")) {
+        if (!mtp->is_num()) return "qwen35moe.nextn_predict_layers is not a number";
+        if (mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
+        n_mtp = (int64_t) mtp->u;
+    }
+    const int64_t interval = (int64_t) g.get("qwen35moe.full_attention_interval")->u;
+    if (interval < 2)
         return "qwen35moe.full_attention_interval must be at least 2 (the GDN / attention pattern)";
+    // attention.head_count and attention.head_count_kv may be scalars or per-layer arrays of length block_count (#6522)
+    int64_t hc = 0, hkv = 0;
+    std::string err = read_qwen35moe_layer_int(g, "qwen35moe.attention.head_count", block_count, n_mtp, interval, hc);
+    if (!err.empty()) return err;
+    err = read_qwen35moe_layer_int(g, "qwen35moe.attention.head_count_kv", block_count, n_mtp, interval, hkv);
+    if (!err.empty()) return err;
+    // MoE-only checkpoints may carry feed_forward_length = 0 (scalar or zero array); tolerate it explicitly.
     return {};
 }
 
