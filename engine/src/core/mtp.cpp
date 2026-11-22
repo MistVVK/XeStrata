@@ -992,7 +992,7 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
         NodeTypeT ty;
         MTP_NODE_TYPE(nd, &ty);
         std::string name = "type" + std::to_string((int) ty);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
         if (ty == hipGraphNodeTypeKernel) {
             hipKernelNodeParams kp{};
             if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess && kp.func != nullptr) {
@@ -1000,6 +1000,8 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
                 if (fn != nullptr) name = fn;
             }
         }
+#elif defined(STRATA_USE_HIP)
+        if (ty == hipGraphNodeTypeKernel) name = "kernel";
 #else
         if (ty == cudaGraphNodeTypeKernel) name = "kernel";
 #endif

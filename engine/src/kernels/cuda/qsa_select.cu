@@ -1232,7 +1232,7 @@ int scores_thread_arch() {
         cudaDeviceProp properties{};
         arch = 0;
         if (cudaGetDeviceProperties(&properties, device) == cudaSuccess)
-            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
+            arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is_discrete_rdna3(properties.gcnArchName) ? 1 : 0;
         cached_device = device;
         cudaGetLastError();
     }

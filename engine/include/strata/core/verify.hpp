@@ -723,6 +723,13 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    // STRATA_MEGAKERNEL=1 (RDNA3/4 persistent GDN dense chain): device counter scratch + mapped stall word
+    unsigned* mk_counters_ = nullptr;
+    unsigned* h_mk_stall_ = nullptr;
+    unsigned* m_mk_stall_ = nullptr;
+    bool mk_in_graph_ = false;
+    bool megakernel_stall_take();
+    void megakernel_off();
     // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
     // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
     // whether the step had a plan

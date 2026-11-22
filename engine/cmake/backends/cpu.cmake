@@ -42,6 +42,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(gfx12_extra_test src/core/gfx12_extra_test.cpp src/core/arch_defaults.cpp)   # gfx12 extra defaults and their off switches
   target_include_directories(gfx12_extra_test PRIVATE include)
   add_test(NAME gfx12_extra_test COMMAND gfx12_extra_test)
+  add_executable(gfx11_extra_test src/core/gfx11_extra_test.cpp src/core/arch_defaults.cpp)   # discrete RDNA3 (gfx1100/1101/1102) defaults and off switches
+  target_include_directories(gfx11_extra_test PRIVATE include)
+  add_test(NAME gfx11_extra_test COMMAND gfx11_extra_test)
   add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)   # the sm_121 (GB10) table and its two off switches
   target_include_directories(nv_defaults_test PRIVATE include)
   add_test(NAME nv_defaults_test COMMAND nv_defaults_test)

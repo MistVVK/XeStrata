@@ -28,6 +28,7 @@
 #include "strata/prefill/warm_policy.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/core/gfx11_extra.hpp"
 #include "strata/core/kfd_quiet.hpp"   // LOAD: the first prompt's buffers at init (integrated gfx11, Linux HIP)
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -204,6 +205,8 @@ bool p1a_wanted() { return false; }
 void p1a_input(const void*, size_t) {}
 bool p1a_used() { return false; }
 bool p1a_takes_pair(int, int) { return false; }
+bool h11p_wanted() { return false; }
+bool h11p_takes_pair(int, int) { return false; }
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
@@ -2293,10 +2296,11 @@ void p1a_report(const std::vector<F>& fmt, size_t l, bool took) {
 // H that Prefill::init carved (H_bytes), and runs today's kernels for that call otherwise.
 bool p1a_pack() {
     bool any = false;
-    if (fused::p1a_wanted()) {
+    if (fused::p1a_wanted() || fused::h11p_wanted()) {
         const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
         for (size_t l = 0; lay.native && l < lay.fmt.size() && !any; ++l)
-            any = fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type);
+            any = fused::p1a_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type) ||
+                  fused::h11p_takes_pair(lay.fmt[l].gu_type, lay.fmt[l].d_type);
     }
 #ifndef NDEBUG
     static std::atomic<int> first{-1};   // the first sizing's answer; a later different one = a plan made before the layout was loaded
@@ -3790,14 +3794,22 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         int dev = 0;
         cudaDeviceProp prop;
-        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
-            strata::core::gfx12_prefill_share_default(prop.gcnArchName)) {
-            g_share_default = true;
-            g_share_limit_arch = strata::prefill::share_rules::gfx12_share_limit(fused::gfx12_iq2s_default());
-            std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens on this gfx12 card (the idle CPU "
-                                 "takes some of the experts the GPU would stream; answers can differ slightly: first-token KL ~0.02 at 1K tokens, "
-                                 "prompts of 500-1,000 tokens +18..+31%%, 2K and up unchanged). STRATA_PREFILL_CPU_SHARE=0 or STRATA_GFX12_DEFAULTS=0 turns it off, "
-                                 "STRATA_PREFILL_CPU_SHARE_MAX=1024 keeps a 1,024 limit.\n", (long long) cpu_share_max());
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            if (strata::core::gfx12_prefill_share_default(prop.gcnArchName)) {
+                g_share_default = true;
+                g_share_limit_arch = strata::prefill::share_rules::gfx12_share_limit(fused::gfx12_iq2s_default());
+                std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens on this gfx12 card (the idle CPU "
+                                     "takes some of the experts the GPU would stream; answers can differ slightly: first-token KL ~0.02 at 1K tokens, "
+                                     "prompts of 500-1,000 tokens +18..+31%%, 2K and up unchanged). STRATA_PREFILL_CPU_SHARE=0 or STRATA_GFX12_DEFAULTS=0 turns it off, "
+                                     "STRATA_PREFILL_CPU_SHARE_MAX=1024 keeps a 1,024 limit.\n", (long long) cpu_share_max());
+            } else if (!prop.integrated && strata::core::gfx11_prefill_share_default(prop.gcnArchName)) {
+                g_share_default = true;
+                g_share_limit_arch = strata::prefill::share_rules::default_share_limit();
+                std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens on this gfx11 card (the idle CPU "
+                                     "takes some of the experts the GPU would stream; answers can differ slightly: first-token KL ~0.01-0.02 below 3K tokens). "
+                                     "STRATA_PREFILL_CPU_SHARE=0 or STRATA_GFX11_DEFAULTS=0 turns it off, "
+                                     "STRATA_PREFILL_CPU_SHARE_MAX=1024 keeps a 1,024 limit.\n", (long long) cpu_share_max());
+            }
         }
     }
 #else

@@ -2,6 +2,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/amd_community.hpp"
+#include "strata/core/gfx11_extra.hpp"
 #include "strata/core/gfx12_extra.hpp"
 
 #include "strata/kernels/gfx_arch.hpp"
@@ -308,6 +309,54 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrat
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
         set_default(kv);
         set.push_back(kv.first);
+    }
+    {   // discrete RDNA3 (gfx1100 / gfx1101 / gfx1102, gfx11_extra.hpp); kept apart from the returned list like gfx12_extra.hpp
+#if defined(_WIN32)
+        const bool win11 = true;
+#else
+        const bool win11 = false;
+#endif
+        if (!integrated) {
+            std::vector<std::string> ex11;
+            for (const auto& kv : gfx11_discrete_exact_env(gcn_arch, win11)) {
+                if (std::getenv(kv.first.c_str()) != nullptr) continue;
+                set_default(kv);
+                ex11.push_back(kv.first);
+            }
+            if (!ex11.empty()) {
+                std::fprintf(stderr, "strata: gfx11 (RDNA3): %zu exact speed switches on by default (STRATA_GFX11_DEFAULTS=0 turns them off; a switch you set is kept): ",
+                             ex11.size());
+                for (size_t i = 0; i < ex11.size(); ++i) {
+                    const char* nm = std::strncmp(ex11[i].c_str(), "STRATA_", 7) == 0 ? ex11[i].c_str() + 7 : ex11[i].c_str();
+                    std::fprintf(stderr, "%s%s", i ? " " : "", nm);
+                }
+                std::fprintf(stderr, "\n");
+            }
+            std::vector<std::string> wm11;
+            for (const auto& kv : gfx11_discrete_wmma_env(gcn_arch)) {
+                if (std::getenv(kv.first.c_str()) != nullptr) continue;
+                set_default(kv);
+                wm11.push_back(kv.first);
+            }
+            if (!wm11.empty()) {
+                std::fprintf(stderr, "strata: gfx11 (RDNA3): %zu matrix-core prompt & MoE switches on by default (STRATA_GFX11_WMMA_DEFAULTS=0 or STRATA_GFX11_DEFAULTS=0 turns them off; NAME=0 turns one off): ",
+                             wm11.size());
+                for (size_t i = 0; i < wm11.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", wm11[i].c_str() + 7);
+                std::fprintf(stderr, "\n");
+            }
+            std::vector<std::string> par11;
+            for (const auto& kv : gfx11_discrete_parallel_env(gcn_arch, batch_slots)) {
+                if (std::getenv(kv.first.c_str()) != nullptr) continue;
+                set_default(kv);
+                par11.push_back(kv.first);
+            }
+            if (!par11.empty()) {
+                std::fprintf(stderr, "strata: gfx11 (RDNA3): exact parallel-request switches on for %d batch slots (STRATA_GFX11_DEFAULTS=0 turns them off; a switch you set is kept): ",
+                             batch_slots);
+                for (size_t i = 0; i < par11.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", par11[i].c_str() + 7);
+                std::fprintf(stderr, "\n");
+            }
+        }
     }
     {   // gfx12 extras kept apart from the table (gfx12_extra.hpp); not counted in the returned list
         std::vector<std::string> extra;

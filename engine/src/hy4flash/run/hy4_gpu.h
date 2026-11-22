@@ -341,6 +341,23 @@ __device__ __forceinline__ const void* shfl_ptr(const void* p, int src) {
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#if defined(_WIN32)
+#include <cstdlib>
+namespace hy4 {
+inline hipError_t hy4_hip_host_malloc_wddm(void** ptr, size_t size, unsigned int flags) {
+    if ((flags & hipHostMallocMapped) != 0u) {
+        static const bool coherent_win = [] {
+            const char* v = std::getenv("STRATA_HIP_MAPPED_COHERENT");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (coherent_win) flags |= hipHostMallocCoherent;
+    }
+    return hipHostMalloc(ptr, size, flags);
+}
+}  // namespace hy4
+#define hipHostMalloc(p, n, f) ::hy4::hy4_hip_host_malloc_wddm((p), (n), (f))
+#endif
+
 #include <cstdint>
 #include <cstring>
 namespace hy4 {

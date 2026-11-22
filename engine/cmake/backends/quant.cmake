@@ -25,10 +25,15 @@ macro(strata_quant_layer)
     target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
     if(MSVC)
       # MSVC contracts neither ggml-cpu's C nor these files' intrinsics (measured: 0 differences from its own ggml in all three flavours); the Windows bits
-      # differ from GCC's in the Q5_K and IQ1_S dots, see below
+      # differ from GCC's in the Q5_K and IQ1_S dots, see below.  Under clang-cl (MSVC frontend + Clang compiler), /arch:AVX512 enables Skylake-X only,
+      # so pass /clang:-mavx512vnni explicitly so dot_avx512.cpp emits VPDPBUSD.
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
-      set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/clang:-mavx512vnni")
+      else()
+        set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+      endif()
     else()
       # What is pinned, and against what: the reference is ggml-cpu as GCC 13.3 builds it (C, gnu11, where GCC contracts a multiply and an add into an
       # FMA wherever it can, the intrinsics' `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included).  -ffp-contract=fast keeps this C++ (-std=c++20,

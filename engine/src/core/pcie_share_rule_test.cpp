@@ -58,17 +58,24 @@ int main() {
     CHECK(pcie_auto_split_default(true, true, false, "1"));
     CHECK(pcie_auto_split_default(false, false, false, "1"));
     CHECK(pcie_auto_split_default(false, true, false, ""));   // empty = unset
-    // PcieAuto on HIP outside gfx12: on for a discrete gfx103x card, off for other parts, an integrated GPU and 026; =auto turns it on
-    // anywhere, any other value (old) leaves it off, empty = unset
+    // PcieAuto on HIP outside gfx12: on for discrete gfx103x and discrete RDNA3 (gfx1100/1101/1102), off for other parts,
+    // an integrated GPU and 026; =auto turns it on anywhere, any other value (old) leaves it off, empty = unset
     CHECK(pcie_auto_hip_default("gfx1030", true, false, nullptr));
     CHECK(pcie_auto_hip_default("gfx1031", true, false, nullptr));
     CHECK(pcie_auto_hip_default("gfx1030:xnack-", true, false, nullptr));
     CHECK(pcie_auto_hip_default("gfx1030", true, false, ""));
+    CHECK(pcie_auto_hip_default("gfx1100", true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1101", true, false, nullptr));
+    CHECK(pcie_auto_hip_default("gfx1102:sramecc-:xnack-", true, false, nullptr));
+    CHECK(!pcie_auto_hip_default("gfx1100", false, false, nullptr));   // integrated flag false required
+    CHECK(!pcie_auto_hip_default("gfx1100", true, true, nullptr));     // 026 turns it off
+    CHECK(!pcie_auto_hip_default("gfx1100", true, false, "old"));
+    CHECK(!pcie_auto_hip_default("gfx1103", true, false, nullptr));    // APU arch
+    CHECK(!pcie_auto_hip_default("gfx1151", true, false, nullptr));    // Strix Halo
     CHECK(!pcie_auto_hip_default("gfx1036", false, false, nullptr));   // Raphael iGPU
     CHECK(!pcie_auto_hip_default("gfx1030", true, true, nullptr));
     CHECK(!pcie_auto_hip_default("gfx1030", true, false, "old"));
     CHECK(!pcie_auto_hip_default("gfx1030", true, false, "0"));
-    CHECK(!pcie_auto_hip_default("gfx1100", true, false, nullptr));
     CHECK(!pcie_auto_hip_default("gfx1010", true, false, nullptr));
     CHECK(!pcie_auto_hip_default(nullptr, true, false, nullptr));
     CHECK(pcie_auto_hip_default("gfx1100", true, false, "auto"));

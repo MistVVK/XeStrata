@@ -316,10 +316,12 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     if (suffix != std::string::npos) arch.resize(suffix);
 
     if (from_package) {
-        // Unset or "auto": only Strix Halo (gfx1151) takes the packaged table by itself, the owner's decision of 2026-10-19 (the same
-        // rule as AUTO_ARCHS in strata_control/hipblaslt_tuning.py): on other cards the table changes the answers' last digits for ~1%
-        // (gfx1201), so they take it with STRATA_HIPBLASLT_TABLE=on only.
-        if (!table_forced && arch != "gfx1151") return nullptr;
+        // Unset or "auto": gfx11 matrix-core parts (RX 7000 discrete RDNA3 + Strix Halo / 780M / 890M gfx1150) take a matching
+        // packaged tuning table automatically unless STRATA_GFX11_DEFAULTS=0 (on RX 7900 XTX, 128K prompt +82%: 926 -> 1,687 tok/s);
+        // gfx12 parts keep the opt-in STRATA_HIPBLASLT_TABLE=on rule.
+        const char* off11 = std::getenv("STRATA_GFX11_DEFAULTS");
+        const bool g11_auto = !(off11 != nullptr && off11[0] == '0') && strata::kernels::gfx_arch_is_gfx11_wmma(arch.c_str());
+        if (!table_forced && arch != "gfx1151" && !g11_auto) return nullptr;
         const std::string dir = own_tuning_dir();
         if (dir.empty()) return nullptr;
         path_own = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";

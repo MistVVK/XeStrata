@@ -32,6 +32,7 @@
 #include "strata/kernels/fused_gr.hpp"   // fused_gr_check, called early on an integrated gfx11 (kfd_quiet.hpp, LOAD)
 #endif
 #include "strata/core/page_cache_drop.hpp"
+#include "strata/core/gfx11_extra.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
@@ -2815,19 +2816,21 @@ static bool pcie_auto_split_ok() {
 /// values.
 [[maybe_unused]] static bool pcie_share_gfx12_default() {
 #if defined(STRATA_USE_HIP)
-    return decode_defaults_arch_ok();
+    if (decode_defaults_arch_ok()) return true;
+    int dev = 0;
+    cudaDeviceProp p{};
+    const bool ok11 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                      !p.integrated && strata::kernels::gfx_arch_is_discrete_rdna3(p.gcnArchName) &&
+                      !strata::core::gfx11_defaults_disabled(false);
+    (void) cudaGetLastError();
+    return ok11;
 #else
     return false;
 #endif
 }
 
-// HIP outside gfx12: the same refinement, opt-in with STRATA_PCIE_FRAC_DEFAULT=auto (#2224).  Its author gate-measured it on an
-// RX 7900 XTX (gfx1100) as "no regression" only (4 alternating starts at 64K, prefill 2189 base vs 2180 with it, decode 65.4 vs
-// 65.4; under serve the share refines 0.55 -> 0.25 from the pool's 42-45 us/missed expert and the probed 28.4-28.5 GB/s link);
-// a second report (2x RX 7900 GRE) found it never engages there (95-98% of the experts cached).  #4007: on by default on
-// a discrete gfx103x card (RX 6000), where the start-up share (bandwidth only) is too high for a fast CPU pool; the measurements
-// are at strata::pcie_auto_hip_default.  The other parts keep the fixed share unless asked; STRATA_PCIE_FRAC_DEFAULT=old (or any
-// value other than auto) keeps it on gfx103x too.
+// HIP outside gfx12: the same refinement, opt-in with STRATA_PCIE_FRAC_DEFAULT=auto (#2224), and on by default on discrete
+// gfx103x (#4007) and discrete RDNA3 (gfx1100 / gfx1101 / gfx1102; STRATA_GFX11_DEFAULTS=0 or STRATA_PCIE_FRAC_DEFAULT=old turns it off).
 [[maybe_unused]] static bool pcie_auto_fork_arch_ok() {
 #if defined(STRATA_USE_HIP)
     static const bool on = [] {
@@ -2836,7 +2839,11 @@ static bool pcie_auto_split_ok() {
         const char* arch = nullptr;
         if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) arch = p.gcnArchName;
         else (void) cudaGetLastError();
-        return strata::pcie_auto_hip_default(arch, spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_FRAC_DEFAULT"));
+        const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+        if ((pfd == nullptr || pfd[0] == '\0') && strata::kernels::gfx_arch_is_discrete_rdna3(arch) &&
+            strata::core::gfx11_defaults_disabled(false))
+            return false;
+        return strata::pcie_auto_hip_default(arch, spill_discrete_gpu(), strata::qwen_defaults_026(), pfd);
     }();
     return on;
 #else
@@ -4408,14 +4415,50 @@ int main(int argc, char** argv) {
         // what a prompt needs, and the RAM guard below steps 32768 -> 16384 -> 8192.  STRATA_GFX12_CHUNK=16 keeps 16384.
         const char* c0 = std::getenv("STRATA_GFX12_CHUNK");
         const char* d0 = std::getenv("STRATA_GFX12_DEFAULTS");
+        const char* c11 = std::getenv("STRATA_GFX11_CHUNK");
         cudaDeviceProp cp{};
-        if (strata::core::gfx12_chunk_ceiling(c0) > 0 && !(d0 != nullptr && d0[0] == '0') &&
-            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(cp.gcnArchName)) {
-            const int64_t top = strata::core::gfx12_chunk_ceiling(c0);
-            o.prefill_auto_max = top;
-            o.prefill_chunk = top;
-            o.prefill_gfx12_16k = true;
-            std::fprintf(stderr, "strata generate: gfx12: --prefill auto may take chunks up to %lld (STRATA_GFX12_CHUNK=16 keeps 16384, =0 keeps 8192)\n", (long long) top);
+        if (cudaGetDeviceProperties(&cp, 0) == cudaSuccess) {
+            if (strata::core::gfx12_chunk_ceiling(c0) > 0 && !(d0 != nullptr && d0[0] == '0') &&
+                strata::kernels::gfx_arch_is_gfx12(cp.gcnArchName)) {
+                const int64_t top = strata::core::gfx12_chunk_ceiling(c0);
+                o.prefill_auto_max = top;
+                o.prefill_chunk = top;
+                o.prefill_gfx12_16k = true;
+                o.prefill_raise_who = "gfx12";
+                std::fprintf(stderr, "strata generate: gfx12: --prefill auto may take chunks up to %lld (STRATA_GFX12_CHUNK=16 keeps 16384, =0 keeps 8192)\n", (long long) top);
+            } else if (!cp.integrated && strata::kernels::gfx_arch_is_discrete_rdna3(cp.gcnArchName) &&
+                       !strata::core::gfx11_defaults_disabled(strata::qwen_defaults_026()) &&
+                       strata::core::gfx11_chunk_ceiling(c11, strata::qwen_defaults_026()) > 0) {
+                const int64_t top = strata::core::gfx11_chunk_ceiling(c11, strata::qwen_defaults_026());
+                o.prefill_auto_max = top;
+                o.prefill_chunk = top;
+                o.prefill_gfx12_16k = true;
+                o.prefill_raise_who = "gfx11";
+                std::fprintf(stderr, "strata generate: gfx11: --prefill auto may take chunks up to %lld (STRATA_GFX11_CHUNK=16 keeps 16384, =0 keeps 8192)\n", (long long) top);
+            }
+        }
+        (void) cudaGetLastError();
+    }
+#elif defined(STRATA_USE_HIP) && defined(_WIN32)
+    // Windows discrete RDNA3 keeps #1630's 6144 bare-auto cap by default to avoid Windows HIP pagefile commit spikes on tight systems,
+    // while allowing explicit STRATA_GFX11_CHUNK=16 or 32 on high-RAM hosts (still guarded by #2090 RAM step-down below).
+    if (o.prefill_auto_bare) {
+        const char* c11w = std::getenv("STRATA_GFX11_CHUNK");
+        cudaDeviceProp cpw{};
+        if (c11w != nullptr && c11w[0] != '\0' && c11w[0] != '0' &&
+            !strata::core::gfx11_defaults_disabled(strata::qwen_defaults_026()) &&
+            cudaGetDeviceProperties(&cpw, 0) == cudaSuccess &&
+            !cpw.integrated && strata::kernels::gfx_arch_is_discrete_rdna3(cpw.gcnArchName)) {
+            const int64_t top = strata::core::gfx11_chunk_ceiling(c11w, false);
+            if (top > 0) {
+                o.prefill_auto_cap = 0;
+                o.prefill_cap_warn_skip = true;
+                o.prefill_auto_max = top;
+                o.prefill_chunk = top;
+                o.prefill_gfx12_16k = true;
+                o.prefill_raise_who = "gfx11";
+                std::fprintf(stderr, "strata generate: gfx11 (Windows): STRATA_GFX11_CHUNK raised --prefill auto up to %lld\n", (long long) top);
+            }
         }
         (void) cudaGetLastError();
     }
@@ -8458,7 +8501,17 @@ int main(int argc, char** argv) {
         // STRATA_PIN_BY_NEED_SKIP=<n> forces R.  Single GPU, profile given, no helper caches only.
         std::vector<std::pair<int32_t, int32_t>> pin_cand;   // the non-resident estimate, by decreasing rank, then the resident one
         size_t pin_nonres = 0;                               // (how many of them are the non-resident estimate)
-        if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\0' && pn[0] != '0') {
+        const char* pn_env = std::getenv("STRATA_PIN_BY_NEED");
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        // Windows HIP under WDDM: enable pin-by-need by default on single-GPU discrete runs with a profile so ~10-15 GiB
+        // of WDDM's ~RAM/2 pinned-memory quota is not wasted on experts that already reside in VRAM.
+        const bool pn_wddm_hip_default = (pn_env == nullptr || pn_env[0] == '\0') && under_wddm() && spill_discrete_gpu() &&
+                                         !strata::qwen_defaults_026() && !profile.empty() && !multi_gpu && o.peer_device < 1 &&
+                                         !std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(), [](int n) { return n > 0; });
+#else
+        const bool pn_wddm_hip_default = false;
+#endif
+        if ((pn_env != nullptr && pn_env[0] != '\0' && pn_env[0] != '0') || pn_wddm_hip_default) {
             const char* off_why = profile.empty() ? "it needs --expert-profile (the ranking)"
                                 : multi_gpu || o.peer_device >= 1 ? "not with a layer split or a peer GPU"
                                 : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
@@ -10790,7 +10843,10 @@ int main(int argc, char** argv) {
     // ran with ~6.4) the default stays at 8192.
     // STRATA_GFX12_CHUNK=1 keeps the default ceiling anyway.  The ceiling is 32768 now: the guard steps it down 32768 -> 16384 -> 8192 until the loan fits.
     for (int64_t cand = auto_ceiling; o.prefill_gfx12_16k && cand > 8192;) {
-        static const char* force16 = std::getenv(std::strcmp(o.prefill_raise_who, "NVIDIA") == 0 ? "STRATA_NV_CHUNK" : "STRATA_GFX12_CHUNK");
+        const char* chunk_env_name = std::strcmp(o.prefill_raise_who, "NVIDIA") == 0 ? "STRATA_NV_CHUNK"
+                                   : std::strcmp(o.prefill_raise_who, "gfx11") == 0  ? "STRATA_GFX11_CHUNK"
+                                                                                     : "STRATA_GFX12_CHUNK";
+        const char* force16 = std::getenv(chunk_env_name);
         const int64_t extra_slots = std::max<int64_t>(0, lend_slots(cand) - lend_slots(8192));
         const uint64_t extra_mib = ((uint64_t) extra_slots * strata::kernels::cpu::expert_layout().max_blob) >> 20;
         const auto hm = strata::core::sample_host_memory();   // the cgroup / --memory-limit-mib cap counts too
@@ -10813,8 +10869,7 @@ int main(int argc, char** argv) {
                                  "(%llu MiB more held in RAM during a prompt), and %llu MiB of RAM is available for %llu MiB "
                                  "of resident experts plus that (#2090; %s=1 takes the default ceiling anyway)\n",
                          o.prefill_raise_who, (long long) next, (long long) cand, (long long) extra_slots, (unsigned long long) extra_mib,
-                         (unsigned long long) avail_mib, (unsigned long long) pin_mib,
-                         std::strcmp(o.prefill_raise_who, "NVIDIA") == 0 ? "STRATA_NV_CHUNK" : "STRATA_GFX12_CHUNK");
+                         (unsigned long long) avail_mib, (unsigned long long) pin_mib, chunk_env_name);
             cand = next;
             continue;
         }

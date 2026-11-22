@@ -19,6 +19,12 @@ inline bool gfx_arch_is(const char* gcn, const char* name) {
     return std::strncmp(gcn, name, n) == 0 && (gcn[n] == '\0' || gcn[n] == ':');
 }
 
+/// Discrete RDNA3 desktop / workstation GPUs (RX 7900 XTX / XT / GRE / W7900 = gfx1100,
+/// RX 7800 XT / 7700 XT = gfx1101, RX 7600 / 7600 XT = gfx1102).
+inline bool gfx_arch_is_discrete_rdna3(const char* gcn) {
+    return gfx_arch_is(gcn, "gfx1100") || gfx_arch_is(gcn, "gfx1101") || gfx_arch_is(gcn, "gfx1102");
+}
+
 /// The gfx11 targets the matrix-core kernels (prompt GEMM / attention / scorer / fused experts) are compiled for.
 inline bool gfx_arch_is_gfx11_wmma(const char* gcn) {
     return gfx_arch_is(gcn, "gfx1100") || gfx_arch_is(gcn, "gfx1101") || gfx_arch_is(gcn, "gfx1102") || gfx_arch_is(gcn, "gfx1103") ||

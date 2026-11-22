@@ -363,7 +363,10 @@ class TestInklingServing(unittest.TestCase):
             "{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"C\"}}<|end_message|>"
             "<|message_model|><|content_text|>Checking now.<|end_message|><|content_model_end_sampling|>"
         )
-        p = frontend.InklingOutputParser(thinking=True)
+        p = frontend.InklingOutputParser(
+            thinking=True,
+            tools=[{"name": "get_weather", "parameters": {"type": "object"}}],
+        )
         events = []
         for i in range(0, len(sample), 5):
             events.extend(p.feed(sample[i : i + 5]))
@@ -383,7 +386,10 @@ class TestInklingServing(unittest.TestCase):
             "<tool_call name=\"run_py\"><param name=\"code\">if a < b && c > 0: print(1)</param></tool_call>"
             "<|end_message|>"
         )
-        p2 = frontend.InklingOutputParser(thinking=False)
+        p2 = frontend.InklingOutputParser(
+            thinking=False,
+            tools=[{"name": "run_py", "parameters": {"type": "object"}}],
+        )
         ev2 = p2.feed(xml_sample) + p2.finish()
         calls2 = [e.call for e in ev2 if e.kind == "tool_call"]
         self.assertEqual(len(calls2), 1)
