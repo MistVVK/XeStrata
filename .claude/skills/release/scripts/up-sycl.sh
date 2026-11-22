@@ -1,15 +1,15 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# .claude/skills/release/scripts/up-sycl.sh - upstream's sycl/ port as an engine command (UP for bench.sh and the
-# serve and everyday scripts): its strata, built in its strata-sycl-dev image (its docs/INTEL.md), run in that image
-# as its setup configures it: the arguments get what its sycl/setup_intel.py writes for the card, and the engine the
-# environment of that config and the run-time switches of its sycl/serve/strata-sycl.sh (tools/bench_upstream.py
-# --sycl-setup).  stdin passes through (serve).
+# .claude/skills/release/scripts/up-sycl.sh - upstream's sycl/ port (engine/sycl/ from 0.2.16) as an engine command (UP
+# for bench.sh and the serve and everyday scripts): its strata, built in its strata-sycl-dev image (its docs/INTEL.md),
+# run in that image as its setup configures it: the arguments get what the port's setup_intel.py writes for the card,
+# and the engine the environment of that config and the run-time switches of the port's serve/strata-sycl.sh
+# (tools/bench_upstream.py --sycl-setup, which finds the port in either layout).  stdin passes through (serve).
 #
 #   UP_TREE=DIR DATA=DIR [IDS=DIR] [UP_SELECTOR=level_zero:N] [UP_SYCL_DIRECT=1] up-sycl.sh ARGS...
 #
-# UP_TREE: upstream's worktree (its build-sycl-aot/strata, its data/).  DATA and IDS are mounted read-only at the same
+# UP_TREE: upstream's worktree (its build-sycl-aot/strata at the top, its data/: terminal/data/ from 0.2.16).  DATA and IDS are mounted read-only at the same
 # paths, so the arguments need no rewriting; so is the folder of any other absolute path among the arguments (writable).
 # UP_SELECTOR (default level_zero:0): the Level Zero device to take.  UP_SYCL_DIRECT=1: run its strata here, with the
 # oneAPI runtime of /opt/intel/oneapi, not in its image (in the release's bench container, podman-bench.sh, where it was
@@ -27,7 +27,7 @@ for i in "${!w[@]}"; do
   [ "${w[$i]}" = -- ] && { set -- "${w[@]:$((i + 1))}"; break; }
   envs+=(-e "${w[$i]}")
 done
-echo "up-sycl.sh: sycl/setup_intel.py's settings: ${envs[*]} $*" >&2
+echo "up-sycl.sh: setup_intel.py's settings: ${envs[*]} $*" >&2
 if [ -n "${UP_SYCL_DIRECT:-}" ]; then
   kv=()
   for ((i = 1; i < ${#envs[@]}; i += 2)); do kv+=("${envs[$i]}"); done

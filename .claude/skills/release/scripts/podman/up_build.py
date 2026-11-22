@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Upstream's engines for one GPU maker, built in the bench container (podman-bench.sh upstream) as upstream's own
 setup builds them: its setup.py's build_engine (CUDA) or build_engine_hip (HIP) and build_image_engine (sd-cli: cuda,
-hip, or vulkan on Intel), loaded through tools/bench_upstream.py; for Intel its sycl/ port with its
-sycl/tools/build.sh and the image's oneAPI DPC++ (AOT: the ahead-of-time device, as its docs/INTEL.md names it;
+hip, or vulkan on Intel), loaded through tools/bench_upstream.py; for Intel its sycl/ port (engine/sycl/ from 0.2.16)
+with its tools/build.sh and the image's oneAPI DPC++ (AOT: the ahead-of-time device, as its docs/INTEL.md names it;
 empty for SPIR-V).  The GPU's architecture for CUDA and HIP is read from the GPU (nvidia-smi, rocminfo) unless ARCH
 gives it.
 
@@ -61,13 +61,14 @@ core = sorted(Path("/opt/rocm").glob("core-*"))
 if core and not os.environ.get("ROCM_PATH"):
     os.environ["ROCM_PATH"] = str(core[-1])
 gpu: dict[str, int | str] = {}
-v = {"UP_ROOT": str(tree), "UP_PROFILE": str(tree / "data" / "expert-profile.bin")}
+term = U.terminal(tree)  # its setup.py, serve/ and data/ (terminal/ from 0.2.16)
+v = {"UP_ROOT": str(term), "UP_PROFILE": str(term / "data" / "expert-profile.bin")}
 mod = U.load_setup(tree)
 if maker == "intel":
     aot = os.environ.get("AOT", "")
     exe = tree / "build-sycl-aot" / "strata"  # upstream's engine
     env = Path(__file__).with_name("oneapi-env.sh")
-    build = f"source {env}; bash sycl/tools/build.sh strata"  # upstream's target
+    build = f"source {env}; bash {U.sycl_dir(tree).relative_to(tree)}/tools/build.sh strata"  # upstream's target
     subprocess.run(["bash", "-c", build], check=True,
                    env={**os.environ, "AOT": aot, "REPO": str(tree), "BUILD_DIR": str(tree / "build-sycl-aot")})
     if not exe.exists():
