@@ -8,7 +8,8 @@ POSIX gets these from ``fcntl.flock`` and ``os.kill(pid, 0)``. Neither exists on
   shared locks, which ``msvcrt.locking`` does not, and is released by the OS when the process ends, however it ends.
 * ``process_started`` / ``pid_alive``: whether a process exists and when it was created. A PID recorded in a state
   file is only a hint; the creation time is what tells the process that was recorded from a later one that reused
-  the number.
+  the number. When the process cannot be opened, a creation time from before the last boot still decides: no process
+  survives a restart (``created_before_boot``).
 """
 
 from __future__ import annotations
@@ -19,6 +20,18 @@ WINDOWS = os.name == "nt"
 
 #: the locked byte. Beyond any data file the runtime writes (they are all far smaller).
 LOCK_OFFSET = 1 << 16
+
+#: clock slack when a recorded creation time is compared with the boot time: one minute, in 100 ns ticks.
+_BOOT_SLACK = 60 * 10_000_000
+
+
+def created_before_boot(started: int | None, boot: int | None) -> bool:
+    """Whether a recorded creation time (100 ns ticks since 1601) is from before the last boot (same unit). No process
+    survives a restart, so a record like that names a process that is gone, whatever holds its number now. False when
+    either time is unknown, and within a minute of the boot time, so a clock adjustment never clears a live record."""
+    if type(started) is not int or type(boot) is not int or started <= 0 or boot <= 0:
+        return False
+    return started < boot - _BOOT_SLACK
 
 if WINDOWS:
     import ctypes
@@ -48,6 +61,10 @@ if WINDOWS:
     _k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
                                                 ctypes.POINTER(wintypes.DWORD)]
     _k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    _k32.GetSystemTimeAsFileTime.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
+    _k32.GetSystemTimeAsFileTime.restype = None
+    _k32.GetTickCount64.argtypes = []
+    _k32.GetTickCount64.restype = ctypes.c_ulonglong
 
     _LOCKFILE_FAIL_IMMEDIATELY = 0x1
     _LOCKFILE_EXCLUSIVE_LOCK = 0x2
@@ -113,6 +130,17 @@ if WINDOWS:
         finally:
             _k32.CloseHandle(handle)
 
+    def boot_time() -> int | None:
+        """When the system last started (100 ns ticks since 1601): the current time less the milliseconds since boot,
+        which include time asleep. None when it cannot be read."""
+        now = wintypes.FILETIME()
+        _k32.GetSystemTimeAsFileTime(ctypes.byref(now))
+        current = (now.dwHighDateTime << 32) | now.dwLowDateTime
+        uptime = _k32.GetTickCount64()
+        if current <= 0 or uptime <= 0:
+            return None
+        return current - uptime * 10_000
+
     def pid_alive(pid: int, started: int | None = None) -> bool:
         """Whether `pid` is a running process, and, when `started` is given, the one created at that time."""
         if type(pid) is not int or pid <= 0:
@@ -124,7 +152,12 @@ if WINDOWS:
             if handle:
                 _k32.CloseHandle(handle)
                 return False                          # opened, but exited or unreadable: not running
-            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+            if ctypes.get_last_error() != _ERROR_ACCESS_DENIED:
+                return False
+            # Refused, so its creation time cannot be compared. After a restart the number often belongs to a system
+            # process this user may not open; a record created before the boot cannot be that process (none survives
+            # a restart), so it is gone. Without a recorded time, or with one after the boot, keep treating it as present.
+            return not created_before_boot(started, boot_time())
         return started is None or now == started
 else:
     def try_lock(fd: int, *, exclusive: bool) -> bool:
@@ -137,6 +170,9 @@ else:
         return None
 
     def process_image(pid: int) -> str | None:
+        return None
+
+    def boot_time() -> int | None:
         return None
 
     def pid_alive(pid: int, started: int | None = None) -> bool:

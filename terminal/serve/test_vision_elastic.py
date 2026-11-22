@@ -178,8 +178,8 @@ class OnDemandReader(unittest.TestCase):
     """The reader that starts with the first picture: no room on the card -> the CPU reader reads it, the cache grows back at once,
     and the next start tries the card again; pictures already encoded start nothing."""
 
-    def vision(self, d):
-        v = Vision({"exe": "gpu-reader", "mmproj": "m", "model": "t", "gpu": True, "cpu_exe": "cpu-reader", "elastic": True}, lazy=True)
+    def vision(self, d, cfg=None):
+        v = Vision(cfg or {"exe": "gpu-reader", "mmproj": "m", "model": "t", "gpu": True, "cpu_exe": "cpu-reader", "elastic": True}, lazy=True)
         v.started = []
 
         def start_reader():
@@ -242,6 +242,35 @@ class OnDemandReader(unittest.TestCase):
         svc2.free_vram_mib = lambda: None                   # unknown: the card is tried (and the CPU reader is there if it fails)
         svc2._vision_up()
         self.assertEqual([x.split("-")[0] for x in svc2.vision.started], ["gpu"])
+
+    def test_a_cpu_reader_starts_without_asking_the_cache_for_vram(self):
+        """An on-demand CPU reader by choice (no "gpu" in the vision section) uses no VRAM: its start asks the expert cache for nothing,
+        whether the engine can shrink its cache or not, and logs no missing room.  A GPU reader still asks."""
+        cpu = {"exe": "cpu-reader", "mmproj": "m", "model": "t", "elastic": True}
+        for elastic_engine in (True, False):
+            with self.subTest(elastic_engine=elastic_engine):
+                v = self.vision(tempfile.mkdtemp(), cpu)
+                svc, engine = self.service(v, elastic_engine=elastic_engine)
+                svc.free_vram_mib = lambda: None            # (not this PC's card)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    svc._vision_up()
+                self.assertEqual([x.split("-")[0] for x in v.started], ["cpu"])
+                self.assertEqual(engine.calls, [])             # the cache was not asked
+                self.assertFalse(svc.vision_held)
+                self.assertIn("the image encoder started in", out.getvalue())
+                self.assertIn("on the CPU", out.getvalue())
+                self.assertNotIn("did not make room", out.getvalue())
+                svc.last_image_at = 0
+                self.assertEqual(svc._vision_idle_down(), "down")
+                self.assertEqual(engine.calls, [])             # nothing to give back at the stop either
+        v = self.vision(tempfile.mkdtemp())
+        svc, engine = self.service(v)
+        svc.free_vram_mib = lambda: None
+        svc._vision_up()
+        self.assertEqual([x.split("-")[0] for x in v.started], ["gpu"])
+        self.assertEqual(engine.calls, [2048])                 # the GPU reader: the cache keeps its share free first
+        self.assertTrue(svc.vision_held)
 
     def test_a_non_elastic_gpu_reader_keeps_the_cpu_reader_for_good(self):
         v = Vision({"exe": "gpu-reader", "mmproj": "m", "model": "t", "gpu": True, "cpu_exe": "cpu-reader"}, lazy=True)

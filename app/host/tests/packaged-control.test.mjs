@@ -156,8 +156,12 @@ function packagedFixture({ engineUsable = true, updater = null, repair = false, 
     contexts: [8192, 32768], recommendation: { family: 'qwen', model: 'IQ3_XXS', context: 32768 }, context_note: '' };
   const hardware = { ram_gb: 63, cpu: { name: 'cpu', cores: 12 }, gpus: [{ index: 0, name: 'NVIDIA GeForce RTX 5070', vram_gb: 11.9, usable: true }] };
   let installJob = null;
+  const tunedConfigs = [];
   const spawnProcess = (command, args, options) => {
     spawned.push({ command, args, options });
+    if (args[1] === 'presets' && args[2] === 'status' && typeof args[3] === 'string' && existsSync(args[3])) {
+      try { tunedConfigs.push(JSON.parse(readFileSync(args[3], 'utf8'))); } catch {}
+    }
     if (!String(args[0]).endsWith('strata_mcp.py')) throw new Error('no process but the installer may be started by the host in packaged mode: ' + command + ' ' + args.join(' '));
     const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.exitCode = null;
     child.kill = () => { child.exitCode = 0; queueMicrotask(() => child.emit('exit', 0)); return true; };
@@ -182,7 +186,7 @@ function packagedFixture({ engineUsable = true, updater = null, repair = false, 
   };
   const native = createNativeControl({ control, directory: data, spawnProcess, fetcher, requests: () => requests });
   const others = () => spawned.filter(s => !String(s.args[0]).endsWith('strata_mcp.py'));
-  return { native, calls, saved, spawned, others, rpc, setStatus: v => { statusAnswer = v; }, setMetricsDown: v => { metricsDown = v; }, setHealthDown: v => { healthDown = v; }, failStart: (v, times = Infinity) => { startFailure = v; startFailureLeft = times; }, catalog, hardware, install, root, cleanup: () => { if (earlierInstallEnv === undefined) delete process.env.STRATA_INSTALL_DIR; else process.env.STRATA_INSTALL_DIR = earlierInstallEnv; rmSync(root, { recursive: true, force: true }); } };
+  return { native, calls, saved, tunedConfigs, spawned, others, rpc, setStatus: v => { statusAnswer = v; }, setMetricsDown: v => { metricsDown = v; }, setHealthDown: v => { healthDown = v; }, failStart: (v, times = Infinity) => { startFailure = v; startFailureLeft = times; }, catalog, hardware, install, root, cleanup: () => { if (earlierInstallEnv === undefined) delete process.env.STRATA_INSTALL_DIR; else process.env.STRATA_INSTALL_DIR = earlierInstallEnv; rmSync(root, { recursive: true, force: true }); } };
 }
 const finish = async (native, id) => { for (let i = 0; i < 400; i++) { const job = native.state().jobs.find(j => j.id === id); if (job.state !== 'running') return job; await new Promise(r => setTimeout(r, 10)); } throw new Error('job did not finish'); };
 
@@ -653,8 +657,9 @@ test('packaged: a tune measures the engine a load starts: same start args, slots
     try {
       await f.native.refresh(true);
       const args = { model: 'iq2_xs', resourceProfile: 'work', vision: 'no' };
-      await f.native.tuneStatus(args).catch(() => {});      // the fake host cannot run Control's tuner; the config it would measure is written first
-      const tuned = JSON.parse(readFileSync(join(f.root, 'data', 'native-tune', 'iq2_xs.json'), 'utf8'));
+      await f.native.tuneStatus(args).catch(() => {});      // the fake host cannot run Control's tuner; the config it would measure is captured before withTuneConfig cleans it up
+      const tuned = f.tunedConfigs.at(-1);
+      assert.ok(tuned, 'tuneStatus wrote a config for Control to measure');
       const job = await finish(f.native, f.native.operation('load', args).id);
       assert.equal(job.state, 'done', job.error);
       const loaded = { ...f.saved.at(-1) }; delete loaded.port; delete loaded.api_key;

@@ -3,17 +3,109 @@
 // count a prompt the way the engine does (characters over a density) and to refuse one that leaves no room.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startScriptedWorker } from './helpers/scripted-worker.mjs';
 import { createAgentBridge } from '../server/agent/agent-bridge.mjs';
 import { resolveHarness } from '../server/agent/harness-runtime.mjs';
 import { buildProfile } from '../server/agent/profile.mjs';
+import { guardPressureCompaction } from '../server/agent/plugins/strata-compaction.mjs';
+import { apply as applyContextPlugin, projectForeignReasoning } from '../server/agent/plugins/strata-context.mjs';
 import { clipMessage, densityOf, estimateMessage, isContextOverflow, pressureNow, promptTokensOf, splitMessages, summaryBudget, usageOfEvent, SUMMARY_LANGUAGE_RULE, withSummaryLanguage } from '../server/agent/context-budget.mjs';
 
 const HARNESS = process.env.STRATA_HARNESS_DIR;
 const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARNESS_DIR is not set to a built Harness' : false;
+
+test('pressure compaction skips a tiny range and backs off only from unchanged non-shrinking work', async () => {
+  const agent = { session: {} };
+  const meter = { measure: () => ({ nodes: [{ seq: 1, tokens: 38 }, { seq: 2, tokens: 900 }, { seq: 3, tokens: 300 }] }) };
+  const attempts = [];
+  let end = 1;
+  let failure = null;
+  const compaction = {
+    async compactIfNeeded(owner, trigger, signal) {
+      return this.compactRegion(1, end, owner, signal);
+    },
+    async compactRegion(_start, last) {
+      attempts.push(last);
+      if (failure) throw failure;
+      return 'checkpoint';
+    },
+  };
+  guardPressureCompaction(compaction, meter, () => {});
+  const compact = (trigger = 'pressure') => compaction.compactIfNeeded(agent, trigger, new AbortController().signal);
+  assert.equal(await compact(), null);
+  assert.deepEqual(attempts, [], 'a 38-token prefix does not reach the summarizer');
+  assert.equal(await compact('context-overflow'), 'checkpoint', 'an actual provider refusal keeps its recovery path');
+
+  end = 2;
+  failure = new Error('summary is not smaller than the shadowed content (1000 estimated framed tokens >= 938)');
+  assert.equal(await compact(), null);
+  assert.equal(await compact(), null);
+  assert.deepEqual(attempts, [1, 2], 'only the first attempt at the unchanged range used the model');
+
+  end = 3;
+  const transient = new Error('temporary disconnect');
+  failure = transient;
+  await assert.rejects(compact(), transient);
+  failure = null;
+  assert.equal(await compact(), 'checkpoint', 'a transient failure does not blacklist the new range');
+  assert.deepEqual(attempts, [1, 2, 3, 3]);
+});
+
+test('a model switch removes only foreign reasoning and replay state from the request', () => {
+  const source = { provider: 'old-route', model: 'a', replayState: { signature: 'opaque' } };
+  const chain = [
+    { role: 'user', content: [{ type: 'text', text: 'Check the test.' }] },
+    { role: 'assistant', source, content: [
+      { type: 'reasoning', text: 'Private to the original model' },
+      { type: 'text', text: 'I ran it.' },
+      { type: 'tool-call', id: 'c', name: 'read', arguments: '{}' },
+    ] },
+    { role: 'tool', toolCallId: 'c', content: [{ type: 'text', text: 'PASS' }] },
+    { role: 'assistant', source, content: [{ type: 'reasoning', text: '' }] },
+  ];
+  const same = { provider: 'old-route', model: 'a', messages: chain };
+  assert.equal(projectForeignReasoning(same), same, 'same-model replay is byte-for-byte unchanged');
+  const changed = projectForeignReasoning({ ...same, provider: 'new-route' });
+  assert.deepEqual(changed.messages.map(m => m.role), ['user', 'assistant', 'tool']);
+  assert.deepEqual(changed.messages[1].content, chain[1].content.slice(1));
+  assert.equal(changed.messages[2], chain[2]);
+  assert.equal(changed.messages[1].source.replayState, undefined);
+  assert.equal(chain[1].source.replayState.signature, 'opaque', 'the durable history is untouched');
+});
+
+test('calibration is cleared when the session selects another model', () => {
+  const session = { id: 'calibration', requestHeader: () => ({ tools: [] }) };
+  const meter = { measure: () => ({ surfaceTokens: 500, totalTokens: 500, nodes: [{ seq: 1, heuristicTokens: 500, tokens: 500 }] }) };
+  let onEvent;
+  applyContextPlugin({ tokenMeter: meter, on: (_, fn) => { onEvent = fn; }, inject: () => {} });
+  onEvent(session, { type: 'assistant/message', seq: 2, data: { usage: { inputTokens: 1500 } } });
+  assert.equal(meter.measure(session).totalTokens, 1500);
+  onEvent(session, { type: 'model/selection' });
+  assert.equal(meter.measure(session).totalTokens, 500);
+});
+
+test('only the default agent request gets the raised reply ceiling at 512K', async () => {
+  const adapter = {
+    modelOf: () => ({ contextWindow: 524288, maxTokens: 32768 }),
+    streamWithSnapshot: options => options,
+  };
+  const provider = 'strata-local';
+  const llm = {
+    adapters: new Map([[provider, { adapter }]]),
+    prepareCall: async () => ({ stream: options => adapter.streamWithSnapshot(options) }),
+  };
+  applyContextPlugin({ llm, inject: () => {} });
+  const { stream } = await llm.prepareCall({ provider });
+  const request = { provider, model: 'fixture', maxTokens: 32768 };
+
+  assert.equal(stream(request).maxTokens, 65536);
+  assert.equal(stream({ ...request, purpose: 'compaction', maxTokens: 61440 }).maxTokens, 61440);
+  assert.equal(stream({ ...request, purpose: 'session-title' }).maxTokens, 32768);
+  assert.equal(stream({ ...request, maxTokens: 16384 }).maxTokens, 16384);
+});
 
 test('the profile loads the context plugin, so compaction and /compact read the measured prompt', () => {
   const profile = buildProfile({ local: [{ id: 'a', modelId: 'm', baseUrl: 'http://x', context: 65536 }], connections: [] });
@@ -87,6 +179,45 @@ test('a summary request is split into pieces that fit, each message whole when i
   assert.ok(summaryBudget({ window: 65536, summaryTokens: 5734, toolsTokens: 10133, systemTokens: 400 }) > 40000);
 });
 
+test('a late context refusal retries only the unsummarised messages', async t => {
+  const line = text => ({ role: 'user', content: [{ type: 'text', text }] });
+  const history = Array.from({ length: 6 }, (_, index) => line('PART ' + (index + 1) + '\n' + 'x'.repeat(4000)));
+  const calls = [];
+  const llm = {
+    async resolveModelInfo() { return { context: { contextWindow: 4500 } }; },
+    async *stream({ messages }) {
+      const parts = messages.flatMap(message => {
+        const part = /^PART (\d+)\b/u.exec(message.content[0].text);
+        return part ? [Number(part[1])] : [];
+      });
+      const carried = messages.map(message => message.content[0].text).find(text => text.startsWith('<compacted-summary>'));
+      const prior = carried?.match(/\nDONE ([\d,]+)\n/u)?.[1].split(',').map(Number) ?? [];
+      calls.push({ parts, prior, characters: messages.reduce((total, message) =>
+        total + message.content.reduce((size, block) => size + block.text.length, 0), 0) });
+      if (parts.length > 1 && parts.includes(3)) {
+        yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED' } } };
+        return;
+      }
+      yield { type: 'text-delta', text: 'DONE ' + [...prior, ...parts].join(',') };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  applyContextPlugin({ llm, inject: () => {} });
+  const final = [];
+  for await (const chunk of llm.stream({
+    purpose: 'compaction', provider: 'strata-local', model: 'fixture', sessionId: 'late-summary-refusal',
+    messages: [...history, line('Condense this history.')], maxTokens: 256,
+  })) final.push(chunk);
+  t.diagnostic(JSON.stringify({ attempts: calls.length, sourceParts: calls.map(call => call.parts),
+    modelInputCharacters: calls.reduce((total, call) => total + call.characters, 0) }));
+  assert.deepEqual(calls.map(call => call.parts), [[1, 2], [3, 4], [3], [4], [5], [6]]);
+  assert.deepEqual(calls[2].prior, [1, 2]);
+  assert.deepEqual(final, [
+    { type: 'text-delta', text: 'DONE 1,2,3,4,5,6' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]);
+});
+
 /** The scripted model server counting like the engine (3 characters a token here: logs and code) in a 32K window. */
 async function rig(t, { window = 32768, charsPerToken = 3, noCount = false } = {}) {
   const worker = await startScriptedWorker({ window, charsPerToken, noCount });
@@ -101,11 +232,47 @@ async function rig(t, { window = 32768, charsPerToken = 3, noCount = false } = {
 const answerOf = frames => frames.filter(f => f.type === 'delta' && !f.noteReason).map(f => f.text).join('');
 const dense = 'q=0x1f ok;';   // 10 characters: 2.5 tokens by the Harness price, 3.3 by the model server's count here
 
+test('model switching in the real Harness preserves tool evidence without replaying foreign reasoning', { skip }, async t => {
+  const first = await startScriptedWorker({ model: 'model-a', chunkDelayMs: 5 });
+  const second = await startScriptedWorker({ model: 'model-b', chunkDelayMs: 5 });
+  const dir = mkdtempSync(join(tmpdir(), 'strata-model-switch-'));
+  writeFileSync(join(dir, 'evidence.txt'), 'HANDOFF_EVIDENCE\n');
+  const bridge = createAgentBridge({ dataDir: dir, localInstances: () => [
+    { id: 'a', label: 'Model A', baseUrl: first.url, modelId: 'model-a', context: 32768 },
+    { id: 'b', label: 'Model B', baseUrl: second.url, modelId: 'model-b', context: 32768 },
+  ], connections: () => [], env: process.env, startTimeoutMs: 90_000 });
+  t.after(async () => { await bridge.close(); await first.close(); await second.close(); try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch {} });
+  const send = async (instanceId, message) => {
+    const frames = [];
+    await bridge.runTurn({ chatId: 'handoff', choice: { instanceId }, message, workspacePath: dir, mode: 'plan', onFrame: f => frames.push(f) });
+    return frames;
+  };
+  assert.equal((await send('a', 'SCRIPT:call read {"file_path":"evidence.txt"}')).at(-1).type, 'done');
+  const same = first.requests.filter(r => r.toolNames.length).at(-1).raw;
+  assert.match(same, /I will use read/);
+  assert.match(same, /HANDOFF_EVIDENCE/);
+  assert.equal((await send('b', 'SCRIPT:echo switched')).at(-1).type, 'done');
+  const switched = second.requests.find(r => r.directive === 'echo' && r.toolNames.length).raw;
+  assert.match(switched, /HANDOFF_EVIDENCE/);
+  assert.doesNotMatch(switched, /I will use read/);
+});
+
 test('the plugin loads in the real Harness (a plugin that fails to import would leave compaction as it was, silently)', { skip }, async (t) => {
   const { send, harnessLog } = await rig(t);
   const frames = await send('SCRIPT:echo hello');
   assert.equal(frames.at(-1).type, 'done');
   assert.doesNotMatch(harnessLog(), /did not activate|failed to import|strata-context/, harnessLog());
+});
+
+test('the packaged Harness skips a tiny compaction source between tool steps at 512K', { skip }, async (t) => {
+  const { worker, send, ws } = await rig(t, { window: 524288 });
+  writeFileSync(join(ws, 'proof.txt'), 'EVIDENCE_512K');
+  const frames = await send('SCRIPT:call read {"file_path":"proof.txt"}\n' + dense.repeat(137000));
+  assert.match(answerOf(frames), /Tool finished/);
+  assert.ok(frames.some(frame => frame.type === 'agent-tool' && frame.tool?.name === 'read' && frame.tool.state === 'done'));
+  assert.equal(frames.at(-1).finishReason, 'stop');
+  assert.equal(worker.requests.length, 2, 'one tool call and its answer use the model');
+  assert.ok(worker.requests.every(request => request.promptChars / 3 > 419430), 'both requests exceed the default pressure threshold');
 });
 
 test('dense text compacts in time: no request is refused, and every message is answered', { skip }, async (t) => {

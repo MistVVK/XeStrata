@@ -1170,12 +1170,14 @@ def _stub_follows(after: str):
 NOT_PARAMS = ("function", "think", "parameter")
 
 
-def param_name(opener: str) -> str | None:
+def param_name(opener: str, declared=None) -> str | None:
     """#6032 R1: the parameter a `<parameter=` opener names (`opener`: what follows `=` up to the `>` found): the name
     cut at its first whitespace, `<` or `>` (the model ran a closer or `</think>` into it, or put a space before the
     `>`); None - the value is read and dropped - when that leaves nothing, a placeholder (null / none) or one of the
     call format's own tag names."""
-    name = re.split(r"[\s<>]", opener.lstrip(), 1)[0]
+    name = re.split(r"[\s<>]", opener.lstrip(), maxsplit=1)[0]
+    if declared and name in declared:        # #6461: a tool may declare a parameter called `function` (Playwright's browser_evaluate)
+        return name
     if not name or name in NOT_PARAMS or name.lower() in ("null", "none"):
         return None
     return name
@@ -1229,7 +1231,7 @@ def opener_at(s: str, names=None, final: bool = False):
         line = s.split("\n", 1)[0]
         gt = line.find(">")
         if gt >= 0:
-            return param_name(s[len(PARAM_START):gt]), gt + 1, None
+            return param_name(s[len(PARAM_START):gt], names), gt + 1, None
         m = _COLON_OPENER.match(s)
         if m:
             value = m.group(2).strip()
@@ -1239,14 +1241,14 @@ def opener_at(s: str, names=None, final: bool = False):
             tail = re.match(r"\s*" + re.escape(PARAM_END), s[m.end():])
             if tail is None and not final and PARAM_END.startswith(s[m.end():].lstrip()):
                 return "pending"
-            return param_name(m.group(1)), m.end() + (tail.end() if tail else 0), value
+            return param_name(m.group(1), names), m.end() + (tail.end() if tail else 0), value
         if "\n" not in s:
             # the `>` still arriving, or a long name: held, except that the call's own scan reads it as before when
             # the line ends (a `<parameter=` line with neither `>` nor a colon form is no opener)
             if s.find(">") < 0 and not final:
                 return "pending"
             gt = s.find(">")
-            return (param_name(s[len(PARAM_START):gt]), gt + 1, None) if gt >= 0 else None
+            return (param_name(s[len(PARAM_START):gt], names), gt + 1, None) if gt >= 0 else None
         return None, len(line), None        # #6032 R5: an opener cut before its `>` (its line ends first): dropped
     if names:
         m = _NAMED_OPENER.match(s)
@@ -1294,7 +1296,7 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            pname = param_name(text[pos:gt].split("=", 1)[1])
+            pname = param_name(text[pos:gt].split("=", 1)[1], names)
             end = param_end(text[gt + 1:], final, pname, hold, allow_reopen=True,
                             names=(set(names) - seen - {pname}) if names else None)
             if end < 0:
@@ -1712,7 +1714,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             if recover:
                 got = opener_at(rest, unset, final=True)
             if got is None:                                  # the old reading (a `<parameter=` with no `>` raises)
-                got = (param_name(rest[len(PARAM_START):rest.index(">")]), rest.index(">") + 1, None)
+                got = (param_name(rest[len(PARAM_START):rest.index(">")], props), rest.index(">") + 1, None)
             s = rest
         pname, length, inline = got
         openers += 1
@@ -1803,6 +1805,20 @@ class OutputParser:
             if isinstance(name, str) and name:
                 for prefix in ("tools.", "functions.", "default_api."):
                     aliases.setdefault(prefix + name, set()).add(name)
+        # A client that declares MCP tools as `mcp__server__tool` next to plain tools (`web_fetch`, `memory`): Qwen carries
+        # the prefix over to a plain tool (`mcp__web_fetch`), drops it from an MCP tool (`server__tool`), or keeps it and
+        # drops the server (`mcp__tool`, the #5281 last segment with its prefix).  Spellings of a declared name, under the
+        # same unambiguous-alias rule; a server name that differs (`mcp__serevr__tool`) is not guessed.
+        for name in self.schemas:
+            if not isinstance(name, str) or not name or "." in name:
+                continue
+            if name.startswith("mcp__"):
+                rest = name[len("mcp__"):]
+                if "__" in rest:
+                    aliases.setdefault(rest, set()).add(name)
+                    aliases.setdefault("mcp__" + rest.rsplit("__", 1)[1], set()).add(name)
+            elif "__" not in name:
+                aliases.setdefault("mcp__" + name, set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
@@ -2307,7 +2323,7 @@ class OutputParser:
                         b = stripped.find(">")
                         if b < 0:
                             return out
-                        got = (param_name(stripped[11:b]), b + 1, None)  # #6032 R1: as parse_tool_call names it
+                        got = (param_name(stripped[11:b], self.sdeclared), b + 1, None)  # #6032 R1: as parse_tool_call names it
                     pname, length, inline = got
                     self.sp += length
                     self.sraw_pname = pname
@@ -2319,7 +2335,8 @@ class OutputParser:
                         declared = self.sdeclared.get(pname) if pname else None
                         v = coerce_value(inline, declared) if pname else _SKIP
                         if v is not _SKIP and declared == "string":
-                            args(("" if self.sfirst else ",") + json.dumps(pname) + ":" + json.dumps(v))
+                            args(("" if self.sfirst else ",") + json.dumps(pname, ensure_ascii=False) + ":"
+                                 + json.dumps(v, ensure_ascii=False))
                             self.sfirst = False
                             self.sset.add(pname)
                         elif v is not _SKIP:
@@ -2329,7 +2346,7 @@ class OutputParser:
                         continue
                     if pname is not None and self.sdeclared.get(pname) == "string":
                         self.sset.add(pname)
-                        args(("" if self.sfirst else ",") + json.dumps(pname) + ':"')
+                        args(("" if self.sfirst else ",") + json.dumps(pname, ensure_ascii=False) + ':"')
                         self.sfirst = False
                         self.ss, self.sval_started = "str", False
                     else:
@@ -2357,7 +2374,7 @@ class OutputParser:
                     value = rest[:end]
                     if value.endswith("\n"):
                         value = value[:-1]
-                    args(json.dumps(value)[1:-1] + '"')
+                    args(json.dumps(value, ensure_ascii=False)[1:-1] + '"')
                     self.sp += end + close_len(rest, end, self.scloser)
                     self.ss = "between"
                     continue
@@ -2367,7 +2384,7 @@ class OutputParser:
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
-                    args(json.dumps(rest[:safe])[1:-1])
+                    args(json.dumps(rest[:safe], ensure_ascii=False)[1:-1])
                     self.sp += safe
                 return out
             elif self.ss == "raw":

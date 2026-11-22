@@ -27,7 +27,7 @@ test('the sentence is in all nine catalogs, translated in eight', async () => {
 });
 
 test('the web Monitor shows the same sentence on its GPU load label', async () => {
-  const app = await read('../../../terminal/serve/web/app.js');
+  const app = (await read('../../../terminal/serve/web/app.js')).replace(/\r\n/g, '\n');
   assert.ok(app.includes(`{key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100,\n   hint: "${TEXT}"}`));
   // #4968 gave each card's label an id (ml-<key>) for the Model card's own title
   assert.ok(app.includes('<span class="st-metric__label" id="ml-${m.key}"${m.hint ? ` title="${esc(m.hint)}"` : ""}>'));

@@ -4,7 +4,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startScriptedWorker } from './helpers/scripted-worker.mjs';
@@ -74,4 +74,29 @@ test('the real Harness: the chosen effort is sent to OpenRouter as reasoning.eff
     seen[level] = worker.requests.at(-1).params.reasoning;
   }
   assert.deepEqual(seen, { High: { effort: 'high' }, Max: { effort: 'xhigh' }, Off: { effort: 'none' } });
+});
+
+test('the real Harness sends DeepSeek controls and returns reasoning with the tool result', { skip }, async t => {
+  const worker = await startScriptedWorker({ model: 'deepseek-chat' });
+  const dir = mkdtempSync(join(tmpdir(), 'strata-deepseek-run-'));
+  writeFileSync(join(dir, 'evidence.txt'), 'DEEPSEEK_TOOL_RESULT\n');
+  const connection = {
+    id: 'ds', name: 'DeepSeek', provider: 'deepseek', baseUrl: worker.url, protocol: 'openai-chat', apiKey: 'mock',
+    models: [{ id: 'deepseek-chat', contextMax: 32768, reasoning: true }],
+  };
+  const bridge = createAgentBridge({ dataDir: dir, env: process.env, startTimeoutMs: 90_000, localInstances: () => [], connections: () => [connection] });
+  t.after(async () => { await bridge.close(); await worker.close(); try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* best effort */ } });
+  for (const [level, message] of [['Medium', 'SCRIPT:call read {"file_path":"evidence.txt"}'], ['Off', 'SCRIPT:echo done']]) {
+    const frames = [];
+    await bridge.runTurn({ chatId: `ds-${level}`, message, workspacePath: dir, mode: 'plan', thinking: level, choice: { connectionId: 'ds', modelId: 'deepseek-chat' }, onFrame: frame => frames.push(frame) });
+    assert.equal(frames.at(-1)?.type, 'done');
+    const request = JSON.parse(worker.requests.at(-1).raw);
+    assert.equal(request.chat_template_kwargs, undefined);
+    assert.deepEqual(request.thinking, { type: level === 'Off' ? 'disabled' : 'enabled' });
+    if (level === 'Medium') {
+      assert.equal(request.reasoning_effort, 'high');
+      assert.ok(request.messages.some(m => m.role === 'assistant' && m.reasoning_content === 'I will use read.'));
+      assert.ok(request.messages.some(m => m.role === 'tool' && JSON.stringify(m.content).includes('DEEPSEEK_TOOL_RESULT')));
+    }
+  }
 });

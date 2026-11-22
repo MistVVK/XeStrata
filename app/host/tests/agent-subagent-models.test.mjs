@@ -54,6 +54,7 @@ test('a close guess is checked with the person, several fits are listed, nothing
 });
 
 test('the assistant is told to use the subagent tool when asked for a subagent or a model', () => {
+  assert.match(AGENT_PROMPT, /list_agents.*send_message/);
   assert.match(AGENT_PROMPT, /ask a subagent/); assert.match(AGENT_PROMPT, /Never look for a model with shell commands/);
 });
 

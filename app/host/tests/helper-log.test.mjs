@@ -2,9 +2,12 @@
 // The row now keeps what the helper did (a short, bounded list) and "View log" shows it for every helper that has steps.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { transform } from 'esbuild';
 import { ChildProjector, MAX_STEPS } from '../server/agent/children.mjs';
+import { createHelperRecords } from '../server/chat-helper-records.mjs';
 
 const src = name => readFileSync(new URL(`../src/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const load = async name => {
@@ -66,7 +69,23 @@ test('the page merges the steps of a frame, keeps them when a later frame has no
 
 test('View log opens for any helper that has steps, and lists them', () => {
   const row = src('components/SubagentRow.tsx');
-  assert.match(row, /a\.status === 'failed' \|\| a\.steps\?\.length \? <button className="text-action" onClick=\{\(\) => setLog\(true\)\}>/);
+  assert.match(row, /a\.status === 'failed' \|\| a\.steps\?\.length \|\| messages\.length\) \? <Btn size="sm" onClick=\{showLog\}>/);
   assert.match(row, /a\.steps\.map\(\(step, i\) => <li key=\{i\}/);
   assert.doesNotMatch(row, /\{tr\(a\.status === 'failed' \? <button className="text-action"/);
+});
+
+test('messages and archive choices survive reopening and are scoped to their chat and helper', t => {
+  const root = mkdtempSync(join(tmpdir(), 'strata-helper-records-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const writer = createHelperRecords(root);
+  const message = writer.message('c1', 'h1', { messageId: 'm1', delivery: 'steer' }, 'Keep the exact text.\nSecond line.');
+  writer.message('c1', 'h1', { messageId: 'm1', delivery: 'steer' }, 'Ignore the duplicate receipt.');
+  writer.archive('c1', ['h1', 'h2'], true);
+  const reader = createHelperRecords(root);
+  assert.deepEqual(reader.read('c1'), { h1: { archived: true, messages: [message] }, h2: { archived: true } });
+  assert.deepEqual(reader.read('c2'), {});
+  reader.archive('c1', ['h1', 'h2'], false);
+  assert.deepEqual(reader.read('c1'), { h1: { messages: [message] } });
+  reader.forget('c1');
+  assert.deepEqual(reader.read('c1'), {});
 });

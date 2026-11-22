@@ -39,11 +39,10 @@ test('a denied call, a running card and the same card seen twice are not counted
   assert.equal(g.failedTotal, 1);
 });
 
-test('a goal is never stopped by the per-turn limits: 100 searches, long text, a full context', () => {
+test('a goal is never stopped by per-turn search and rewrite limits', () => {
   const g = new GoalGuard();
   for (let i = 0; i < 100; i++) assert.equal(g.card(call('web_search', { query: `q${i}` }, 'done')), null);
   assert.equal(g.text('1. step\n'.repeat(50)), null);
-  assert.equal(g.context(1e9), null);
   assert.equal(g.silent({ ended: { kind: 'completed' }, wrote: false }), null);
 });
 
@@ -54,7 +53,8 @@ test('the sentence is the approved one, with its interface key', () => {
 
 test('the bridge gives a goal turn the goal guard; a trip stops the turn, and stop() pauses the goal', () => {
   const src = readFileSync(new URL('../server/agent/agent-bridge.mjs', import.meta.url), 'utf8');
-  assert.match(src, /guard = goal \? new GoalGuard\(\) : new TurnGuard\(\{ plan: !!planTask,/);
+  assert.match(src, /guard = goal \? new GoalGuard\(\) : new TurnGuard\(\{ plan: !!planTask \}\)/);
   assert.match(src, /function trip\(reason\) \{[\s\S]{0,400}void stop\(chatId\)/);
-  assert.match(src, /async function stop\(chatId[\s\S]{0,1200}await pauseGoal\(rt, turn\.sessionId, chatId\);/);
+  const stop = src.slice(src.indexOf('async function stop(chatId'), src.indexOf('function turnOf(chatId'));
+  assert.match(stop, /await beforeAbort\(\(\) => pauseGoal\(runtime, turn\.sessionId, chatId, pauseSignal\), pauseSignal\)/);
 });

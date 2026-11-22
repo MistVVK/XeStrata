@@ -941,8 +941,8 @@ def recheck(session: Session, base_args: list[str], preset: dict[str, Any], *, c
 
     Pass rule (against the stored numbers, not a fresh baseline): decode and the 4K prompt at least 95% of what was stored,
     memory within the stored +5%. A failing prompt rate is measured once more with a second start before it counts (the
-    prompt rate of some cards is bimodal between engine starts). When the engine changed in a way that can move speed
-    (``tuning_epoch``) a baseline start is added and the preset must be at least as fast as doing nothing.
+    prompt rate of some cards is bimodal between engine starts). After an engine or memory policy change,
+    the recheck also needs a valid baseline on the standard settings.
     The result is ``keep``, ``retune`` (suggested, never forced) or ``inconclusive`` (noise or a competing process)."""
     progress = progress or (lambda p: None)
     cancel = cancel or threading.Event()
@@ -995,8 +995,12 @@ def recheck(session: Session, base_args: list[str], preset: dict[str, Any], *, c
                 problems.append("it now uses more memory than when it was saved")
                 break
         if engine_changed:
-            base = one(base_args, {}, "Checking against the standard settings after the engine update")
-            if base.status == "PASS" and base.decode_tok_s and run.decode_tok_s and run.decode_tok_s < base.decode_tok_s:
+            base = one(base_args, {}, "Checking against the standard settings")
+            if base.status != "PASS" or not base.decode_tok_s or not run.decode_tok_s:
+                out.update(verdict="inconclusive", reason="The standard settings could not be measured.",
+                           seconds=round(clock() - t0, 1))
+                return out
+            if run.decode_tok_s < base.decode_tok_s:
                 problems.append("the standard settings are now faster than the saved ones")
             out["baseline"] = {"decode_tok_s": base.decode_tok_s, "pp4k_tok_s": base.pp_tok_s}
         out["problems"] = problems

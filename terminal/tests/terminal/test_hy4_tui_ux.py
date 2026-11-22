@@ -381,7 +381,7 @@ class CliAndHarnessUxTests(unittest.TestCase):
         t_hy4 = harness.Target(url="http://127.0.0.1:8095", key="k", model="hy4-flash-sq-64", context=131072)
         oc_hy4 = json.loads(harness.opencode_file(t_hy4))
         self.assertEqual(
-            oc_hy4["provider"]["strata"]["models"]["hy4-flash-sq-64"]["name"],
+            oc_hy4["providers"]["strata"]["models"]["hy4-flash-sq-64"]["name"],
             "Tencent Hy4-Flash (Strata, local)",
         )
         omp_m = harness.omp_models(t_hy4)
@@ -395,7 +395,7 @@ class CliAndHarnessUxTests(unittest.TestCase):
         t_qwen = harness.Target(url="http://127.0.0.1:8095", key="k", model="qwen3.8-flash-next-iq3_s", context=32768)
         oc_qwen = json.loads(harness.opencode_file(t_qwen))
         self.assertEqual(
-            oc_qwen["provider"]["strata"]["models"]["qwen3.8-flash-next-iq3_s"]["name"],
+            oc_qwen["providers"]["strata"]["models"]["qwen3.8-flash-next-iq3_s"]["name"],
             "Qwen3.8-Flash-Next (Strata, local)",
         )
         self.assertIn("efforts: [minimal, low, medium, high]", harness.omp_models(t_qwen))

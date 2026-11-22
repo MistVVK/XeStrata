@@ -162,6 +162,22 @@ class StoreTest(unittest.TestCase):
         old = dict(p, created_epoch=time.time() - 100 * 86400)
         self.assertEqual(presets.staleness(old, identity())["state"], "soft")
 
+    def test_recheck_detects_engine_digest_and_memory_policy_changes(self):
+        p = self.make()
+        now = identity()
+        now["engine"]["sha256"] = "rebuilt"
+        self.assertEqual(presets.staleness(p, now)["state"], "soft")
+
+        now = identity()
+        config = {**CFG, "args": CFG["args"] + ["--conversation-cache-mib", "4096"],
+                  "env": {"STRATA_RAM_KEEP_GIB": "12"}}
+        now["memory_policy"] = presets.memory_policy(config)
+        self.assertEqual(presets.staleness(p, now)["state"], "soft")  # legacy record
+        p["identity"] = copy.deepcopy(now)
+        self.assertEqual(presets.staleness(p, now)["state"], "fresh")
+        now["memory_policy"]["env"]["STRATA_RAM_KEEP_GIB"] = "8"
+        self.assertEqual(presets.staleness(p, now)["state"], "soft")
+
     def test_per_request_defaults_reach_the_sampling_block(self):
         res = copy.deepcopy(RESULT)
         res["settings"]["per_request"] = {"spec_min_p": 0.7}

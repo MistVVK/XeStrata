@@ -22,6 +22,7 @@ export const NATIVE_FIELDS=[
  {id:'split_skip_if_fits',label:'Use one GPU when the model fits',group:'GPU & memory',type:'boolean'},
  {id:'vram_elastic',label:'Elastic GPU expert cache',group:'GPU & memory',type:'boolean'},
  {id:'vram_reserve_mib',label:'GPU memory for other apps (MiB)',group:'GPU & memory',type:'number',min:0,max:131072,hint:'Applied as --vram-reserve-mib when loading.'},
+ {id:'prompt_cache_spread',label:'Spread prompt cache checkpoints',group:'GPU & memory',type:'boolean',hint:'Keeps conversation cache checkpoints spaced back through the chat instead of only the latest turns. Uses the same RAM and speeds up agent compaction on hybrid models. Default is on in the desktop app.'},
  {id:'vision_tokens',label:'Maximum image tokens',group:'Image reading',type:'number',min:1,max:16384},
  {id:'vision_min_tokens',label:'Minimum image tokens',group:'Image reading',type:'number',min:0,max:16384},
  {id:'mcp_timeout_s',label:'Tool timeout (seconds)',group:'Tools',type:'number',min:1,max:3600},
@@ -96,6 +97,14 @@ export function withoutDraftLayer(args){
  const out=[];const list=(args??[]).map(String);
  for(let i=0;i<list.length;i++){const a=list[i];if(a==='--batch-mtp')continue;if(a==='--mtp'||a==='--spec-min-p'){if(i+1<list.length&&!list[i+1].startsWith('--'))i++;continue;}out.push(a);}
  return out;
+}
+/** Add or remove --prompt-cache-spread in an engine args array without duplicating it (#6469). */
+export function withPromptCacheSpread(args){
+ const list=(args??[]).map(String);
+ return list.includes('--prompt-cache-spread')?list:[...list,'--prompt-cache-spread'];
+}
+export function withoutPromptCacheSpread(args){
+ return (args??[]).map(String).filter(a=>a!=='--prompt-cache-spread');
 }
 export function validateNativeSettings(values){
  if(!values||typeof values!=='object'||Array.isArray(values))throw new Error('Native settings must be an object.');

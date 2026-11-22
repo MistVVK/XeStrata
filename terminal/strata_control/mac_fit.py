@@ -262,13 +262,14 @@ def stream_mtp(stream: bool, ram_gb: float) -> bool:
 
 
 def engine_args(pack: Path, shards: list, rt: Path, ctx: int, stream: bool = False, ram_gb: float = 0.0,
-                profile: Path | str = "data/expert-profile.bin", model: str = "") -> list[str]:
+                profile: Path | str = "data/expert-profile.bin", model: str = "", family: str = "") -> list[str]:
     """The Metal defaults: --spec 2 with the MTP draft layer (measured best on the M5 Max, docs/MAC.md) and the Q8_0
     hyper-connection read (the engine's default on Metal; STRATA_HC_Q8=0 in the config's env gives the exact BF16
     read).  Streaming from the SSD: one token per step, no draft layer (measured faster on the 32 GB M4); a streaming
     Mac with STREAM_MTP_FROM_GB or more keeps the draft layer and uses --spec STREAM_SPEC."""
     mtp = stream_mtp(stream, ram_gb) and not MAC_MODELS.get(model, {}).get("no_mtp")       # a feed model whose entry says "drafter: none" has no draft layer
-    args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(shards[1] if len(shards) > 1 else shards[0])]       # one file: its own PLE table
+    ple = shards[0] if (family == "swift" or len(shards) <= 1) else shards[1]
+    args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple)]       # Swift and single-file models hold the PLE table in shard 1
     if shards[0].name.endswith("-metal.gguf"):         # the repacked file: it is its own dense GGUF
         args += ["--native-dense-gguf", str(shards[0])]
     args += [

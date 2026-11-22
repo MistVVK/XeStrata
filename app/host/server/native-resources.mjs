@@ -1,4 +1,4 @@
-import {USER_KEY,flagValue,capture} from './native-user-args.mjs';
+import {USER_KEY,flagValue,setFlag,capture} from './native-user-args.mjs';
 import {parseEngineVersion} from './engine-version.mjs';
 import {isHy4} from './hy4.mjs';
 import {isInkling} from './inkling.mjs';
@@ -130,6 +130,22 @@ export function launchBudgetArgs(cfg,profile){
 /** The RAM, in GiB, "Leave 20% for my work" asks the engine to keep free: a fifth of the PC's RAM rounded up, never under 5 or over 8
  *  (5 at 24 GB, 7 at 32 GB, 8 at 64 GB and above). The engine adds it to the arena's need and, when the arena does not fit, leaves it free beside the RAM copy. It is sent as the env variable STRATA_RAM_KEEP_GIB. */
 export const ramKeepGib=ram=>Math.min(8,Math.max(5,Math.ceil((Number(ram)||0)*.2)));
+
+export function validRamReserve(value) {
+ return Number.isSafeInteger(value)&&value>0;
+}
+
+/** Apply the shared reserve to the launch copy. Clearing it restores the saved model options. */
+export function withRamReserve(config,reserve) {
+ if(!validRamReserve(reserve))return config;
+ const env={...config.env,STRATA_RAM_KEEP_GIB:String(reserve)};
+ if(env.STRATA_RESIDENT_HEADROOM_GIB!==undefined&&Number(env.STRATA_RESIDENT_HEADROOM_GIB)<reserve)
+  env.STRATA_RESIDENT_HEADROOM_GIB=String(reserve);
+ const flag='--ram-keep-gib';
+ const args=setFlag(config.args,flag,null);
+ const user=Array.isArray(config[USER_KEY])?{[USER_KEY]:setFlag(config[USER_KEY],flag,null)}:{};
+ return {...config,...user,args,env};
+}
 
 /** The first engine version that reads STRATA_RAM_KEEP_GIB / --ram-keep-gib (the setting was added in 0.1.56, the engine of the 0.2.9 update; the released 0.2.9 engine is 0.1.55). An engine older than this, or one whose version cannot be read, gets the
  *  rule of 0.2.9 instead. Lower it (or raise the engine's version) only together with the release that carries the setting. */

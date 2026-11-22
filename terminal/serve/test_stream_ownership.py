@@ -599,6 +599,37 @@ class BatchOwnership(FakeEngines, unittest.TestCase):
         bg[0].cancel.set()
         self.finish(bg)
 
+    def test_closing_an_admission_mid_prompt_sends_stop(self):
+        """A consumer leaving an active BGEN admission (gen.close() on a PP heartbeat, before cancel is polled) must
+        send STOP so the engine aborts the read instead of reading the whole abandoned prompt while holding ctl."""
+        sent = []
+        orig_send = self.engine._send
+
+        def spy_send(text):
+            sent.append(text.split()[0])
+            return orig_send(text)
+
+        bg = self.start_busy(n=2)
+        self.assertTrue(wait_until(lambda: sum(self.engine.slot_busy) >= 2))
+        with mock.patch.object(self.engine, "_send", side_effect=spy_send):
+            gen = self.engine.generate(prompt_ids("KA0001 SLOWPREFILL", 2600), 500, {}, threading.Event())
+            for tok in gen:
+                if tok is None:
+                    gen.close()
+                    break
+        self.assertEqual(sent, ["BGEN", "STOP"], f"closing a BGEN admission did not send STOP and abort: {sent}")
+        self.assertEqual(self.engine.last.get("finish"), "cancel", self.engine.last)
+        self.assertEqual(self.engine.last.get("generated"), 0, self.engine.last)
+        b = Client(self.engine, "LB0002", max_new=60)
+        b.start()
+        self.finish([b], timeout=15)
+        self.assertIsNone(b.error)
+        self.assertEqual(b.foreign(), [])
+        self.assertEqual(b.tokens, expected_reply("LB0002")[:60])
+        for c in bg:
+            c.cancel.set()
+        self.finish(bg)
+
 
 if __name__ == "__main__":
     unittest.main()

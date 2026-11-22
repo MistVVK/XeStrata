@@ -5,6 +5,7 @@ const metric = (value: unknown, fallback = 0) => typeof value === 'number' && Nu
 
 /** The steps of a helper as the log shows them: only well-formed ones, at most 20, each short. A frame without steps keeps the ones the row had. */
 export const MAX_STEPS = 20;
+export const MAX_REPLIES = 50;
 const short = (value: unknown, max: number) => typeof value === 'string' && value.trim() ? value.slice(0, max) : undefined;
 export function stepsOf(value: unknown): { steps?: NonNullable<SessionAgent['steps']> } {
   if (!Array.isArray(value)) return {};
@@ -14,6 +15,17 @@ export function stepsOf(value: unknown): { steps?: NonNullable<SessionAgent['ste
     return said ? [{ said }] : verb || target ? [{ ...(verb ? { verb } : {}), ...(target ? { target } : {}) }] : [];
   }).slice(-MAX_STEPS);
   return steps.length ? { steps } : {};
+}
+
+export function repliesOf(value: unknown): { replies?: NonNullable<SessionAgent['replies']> } {
+  if (!Array.isArray(value)) return {};
+  const replies = value.flatMap((item): NonNullable<SessionAgent['replies']> => {
+    if (!item || typeof item !== 'object') return [];
+    const o = item as Record<string, unknown>;
+    const id = short(o.id, 180), text = typeof o.text === 'string' && o.text.trim() ? o.text.slice(0, 4000) : undefined, at = short(o.at, 64);
+    return id && text && at ? [{ id, text, at }] : [];
+  }).slice(-MAX_REPLIES);
+  return replies.length ? { replies } : {};
 }
 
 /** Merge partial agent frames without replacing other agents or their readings. */
@@ -34,13 +46,31 @@ export function updateAgent(agents: SessionAgent[], frame: unknown, now = Date.n
     tokens: metric(next.tokens, previous?.tokens),
     updatedAt: at,
     ...stepsOf(next.steps ?? previous?.steps),
+    ...repliesOf(next.replies ?? previous?.replies),
   };
   return previous ? agents.map(a => a.id === agent.id ? agent : a) : [...agents, agent];
 }
 
 export const runningAgents = (agents: SessionAgent[]) => agents.filter(a => a.status === 'working').length;
 
+/** Working vs not-working counts and working helper names for the toolbar button and hover summary (#6516). */
+export function agentCounts(agents: SessionAgent[]) {
+  const workingList = agents.filter(a => a.status === 'working');
+  const working = workingList.length;
+  const notWorking = agents.length - working;
+  return {
+    working,
+    notWorking,
+    total: agents.length,
+    workingList,
+  };
+}
+
 /** A page that was closed or reloaded holds no live helper: a saved row still "working" is shown as stopped until a newer frame says otherwise
  *  (updateAgent takes any frame newer than the row's own time, so a helper that really runs comes back by itself). #4218. */
 export const settleAgents = (agents: SessionAgent[] | undefined): SessionAgent[] | undefined =>
-  agents?.some(a => a.status === 'working') ? agents.map(a => a.status === 'working' ? { ...a, status: 'cancelled' as const } : a) : agents;
+  agents?.some(a => a.status === 'working' || a.status === 'queued')
+    ? agents.map(a => a.status === 'working' || a.status === 'queued'
+      ? { ...a, status: 'cancelled' as const, description: 'This helper is no longer running.' }
+      : a)
+    : agents;

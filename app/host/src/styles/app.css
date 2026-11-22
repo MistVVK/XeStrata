@@ -6030,7 +6030,20 @@ button.menu__item:disabled { opacity: .5; cursor: default; }
 .artifact-tab:hover .artifact-tab__close, .artifact-tab:focus-within .artifact-tab__close { opacity: 1; }
 .artifact-tab__close:hover { color: var(--st-ink); background: var(--st-line-soft); }
 .subagent-row { display: flex; gap: 9px; align-items: flex-start; padding: 11px 0; }
+.subagent-row--clickable { cursor: pointer; border-radius: var(--st-r-md); padding-inline: 6px; margin-inline: -6px; transition: background 140ms ease; }
+.subagent-row--clickable:hover { background: var(--st-surface-2); }
 .subagent-row + .subagent-row { border-top: 1px solid var(--st-line-soft); }
+.subagent-row[data-panel] { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; }
+.subagent-row[data-panel] .subagent-log, .subagent-row[data-panel] .subagent-messages, .subagent-row[data-panel] .subagent-work__composer { grid-column: 1 / -1; }
+.subagent-thread__meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--st-ink-muted); margin-bottom: 4px; }
+.subagent-thread__meta strong { color: var(--st-ink); font-weight: 600; }
+.subagent-thread__badge { padding: 1px 6px; border-radius: 999px; background: var(--st-surface); border: 1px solid var(--st-line); font-size: 10px; }
+.subagent-thread__text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.subagent-thread .subagent-thread__item--assistant { border-left-color: var(--st-info-text); }
+.helper-window { height: 100%; min-height: 0; }
+.helper-window .main__body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.helper-window .wrap { max-width: 960px; padding-bottom: 32px; }
+.subagent-row[data-panel] .subagent-log { max-height: min(52dvh, 36rem); overflow-y: auto; overscroll-behavior: contain; }
 .subagent-row__icon { display: flex; flex: none; margin-top: 2px; color: var(--st-ink-muted); }
 .subagent-row__copy { min-width: 0; flex: 1; }
 .subagent-row__title { display: flex; align-items: center; gap: 8px; }
@@ -7633,9 +7646,23 @@ html[data-motion='reduced'] .native-progress__bar[data-indeterminate] > i { anim
 .native-kv-hint { display: block; margin-top: 6px; line-height: 1.5; }
 
 /* ---- a message for one helper, under its row (#4749) ---- */
-.subagent-row__reply { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-.subagent-row__reply .st-input { flex: 1; min-width: 0; }
+.subagent-row__actions, .subagent-overview__actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.subagent-row__actions:not(:empty) { margin-top: 8px; }
+.subagent-overview__actions { padding: 10px 0; border-bottom: 1px solid var(--st-line-soft); }
+.subagent-overview__empty { margin: 12px 0; }
+.subagent-overview__archive { border-top: 1px solid var(--st-line-soft); padding-top: 12px; }
+.subagent-overview__archive h2, .subagent-messages h2 { margin: 0 0 6px; font-size: var(--st-fs-xs); }
+.subagent-row__reply { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; }
+.subagent-row__reply .st-input { flex: 1; min-width: 0; resize: vertical; }
+.subagent-messages { margin: 8px 0; }
+.subagent-messages ol { display: grid; gap: 6px; padding: 0; margin: 0; list-style: none; }
+.subagent-messages li { background: var(--st-surface-2); border-left: 2px solid var(--st-accent-text); padding: 6px 10px; border-radius: var(--st-r-md); font-size: var(--st-fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
 .subagent-row__copy p.subagent-row__note { white-space: normal; margin: 6px 0 0; }
+
+/* A live status is intentionally short-lived; this is the durable human work log. */
+.activity-history { margin: 10px 0 0; border-top: 1px solid var(--st-line-soft); padding-top: 8px; color: var(--st-ink-muted); }
+.activity-history summary { cursor: pointer; font-size: var(--st-fs-xs); font-weight: 600; }
+.activity-history ol { margin: 8px 0 0; padding-left: 20px; display: grid; gap: 4px; font-size: var(--st-fs-xs); line-height: 1.45; }
 
 /* ---- a message sent while an answer is being written: the one waiting to go, and what Enter will do (#4783) ---- */
 .parked { display: flex; flex-direction: column; gap: 6px; margin: 0 0 8px; }

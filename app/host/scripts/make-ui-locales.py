@@ -162,17 +162,21 @@ add(en="Wait for the answer",
 add(en="Send after the answer",
     zh="回答完成后再发送", ja="回答が終わってから送る", de="Nach der Antwort senden", es="Enviar después de la respuesta",
     ru="Отправить после ответа", pt="Enviar depois da resposta", ko="답변이 끝난 뒤 보내기", fr="Envoyer après la réponse")
-add(en="Interrupt the answer",
-    zh="打断回答", ja="回答を中断する", de="Die Antwort unterbrechen", es="Interrumpir la respuesta",
-    ru="Прервать ответ", pt="Interromper a resposta", ko="답변 중단하기", fr="Interrompre la réponse")
+add(en="Send a live message",
+    zh="发送实时消息", ja="作業中にメッセージを送信", de="Live-Nachricht senden", es="Enviar un mensaje en directo",
+    ru="Отправить сообщение во время работы", pt="Enviar uma mensagem em direto", ko="작업 중에 메시지 보내기", fr="Envoyer un message en direct")
 add(en="Enter sends it when the answer is done.",
     zh="回答完成后，按回车即可发送。", ja="回答が終わったら Enter で送信されます。", de="Die Eingabetaste sendet sie, sobald die Antwort fertig ist.",
     es="Intro lo envía cuando termina la respuesta.", ru="Enter отправит сообщение, когда ответ закончится.",
     pt="O Enter envia quando a resposta terminar.", ko="답변이 끝나면 Enter로 보냅니다.", fr="Entrée l'envoie quand la réponse est terminée.")
-add(en="Enter stops the answer here and sends it now.",
-    zh="按回车会在此处停止回答并立即发送。", ja="Enter で回答をここで止めて、すぐに送信します。", de="Die Eingabetaste stoppt die Antwort hier und sendet die Nachricht sofort.",
-    es="Intro detiene la respuesta aquí y lo envía ahora.", ru="Enter остановит ответ здесь и сразу отправит сообщение.",
-    pt="O Enter para a resposta aqui e envia agora.", ko="Enter를 누르면 여기서 답변을 멈추고 바로 보냅니다.", fr="Entrée arrête la réponse ici et l'envoie tout de suite.")
+add(en="Enter sends it at the next step, or after the answer if needed.",
+    zh="按回车会在下一步发送消息，必要时会在回复结束后发送。", ja="Enter で次のステップにメッセージを送ります。必要な場合は回答の後に送信します。",
+    de="Mit der Eingabetaste senden Sie die Nachricht beim nächsten Schritt oder, falls nötig, nach der Antwort.",
+    es="Intro envía el mensaje en el siguiente paso o, si hace falta, después de la respuesta.",
+    ru="Enter отправит сообщение на следующем шаге или, при необходимости, после ответа.",
+    pt="Enter envia a mensagem no próximo passo ou, se necessário, depois da resposta.",
+    ko="Enter를 누르면 다음 단계에 메시지를 보냅니다. 필요한 경우 답변이 끝난 뒤 보냅니다.",
+    fr="Entrée envoie le message à l’étape suivante ou, si nécessaire, après la réponse.")
 add(en="Waiting to send",
     zh="等待发送", ja="送信待ち", de="Wartet auf das Senden", es="Esperando para enviar",
     ru="Ждёт отправки", pt="Aguardando envio", ko="보내기 대기 중", fr="En attente d'envoi")

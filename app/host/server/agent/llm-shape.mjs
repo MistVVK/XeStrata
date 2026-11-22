@@ -17,6 +17,7 @@ import https from 'node:https';
 
 /** The thinking budgets the composer offers (0 = no limit is not a budget). */
 export const BUDGETS = Object.freeze([2048, 8192, 32768]);
+const NATIVE_AGENT_COMPLETION_FLOOR = 1024;
 /** The offered budget nearest to what a chat asks for (0 stays 0). */
 export function nearestBudget(value) {
   const n = Number(value);
@@ -50,7 +51,7 @@ export function samplingFromExpert(expert) {
  * The request body with the person's settings added. A field the request already carries is left alone (the Harness's own wins), the
  * thinking budget is only added while thinking is on, and an output cap only ever lowers the request's own.
  */
-export function shapeBody(body, { sampling = null, budget = 0 } = {}) {
+export function shapeBody(body, { sampling = null, budget = 0, nativeAgent = false } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const out = { ...body };
   for (const [field, value] of Object.entries(sampling ?? {})) {
@@ -63,6 +64,17 @@ export function shapeBody(body, { sampling = null, budget = 0 } = {}) {
   }
   const thinkingOff = out.chat_template_kwargs?.enable_thinking === false;
   if (budget > 0 && !thinkingOff && out.reasoning_budget_tokens === undefined) out.reasoning_budget_tokens = budget;
+  // The SDK can estimate a one-token completion even when the rendered prompt fits.
+  // A native server can make the final decision with its own tokenizer. An explicit
+  // small Expert output limit still wins. Titles and tool-free calls keep their cap.
+  if (nativeAgent && Array.isArray(out.tools) && out.tools.length
+      && !(sampling?.max_tokens > 0 && sampling.max_tokens < NATIVE_AGENT_COMPLETION_FLOOR)) {
+    const field = out.max_completion_tokens > 0 ? 'max_completion_tokens' : 'max_tokens';
+    if (Number.isSafeInteger(out[field]) && out[field] > 0) {
+      out[field] = Math.max(out[field], NATIVE_AGENT_COMPLETION_FLOOR);
+      out.strata_min_completion_tokens = NATIVE_AGENT_COMPLETION_FLOOR;
+    }
+  }
   return out;
 }
 
@@ -168,9 +180,10 @@ export function createLlmProxy({ targetOf, samplingNow, onMarker = null }) {
       const sent = body;
       const budget = nearestBudget(req.headers['x-strata-budget']);
       const sampling = samplingNow();
-      // Nothing to add (every setting at its default): the request goes on byte for byte as the assistant wrote it.
-      if (req.method === 'POST' && /\/chat\/completions\/?$/.test(rest) && body.length && (budget || sampling)) {
-        try { body = Buffer.from(JSON.stringify(shapeBody(JSON.parse(body.toString('utf8')), { sampling, budget }))); } catch { /* not JSON: pass it on untouched */ }
+      const nativeAgent = /^strata-local(?:-|~|$)/.test(key);
+      // Only the app's native routes advertise the completion floor. A user's compatible API keeps its own contract.
+      if (req.method === 'POST' && /\/chat\/completions\/?$/.test(rest) && body.length && (budget || sampling || nativeAgent)) {
+        try { body = Buffer.from(JSON.stringify(shapeBody(JSON.parse(body.toString('utf8')), { sampling, budget, nativeAgent }))); } catch { /* not JSON: pass it on untouched */ }
       }
       // The route's address is the model's own base (it ends in /v1): the assistant's /v1 is that same prefix.
       const target = new URL(base.replace(/\/+$/, '') + rest.replace(/^\/v1(?=\/|$|\?)/, ''));

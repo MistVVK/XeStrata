@@ -54,6 +54,19 @@ test('saved false and unknown support cannot be overridden by request capability
   assert.equal(Object.hasOwn(f.mock.requests.at(-1).body,'reasoning_effort'),false);
  }
 });
+test('the explicit connection format selects Strata or DeepSeek fields without guessing from a LAN address', async t => {
+ const f = await fixture(t, { models: [{ id: 'mock-reasoning' }], reasoningFormat: 'strata' });
+ await f.service.stream({ selection: f.selection, message: 'Test', thinking: 'Low', onFrame: () => {} });
+ assert.deepEqual(f.mock.requests.at(-1).body.chat_template_kwargs, { enable_thinking: true, reasoning_effort: 'low' });
+ for (const [level, enabled, effort] of [['Off', false, undefined], ['Medium', true, 'high'], ['Max', true, 'max']]) {
+  const d = await fixture(t, { models: [{ id: 'mock-reasoning' }], reasoningFormat: 'deepseek' });
+  await d.service.stream({ selection: d.selection, message: 'Test', thinking: level, onFrame: () => {} });
+  const payload = d.mock.requests.at(-1).body;
+  assert.deepEqual(payload.thinking, { type: enabled ? 'enabled' : 'disabled' });
+  assert.equal(payload.reasoning_effort, effort);
+  assert.equal(payload.chat_template_kwargs, undefined);
+ }
+});
 test('host-owned probe support is used only when the saved answer is unknown',async t=>{
  for(const reasoning of [null,false]){
   const f=await fixture(t,{models:[{id:'mock-reasoning',reasoning}]});

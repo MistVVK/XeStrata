@@ -87,6 +87,105 @@ class ParallelServiceYield(tp.FakeEngineCase):
         finally:
             e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing = old
 
+    def test_a_restart_during_admit_drain_keeps_the_new_engines_slot(self):
+        """#4451 / #5657: the engine restarts while generate_batched()'s finally block drains an interrupted admission.
+        The stale generation check computed before the drain must not clear the NEW engine's slot_busy, slot_claims
+        or slot_live."""
+        self.start(2)
+        e = self.engine
+        born = e.gen
+        with e.slot_cv:
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        request = e.generate_batched(list(b"long " * 400), 60, {}, threading.Event())
+        for tok in request:
+            if tok is None:
+                break
+        old = (e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_used, e.slot_live, e.slot_claims, e.slot_releasing)
+        new_live = {"slot": 0, "state": "decoding"}
+        new_busy = [True, False]
+        new_claims, new_releasing = {0}, set()
+        new_live_slots = [new_live, None]
+
+        def drain_then_restart(until, timeout=None, born=None, lines_q=None):
+            e.gen = born + 1                                   # restart(): gen advances, then new slot tables
+            e.slot_q = [queue.Queue(), queue.Queue()]
+            e.slot_busy = new_busy
+            e.slot_held = [[], []]
+            e.slot_used = [0.0, 0.0]
+            e.slot_live = new_live_slots
+            e.slot_claims, e.slot_releasing = new_claims, new_releasing
+            return None
+
+        try:
+            with mock.patch.object(e, "_drain_control", side_effect=drain_then_restart):
+                request.close()
+            self.assertTrue(new_busy[0], "the old request's finally freed the new engine's active slot")
+            self.assertIn(0, new_claims, "the old request's finally erased the new engine's claim")
+            self.assertIs(new_live_slots[0], new_live, "the old request's finally cleared the new engine's live view")
+        finally:
+            e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_used, e.slot_live, e.slot_claims, e.slot_releasing = old
+            e._send("STOP")
+
+    def test_a_restart_during_quarantine_keeps_the_new_engines_slot(self):
+        """#4451 / #5657: _quarantine_control must capture the old engine's slot tables before checking self.gen == born
+        so a restart right before entry or during the quarantine wait cannot mutate the NEW engine's slot state."""
+        self.start(2)
+        e = self.engine
+        born = e.gen
+        old = (e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing)
+
+        class SyncThread:
+            def __init__(self, target, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        # Case 1: restart already happened before _quarantine_control enters
+        new_busy = [True, False]
+        new_claims, new_releasing = {0}, set()
+        try:
+            e.gen = born + 1
+            e.slot_q = [queue.Queue(), queue.Queue()]
+            e.slot_busy = new_busy
+            e.slot_held = [[], []]
+            e.slot_claims, e.slot_releasing = new_claims, new_releasing
+            with mock.patch.object(tp.server.threading, "Thread", SyncThread), \
+                    mock.patch.object(e, "_drain_control", return_value=None):
+                e._quarantine_control("BADM", born, queue.Queue(), 0, False)
+            self.assertTrue(new_busy[0], "pre-entry restart: quarantine cleared the new engine's slot")
+            self.assertIn(0, new_claims, "pre-entry restart: quarantine erased the new engine's claim")
+            self.assertNotIn(0, new_releasing, "pre-entry restart: quarantine marked the new engine's slot releasing")
+        finally:
+            e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing = old
+
+        # Case 2: restart lands after self.gen == born is checked inside quarantine run()
+        with e.slot_cv:
+            e.slot_busy[0] = True
+            e.slot_claims.add(0)
+        new_busy = [True, False]
+        new_claims, new_releasing = {0}, set()
+
+        def alive_then_restart():
+            e.gen = born + 1
+            e.slot_q = [queue.Queue(), queue.Queue()]
+            e.slot_busy = new_busy
+            e.slot_held = [[], []]
+            e.slot_claims, e.slot_releasing = new_claims, new_releasing
+            return False
+
+        try:
+            with mock.patch.object(tp.server.threading, "Thread", SyncThread), \
+                    mock.patch.object(e, "_drain_control", return_value="BADM 0 1\n"), \
+                    mock.patch.object(e, "alive", side_effect=alive_then_restart):
+                e._quarantine_control("BADM", born, queue.Queue(), 0, False)
+            self.assertTrue(new_busy[0], "mid-quarantine restart: quarantine cleared the new engine's busy slot")
+            self.assertIn(0, new_claims, "mid-quarantine restart: quarantine erased the new engine's claim")
+            self.assertNotIn(0, new_releasing, "mid-quarantine restart: quarantine touched the new engine's releasing")
+        finally:
+            e.gen, e.slot_q, e.slot_busy, e.slot_held, e.slot_claims, e.slot_releasing = old
+
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""

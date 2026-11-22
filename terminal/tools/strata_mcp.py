@@ -587,6 +587,7 @@ class Strata:
         # tests: the interpreter that runs setup / the server. The app's Control runs the installer on its own Python.
         self.python_override: str | None = sys.executable if CONTROL else None
         self.health_timeout = 2.0
+        self._non_strata_ports: set[int] = set()        # #6475: unconfigured fallback ports that already answered as non-Strata
 
     # ---- setup.py's own tables and logic
     def setup_module(self):
@@ -861,7 +862,7 @@ class Strata:
                 "context": int(val("--max-context")) if str(val("--max-context") or "").isdigit() else None,
                 "kv": val("--kv"), "images": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict)
                 else ("on" if val("--vision") else "off"),
-                "port": cfg.get("port", DEFAULT_PORT), "host": cfg.get("host", "127.0.0.1"),
+                "port": cfg.get("port", self.default_port()), "host": cfg.get("host", "127.0.0.1"),
                 "gpu": cfg.get("gpu"), "gpu_roles": cfg.get("gpu_roles"), "api_key_set": bool(cfg.get("api_key")),
                 "low_ram": "--resident-experts" in a or "--mmap-experts" in a,
                 "start_script": script.name if script.exists() else None,
@@ -1600,20 +1601,51 @@ class Strata:
             return None
 
     # ---- the running server
+    @staticmethod
+    def configured_default_port() -> int | None:
+        """Preferred default model server port from STRATA_MODEL_PORT (1..65535), or None when unset/invalid (#6475)."""
+        raw = (os.environ.get("STRATA_MODEL_PORT") or "").strip()
+        if raw.isdigit():
+            p = int(raw)
+            if 1 <= p <= 65535:
+                return p
+        return None
+
+    @staticmethod
+    def default_port() -> int:
+        """Default model server port: STRATA_MODEL_PORT when set, else DEFAULT_PORT (8080)."""
+        return Strata.configured_default_port() or DEFAULT_PORT
+
+    @staticmethod
+    def no_default_port() -> bool:
+        """Whether STRATA_NO_DEFAULT_PORT disables probing the unconfigured fallback default port (8080)."""
+        return (os.environ.get("STRATA_NO_DEFAULT_PORT") or "").strip().lower() in ("1", "true", "yes", "on")
+
     def ports(self, port: int | None) -> list[int]:
         if port:
             return [port]
-        ps = [self.state("server").get("port")] + [self.describe_config(c)["port"] for c in self.configs()]
-        return list(dict.fromkeys(int(p) for p in [*ps, DEFAULT_PORT] if isinstance(p, int)))
+        ps = [p for p in ([self.state("server").get("port")] + [self.describe_config(c)["port"] for c in self.configs()])
+              if isinstance(p, int) and 1 <= p <= 65535]
+        explicit = self.configured_default_port()
+        if explicit is not None:
+            if explicit not in ps and explicit not in self._non_strata_ports:
+                ps.append(explicit)
+        elif not ps and not self.no_default_port():
+            # #6475: only probe DEFAULT_PORT (8080) as a fallback when no Strata configs/servers name other ports,
+            # STRATA_NO_DEFAULT_PORT is not set, and 8080 has not already answered as a non-Strata listener.
+            if DEFAULT_PORT not in self._non_strata_ports:
+                ps.append(DEFAULT_PORT)
+        return list(dict.fromkeys(int(p) for p in ps))
 
     def api_key_for(self, port: int) -> str | None:
         """The key a config of this folder set for that port (used for our own requests; never shown)."""
         def real(cfg):                                   # "api_key": "none" = served without a key on purpose
             k = cfg.get("api_key")
             return k if k and str(k).strip().lower() != "none" else None
+        fallback = self.default_port()
         for c in self.configs():
             cfg = self.read_config(c)
-            if real(cfg) and int(cfg.get("port", DEFAULT_PORT)) == port:
+            if real(cfg) and int(cfg.get("port", fallback)) == port:
                 return cfg["api_key"]
         for c in self.configs():
             if real(self.read_config(c)):
@@ -1634,12 +1666,15 @@ class Strata:
         nothing."""
         base = f"http://127.0.0.1:{port}"
         if not port_accepts(port):
+            self._non_strata_ports.discard(port)
             return None
         st, health = http_json(base + "/health", timeout=self.health_timeout)
         if st == 0:
             return None
         if st != 200 or not isinstance(health, dict) or health.get("service") != "strata":
+            self._non_strata_ports.add(port)
             return {"port": port, "other": True, "note": "something else answers on this port (not a Strata server)"}
+        self._non_strata_ports.discard(port)
         info = {"port": port, "url": base, "model": health.get("model"), "context": health.get("max_context"),
                 "images": health.get("images"), "loaded": health.get("loaded"),
                 "api_key_required": bool(health.get("api_key"))}
@@ -1790,9 +1825,19 @@ def files_here(S, family: str, model: str, models_dir: Path, vision: bool) -> di
         size = f.get("bytes")
         if size is None:
             try:
-                size = S.fam_pin(fam, path)[0]
+                pin = S.fam_pin(fam, path)
+            except KeyError:
+                if "sha256" in fam:
+                    return None
+                try:
+                    pin = S.file_pin(S.model_hf(fam, model) + path.name)
+                except Exception:                       # noqa: BLE001
+                    return None
             except Exception:                           # noqa: BLE001 - an unpinned file: its size is not known, so "complete" cannot be said
                 return None
+            if not pin:
+                return None
+            size = pin[0]
         total += size
         try:
             if path.is_file() and path.stat().st_size == size and not path.with_name(path.name + ".part").exists():
@@ -2696,7 +2741,7 @@ class Tools:
             if not desc["ready"]:
                 raise ToolError(f"{cfg_path.name} refers to missing files ({', '.join(desc['missing_files'])}): run "
                                 "the install again (strata_install with confirm=true) to repair it")
-            port = port or desc["port"] or DEFAULT_PORT
+            port = port or desc["port"] or s.default_port()
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
                 info = s.probe(tracked["port"])
@@ -2888,7 +2933,7 @@ class Tools:
                 break
         if port is None:
             cfgs = s.configs()
-            port = target["port"] if target else (s.describe_config(cfgs[0])["port"] if cfgs else DEFAULT_PORT)
+            port = target["port"] if target else (s.describe_config(cfgs[0])["port"] if cfgs else s.default_port())
         model = (target or {}).get("model") or "strata"
         key_needed = (target or {}).get("api_key_required")
         if key_needed is None:

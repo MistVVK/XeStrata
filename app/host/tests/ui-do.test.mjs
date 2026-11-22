@@ -317,9 +317,9 @@ test('#4749 the bridge uses the Harness own subagents/prompt with the documented
   const index = readFileSync(new URL('../server/index.mjs', import.meta.url), 'utf8');
   assert.match(index, /path === '\/api\/chat\/helper' && method === 'POST'/);
   const row = src('components/SubagentRow.tsx');
-  assert.match(row, /delivery: a\.status === 'working' \? 'steer' : 'queue'/);
-  assert.match(row, /sessionId && a\.status !== 'queued' && a\.status !== 'cancelled'/);
-  assert.match(src('components/ChatToolbar.tsx'), /sessionId=\{session && !session\.showcase \? session\.id : undefined\}/, 'the example chat has no real helpers to write to');
+  assert.match(row, /const delivery = a\.status === 'working' \? 'steer' : 'queue'/);
+  assert.match(row, /sessionId && !archived && a\.status !== 'cancelled'/);
+  assert.match(src('components/ChatToolbar.tsx'), /const sessionId = session && !session\.showcase \? session\.id : undefined/, 'the example chat has no real helpers to write to');
 });
 
 test('#4749 the helper strings are translated', async () => {
@@ -331,20 +331,38 @@ test('#4749 the helper strings are translated', async () => {
   setTranslationLanguage('en');
 });
 
+test('a native helper window has a bounded scroll surface and opens its work log at the newest step', () => {
+  const app = src('app/App.tsx');
+  const row = src('components/SubagentRow.tsx');
+  const css = src('styles/app.css');
+  assert.match(app, /<main className="main helper-window">/, 'the helper window has its own viewport-sized main surface');
+  assert.match(css, /\.helper-window \{ height: 100%; min-height: 0; \}/);
+  assert.match(css, /\.helper-window \.main__body \{ min-height: 0; overflow-y: auto; overscroll-behavior: contain; \}/);
+  assert.match(css, /\.subagent-row\[data-panel\] \.subagent-log \{ max-height: min\(52dvh, 36rem\); overflow-y: auto; overscroll-behavior: contain; \}/);
+  assert.match(row, /const logRevision = JSON\.stringify\(a\.steps \?\? \[\]\);/, 'a merged live text step still changes the scroll dependency');
+  assert.match(row, /useLayoutEffect\(\(\) => \{[\s\S]*?if \(seenLog\.current === null \|\| followLog\.current\)\s*log\.scrollTop = log\.scrollHeight;[\s\S]*?\}, \[log, logRevision, panel\]\);/, 'the first paint and every visible log revision follow the current work');
+  assert.match(row, /followLog\.current = log\.scrollHeight - log\.scrollTop - log\.clientHeight < 24;/, 'manual review of older output disables follow mode');
+});
+
 // ---------------------------------------------------------------------------------------------------------------------- #4783
 test('#4783 the three choices while an answer is written, as the web chat page has them, and only those three are valid', async () => {
   const { busyPlan, validWhileBusy, WHILE_BUSY } = await load('lib/while-busy.ts');
   assert.deepEqual([...WHILE_BUSY], ['wait', 'queue', 'interject']);
   assert.equal(busyPlan('wait'), 'refuse');
   assert.equal(busyPlan('queue'), 'goal', 'a running goal has its own queue in the host; with none, the message is parked');
-  assert.equal(busyPlan('interject'), 'interrupt');
+  assert.equal(busyPlan('interject'), 'steer', 'the saved Interrupt preference now sends to the active assistant');
   assert.equal(validWhileBusy('queue'), true);
   for (const bad of ['', 'steer', 'QUEUE', null, undefined, 3]) assert.equal(validWhileBusy(bad), false, String(bad));
 });
 
 test('#4783 the composer acts on the choice, the default keeps today\'s behaviour, and the parked message is sent when the chat is quiet', () => {
   const chat = src('screens/Chat.tsx');
-  assert.match(chat, /if \(plan === 'interrupt'\) \{\s*updateDraft\(''\);\s*clearQuotes\(session\.id\);\s*parkMessage\(session\.id, out\);\s*stopStreaming\(\);\s*return;\s*\}/);
+  const steer = chat.slice(chat.indexOf("if (plan === 'steer')"), chat.indexOf("void queueMessage(session.id"));
+  assert.match(steer, /steerMessage\(id, out\)/);
+  assert.match(src('lib/store.ts'), /await api\.post\('\/api\/chat\/steer', \{ sessionId, message \}\);/, 'the receipt leaves transcript ordering to the ordered agent stream');
+  assert.match(src('lib/store.ts'), /type === 'agent-follow-up'/, 'the agent stream records the accepted live message');
+  assert.match(steer, /if \(!delivered\) parkMessage\(id, out\)/);
+  assert.doesNotMatch(steer, /stopStreaming\(/);
   assert.match(chat, /if \(plan === 'goal'\) \{ clearQuotes\(session\.id\); parkMessage\(session\.id, out\); return; \}/);
   assert.match(chat, /pushToast\('info', tr\('The assistant is still answering'\)/, 'Wait still says so');
   assert.match(chat, /if \(!session \|\| !parkedReady\(session\.id, activeId, streaming, parked\?\.length \?\? 0\)\)\s*return;\s*const next = takeParked\(session\.id\);/);
@@ -354,9 +372,22 @@ test('#4783 the composer acts on the choice, the default keeps today\'s behaviou
   assert.match(src('screens/Settings.tsx'), /setWhileBusy\(value as typeof prefs\.whileBusy\)/);
 });
 
+test('live follow-ups split the streamed answer, so later agent text stays below the message that caused it', async () => {
+  const { isLiveFollowUp } = await load('lib/while-busy.ts');
+  assert.equal(isLiveFollowUp({ id: 'steer-1', role: 'user' }), true);
+  assert.equal(isLiveFollowUp({ id: 'prompt', role: 'user' }), false);
+  const store = src('lib/store.ts');
+  assert.match(store, /const continuationId = uid\('m'\);/);
+  assert.match(store, /messages: \[\.\.\.session\.messages\.slice\(0, replyIndex\), \{ \.\.\.reply, streaming: false \}, next, continuation/);
+  assert.match(store, /const continuation = recordAgentFollowUp\(sessionId, \{ id, text, at \}, assistantId\);\s*if \(continuation\) assistantId = continuation;/);
+  const chat = src('screens/Chat.tsx');
+  assert.doesNotMatch(chat, /visibleChatMessages/, 'the view keeps the persisted temporal order');
+  assert.match(chat, /session\?\.messages\.slice\(seenMessages\.current\)\.some\(message => message\.role === 'user'\)/, 'sending catches up even though the continuation is now the last row');
+});
+
 test('#4783 the new sentences are translated', async () => {
   const { tr, setTranslationLanguage } = await withI18n('approvals.ts');
-  const lines = ['While an answer is being written', 'What Enter does when you send a message while the assistant is still answering.', 'Wait for the answer', 'Send after the answer', 'Interrupt the answer', 'Enter sends it when the answer is done.', 'Enter stops the answer here and sends it now.', 'Waiting to send', 'Take back'];
+  const lines = ['While an answer is being written', 'What Enter does when you send a message while the assistant is still answering.', 'Wait for the answer', 'Send after the answer', 'Send a live message', 'Enter sends it when the answer is done.', 'Enter sends it at the next step, or after the answer if needed.', 'Waiting to send', 'Take back'];
   for (const l of languages.slice(1)) { setTranslationLanguage(l); for (const text of lines) assert.notEqual(tr(text), text, `${l}: ${text}`); }
   setTranslationLanguage('en');
 });
@@ -450,7 +481,7 @@ test('#4244 the tool is offered again, as the group "Questions for you", and the
   assert.match(catalog, /id: 'questions'[^\n]*plugins: \['tool-ask-user'\]/);
   const bridge = readFileSync(new URL('../server/agent/agent-bridge.mjs', import.meta.url), 'utf8');
   assert.match(bridge, /await rt\.gw\.answerEvent\(\{ clientId: entry\.clientId \?\? rt\.clientId, eventId: entry\.eventId, outcome \}\);/);
-  assert.match(bridge, /if \(!turn \|\| turn\.finished \|\| turn\.stopping \|\| turn\.goalRun \|\| turn\.plan \|\| !turn\.announceQuestion \|\| !items\.length\) \{\s*void runtime\.gw\.answerEvent\(\{ clientId: runtime\.clientId, eventId: value\.eventId, outcome: 'next' \}\)/, 'a helper question, a stopping chat or an empty request is still declared unanswerable');
+  assert.match(bridge, /if \(!turn \|\| turn\.finished \|\| turn\.stopping \|\| turn\.goalRun \|\| turn\.plan \|\| !turn\.announceQuestion \|\| !items\.length\) \{\s*void runtime\.gw\.answerEvent\(\{ clientId: runtime\.clientId, eventId: value\.eventId, outcome: 'next' \}\)/, 'a stopping or unattended chat or an empty request is still declared unanswerable');
   const gateway = readFileSync(new URL('../server/agent/gateway-client.mjs', import.meta.url), 'utf8');
   assert.match(gateway, /const wire = outcome === 'next' \? \{ kind: 'next' \} : \{ kind: 'result', value: outcome \};/, 'a structured answer travels as the result value');
   assert.match(src('components/ApprovalCard.tsx'), /asks\.map\(a => <QuestionCard key=\{a\.callId\} sessionId=\{sessionId!\} ask=\{a\}\/>\)/);

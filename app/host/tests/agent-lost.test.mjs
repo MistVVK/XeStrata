@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { replyCap, unescapeJsonTail, ToolDraft, cutCalls, cutNotice, cutNudge } from '../server/agent/reply-cut.mjs';
 import { TurnProjector } from '../server/agent/events.mjs';
 import { startScriptedWorker } from './helpers/scripted-worker.mjs';
-import { createAgentBridge, MAX_CUT_RETRIES } from '../server/agent/agent-bridge.mjs';
+import { createAgentBridge, MAX_RECOVERY_PROMPTS } from '../server/agent/agent-bridge.mjs';
 import { resolveHarness } from '../server/agent/harness-runtime.mjs';
 import { localOutputBudget } from '../server/agent/profile.mjs';
 
@@ -131,6 +131,15 @@ const words = frames => frames.filter(f => f.type === 'delta').map(f => f.text).
 const capOf = q => q.params.max_tokens ?? q.params.max_completion_tokens;
 const writes = r => r.worker.requests.filter(q => q.directive === 'cutwrite' || q.directive === 'cutalways');
 
+test('a reasoning-only length cutoff reports the limit without repeating the same decode', { skip }, async t => {
+  const r = await rig(t);
+  const out = [];
+  await r.bridge.runTurn({ ...r.base('thinkcut', f => out.push(f)), message: 'SCRIPT:thinkcut' });
+  assert.equal(r.worker.requests.filter(q => q.directive === 'thinkcut' && q.toolNames.length).length, 1);
+  assert.equal(out.at(-1).finishReason, 'length');
+  assert.equal(out.filter(f => f.type === 'delta' && f.noteReason === 'cut').length, 1);
+});
+
 test('every model request may produce half the window, not the 30 percent the Harness reserves for compaction', { skip }, async (t) => {
   const r = await rig(t);
   const out = [];
@@ -169,13 +178,13 @@ test('a reply cut inside a file write: the chat says so, the agent is asked to g
   assert.ok(drafts.some(f => f.draft.done && f.draft.lost && f.draft.target === 'big.txt' && f.draft.bytes > 1000), 'and taken down, with its file and size, when it was lost');
 });
 
-test(`a model that is cut every time is asked ${MAX_CUT_RETRIES} times, then the turn ends with a plain sentence, never silently`, { skip }, async (t) => {
+test(`a model that is cut every time is asked ${MAX_RECOVERY_PROMPTS} times, then the turn ends with a plain sentence, never silently`, { skip }, async (t) => {
   const r = await rig(t);
   const out = [];
   await r.bridge.runTurn({ ...r.base('c2', f => out.push(f)), message: 'SCRIPT:cutalways big.txt' });
-  assert.equal(writes(r).length, MAX_CUT_RETRIES + 1);
+  assert.equal(writes(r).length, MAX_RECOVERY_PROMPTS + 1);
   const notes = out.filter(f => f.type === 'delta' && f.noteReason === 'cut');
-  assert.equal(notes.length, MAX_CUT_RETRIES + 1, 'one sentence per cut');
+  assert.equal(notes.length, MAX_RECOVERY_PROMPTS + 1, 'one sentence per cut');
   assert.match(notes.at(-1).text, /that write did not happen\. Say “continue”/);
   const done = out.filter(f => f.type === 'done').at(-1);
   assert.ok(done, 'the turn ended');

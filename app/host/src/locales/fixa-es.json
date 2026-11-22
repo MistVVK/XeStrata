@@ -3,5 +3,14 @@
  "fixa02": "Tarda unos segundos.",
  "fixa03": "Pendiente de descargar",
  "fixa04": "Descargando un pequeño ayudante que acelera las respuestas. Esto solo ocurre una vez.",
- "fixa05": "Todavía se está comprobando. En el primer inicio puede tardar hasta un minuto."
+ "fixa05": "Todavía se está comprobando. En el primer inicio puede tardar hasta un minuto.",
+ "contextOptimizerHint": "Deja que un modelo local pequeño seleccione extractos de mensajes anteriores del asistente y resultados de herramientas cuando el asistente de programación necesita espacio. Desactivado de forma predeterminada. Si la selección falla, se usa el resumen habitual.",
+ "contextOptimizerConfigure": "Configurar modelo local",
+ "contextOptimizerEnable": "Activar Context Optimizer",
+ "contextOptimizerTimeout": "Tiempo de espera en segundos",
+ "contextOptimizerUnavailable": "Los ajustes de Context Optimizer no están disponibles.",
+ "contextOptimizerTest": "Probar modelo",
+ "contextOptimizerTestSuccess": "Prueba del modelo superada ({0} ms).",
+ "contextOptimizerTestFailure": "El modelo local no devolvió una selección válida. Comprueba el servidor, el ID del modelo y el tiempo de espera.",
+ "contextOptimizerSaved": "Guardado. La próxima solicitud al asistente aplica el cambio cuando terminen los chats activos."
 }

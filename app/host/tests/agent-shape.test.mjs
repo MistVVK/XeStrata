@@ -35,6 +35,20 @@ test('only this computer and private networks are shaped, never a cloud address'
   for (const no of ['https://api.openai.com/v1', 'http://8.8.8.8/v1', 'http://172.32.0.1/v1', 'http://example.com', 'nonsense']) assert.equal(isPrivateHost(no), false, no);
 });
 
+test('only native agent calls delegate a minimum completion to the server tokenizer', () => {
+  const body = { tools: [{ type: 'function' }], max_completion_tokens: 1 };
+  assert.deepEqual(shapeBody(body), body);
+  assert.deepEqual(shapeBody(body, { nativeAgent: true }), {
+    ...body, max_completion_tokens: 1024, strata_min_completion_tokens: 1024,
+  });
+  const title = { ...body, tools: [], max_completion_tokens: 32 };
+  assert.deepEqual(shapeBody(title, { nativeAgent: true }), title);
+  const expert = { ...body, max_completion_tokens: 4096 };
+  assert.deepEqual(shapeBody(expert, { nativeAgent: true, sampling: { max_tokens: 256 } }), { ...expert, max_completion_tokens: 256 });
+  const wide = { ...body, max_tokens: 8192, max_completion_tokens: undefined };
+  assert.deepEqual(shapeBody(wide, { nativeAgent: true }), { ...wide, strata_min_completion_tokens: 1024 });
+});
+
 test('the profile adds a response-settings copy of each shapeable route (local, or an OpenAI-style server on this network) and never of a cloud route', () => {
   const profile = buildProfile({
     local: [{ id: 'a', modelId: 'm', baseUrl: 'http://127.0.0.1:9001', context: 65536 }],
@@ -52,8 +66,8 @@ test('the profile adds a response-settings copy of each shapeable route (local, 
   assert.equal(profile.routes.find(r => r.connectionId === 'cloud').shaped, undefined);
   const doc = JSON.parse(profile.patch.slice(profile.patch.indexOf('[')));
   const providers = doc.find(e => e.id === 'llm-pi-ai').config.providers;
-  assert.equal(providers['api-lan'].compat.thinkingFormat, 'chat-template', 'a model server on this network gets the thinking vocabulary of a local model');
-  assert.equal(providers['api-lan'].models[0].reasoning, true);
+  assert.equal(providers['api-lan'].compat.thinkingFormat, undefined, 'the address does not pick a reasoning format');
+  assert.equal(providers['api-lan'].models[0].reasoning, undefined, 'unknown capabilities keep the provider default');
   assert.equal(providers['api-cloud'].compat?.thinkingFormat, undefined, 'a cloud service does not');   // (it may say "no store" field: #5903)
   const small = buildProfile({ local: [], connections: [{ id: 'own', name: 'Own', baseUrl: 'http://127.0.0.1:18798/v1', protocol: 'openai-chat', apiKey: '', models: [{ id: 'm', contextMax: 32768 }] }] });
   const own = JSON.parse(small.patch.slice(small.patch.indexOf('['))).find(e => e.id === 'llm-pi-ai').config.providers['api-own'];
@@ -92,7 +106,7 @@ test('the forwarding endpoint adds the settings, streams the reply back and pass
   assert.equal((await call('nope')).status, 404);
 });
 
-test('a turn uses the response-settings route only when a setting is changed: the model receives the sampling and the budget; defaults go straight to the model', { skip }, async (t) => {
+test('native agent requests carry the selected response settings and output cap at 512K', { skip }, async (t) => {
   const worker = await startScriptedWorker({});
   const dir = mkdtempSync(join(tmpdir(), 'strata-shape-'));
   const ws = join(dir, 'ws'); mkdirSync(ws, { recursive: true });
@@ -100,11 +114,12 @@ test('a turn uses the response-settings route only when a setting is changed: th
   const proxy = createLlmProxy({ targetOf: key => bridge.llmTarget(key), samplingNow: () => expert });
   front = http.createServer((req, res) => { const m = /^\/api\/internal\/agent-llm\/([^/]+)(\/.*)$/.exec(req.url); proxy(req, res, m[1], m[2]); });
   await new Promise(r => front.listen(0, '127.0.0.1', r));
-  bridge = createAgentBridge({ dataDir: dir, localInstances: () => [{ id: 'i', label: 'S', baseUrl: worker.url, modelId: 'scripted-model', context: 32768, slots: 2 }], connections: () => [], env: process.env, startTimeoutMs: 90_000,
+  bridge = createAgentBridge({ dataDir: dir, localInstances: () => [{ id: 'i', label: 'S', baseUrl: worker.url, modelId: 'scripted-model', context: 524288, slots: 2 }], connections: () => [], env: process.env, startTimeoutMs: 90_000,
     proxyBase: `http://127.0.0.1:${front.address().port}/api/internal/agent-llm`, expertSampling: () => expert });
   t.after(async () => { await bridge.close(); await worker.close(); front.close(); try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* best effort */ } });
   const run = (chatId, extra = {}) => bridge.runTurn({ chatId, message: 'SCRIPT:echo hello', workspacePath: ws, mode: 'bypass', onFrame: () => {}, ...extra });
-  const last = () => worker.requests.filter(r => r.directive === 'echo').at(-1).params;
+  const last = () => worker.requests.filter(r => r.directive === 'echo' && r.toolNames.length).at(-1).params;
+  const outputCap = () => last().max_completion_tokens ?? last().max_tokens;
 
   await run('s1', { thinking: 'High' });
   assert.equal(last().temperature, undefined, 'defaults: no sampling sent'); assert.equal(last().reasoning_budget_tokens, undefined);
@@ -124,8 +139,15 @@ test('a turn uses the response-settings route only when a setting is changed: th
   await run('s7', { thinking: 'Medium', thinkingBudget: 2048 });
   assert.equal(last().temperature, 0.2); assert.equal(last().reasoning_budget_tokens, 2048);
   expert = null;
-  await run('s8', { thinking: 'Medium' });
-  assert.equal(last().temperature, undefined, 'back to defaults: straight to the model again');
+  await run('s8', { thinking: 'Max', thinkingBudget: 0 });
+  assert.equal(last().temperature, undefined, 'no Expert sampling override');
+  assert.equal(last().chat_template_kwargs.reasoning_effort, 'high');
+  assert.equal(last().reasoning_budget_tokens, undefined, 'No limit leaves the budget to the server');
+  assert.equal(outputCap(), 65536);
+  expert = { max_tokens: 49152 };
+  await run('s9', { thinking: 'Max', thinkingBudget: 32768 });
+  assert.equal(last().reasoning_budget_tokens, 32768);
+  assert.equal(outputCap(), 49152);
 });
 
 test('a model server on this network gets picture input unless its own model list or the person says it does not read pictures', async () => {

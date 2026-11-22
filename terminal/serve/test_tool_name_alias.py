@@ -257,5 +257,55 @@ class CollapsedUnderscoreNames(unittest.TestCase):
                     self.assertEqual((parser.unread, parser.unread_names), (1, [written]))
 
 
+
+class McpPrefixDrift(unittest.TestCase):
+    """A client that declares MCP tools as `mcp__server__tool` beside plain tools.  Qwen3.8-Flash-Next carries the
+    `mcp__` over to a plain tool (`mcp__web_fetch` for `web_fetch`), drops it from an MCP tool (`files__read_file`), or
+    keeps it and drops the server (`mcp__read_file`).  Each is a spelling of one declared tool; a different server name
+    or an ambiguous spelling stays text and is named for the client."""
+    TOOLS = [plain_tool("web_fetch"), plain_tool("memory"), plain_tool("mcp__files__read_file"),
+             plain_tool("mcp__files__list_dir")]
+
+    def calls(self, written, tools=None, width=0):
+        evs, parser = run_parser("Fetching it.\n" + call_text(written), tools or self.TOOLS, width)
+        return [e.call for e in evs if e.kind == "tool_call"], evs, parser
+
+    def test_the_prefix_on_a_plain_tool_is_that_tool(self):
+        for written, declared in (("mcp__web_fetch", "web_fetch"), ("mcp__memory", "memory")):
+            for width in (0, 1, 5):
+                with self.subTest(written=written, width=width):
+                    found, evs, parser = self.calls(written, width=width)
+                    self.assertEqual([c.name for c in found], [declared])
+                    self.assertEqual(found[0].arguments, {"url": "https://example.com"})
+                    self.assertEqual(text_of(evs).strip(), "Fetching it.")
+                    self.assertEqual((parser.unread, parser.unread_names), (0, []))
+
+    def test_an_mcp_tool_without_its_prefix_or_server_is_that_tool(self):
+        for written in ("files__read_file", "mcp__read_file"):
+            for width in (0, 3):
+                with self.subTest(written=written, width=width):
+                    found, _evs, _parser = self.calls(written, width=width)
+                    self.assertEqual([c.name for c in found], ["mcp__files__read_file"])
+
+    def test_a_declared_name_wins(self):
+        tools = self.TOOLS + [plain_tool("mcp__web_fetch")]
+        found, _evs, _parser = self.calls("mcp__web_fetch", tools)
+        self.assertEqual([c.name for c in found], ["mcp__web_fetch"])
+
+    def test_a_plain_tool_and_an_mcp_member_of_the_same_name_are_not_guessed(self):
+        tools = self.TOOLS + [plain_tool("read_file")]
+        found, evs, parser = self.calls("mcp__read_file", tools)
+        self.assertEqual(found, [])
+        self.assertIn("mcp__read_file", text_of(evs))
+        self.assertEqual(parser.unread_names, ["mcp__read_file"])
+
+    def test_a_different_server_name_stays_text(self):
+        for written in ("mcp__flies__read_file", "mcp__Files__read_file"):
+            with self.subTest(written=written):
+                found, evs, parser = self.calls(written)
+                self.assertEqual(found, [])
+                self.assertEqual(parser.unread_names, [written])
+
+
 if __name__ == "__main__":
     unittest.main()

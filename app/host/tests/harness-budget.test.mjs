@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
-import { HARNESS_BUDGET_PATCH, patchStagedHarnessBudget } from '../../desktop/scripts/harness-budget.mjs';
+import { HARNESS_BUDGET_PATCH, patchStagedHarnessBudget, prepareStagedHarnessBudget } from '../../desktop/scripts/harness-budget.mjs';
 
 // Exact MIT-licensed pi-ai 1.1.0 module; arithmetic fixture, not native tokenization.
 const original = readFileSync(new URL('./fixtures/pi-ai-1.1.0-simple-options.js.fixture', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
@@ -107,6 +107,17 @@ test('a repeated patch rejects already-changed bytes without writing again', t =
   const f = patched(t), before = readFileSync(f.file);
   assert.throws(() => patchStagedHarnessBudget(f.root), /unexpected simple-options.js SHA-256/);
   assert.deepEqual(readFileSync(f.file), before);
+});
+
+test('desktop bundling repairs a stale stage, records provenance and refuses subsequent drift', t => {
+  const f = staged(t), manifest = join(f.root, 'BUNDLE.json');
+  writeFileSync(manifest, JSON.stringify({ component: 'deepseek-harness', patches: [{ id: 'other' }] }));
+  const patch = prepareStagedHarnessBudget(f.root);
+  assert.deepEqual(JSON.parse(readFileSync(manifest, 'utf8')).patches, [{ id: 'other' }, patch]);
+  assert.deepEqual(prepareStagedHarnessBudget(f.root), patch);
+  writeFileSync(f.file, original);
+  assert.throws(() => prepareStagedHarnessBudget(f.root), /staged bytes do not match/);
+  assert.equal(readFileSync(f.file, 'utf8'), original);
 });
 
 test('staging refuses a module hardlinked to another copy', t => {

@@ -545,7 +545,11 @@ cases.helper = async () => {
 
 /* ------------------------------------------------------------------------------------------------------------------- #4783 */
 cases.busy = async () => {
-  const fresh = (scheme, w, h, whileBusy) => open(scheme, w, h, [chat('s1', 'Busy', [])], { prefs: whileBusy ? { whileBusy } : {} });
+  const fresh = (scheme, w, h, whileBusy) => {
+    const session = chat('s1', 'Busy', []);
+    session.preferences.agent = false;
+    return open(scheme, w, h, [session], { prefs: whileBusy ? { whileBusy } : {} });
+  };
   const send = async (page, text) => { await page.locator('textarea').first().fill(text); await page.keyboard.press('Enter'); };
   const lastReply = page => page.locator('.st-msg--assistant .st-bubble').last();
   for (const scheme of ['light', 'dark']) {
@@ -578,22 +582,23 @@ cases.busy = async () => {
     check(/w79/.test(firstText), `${tag}: Send after: the first answer was written to its end`, firstText.slice(-30));
     check(/the second answer/.test(await lastReply(page).innerText()), `${tag}: Send after: then the second message was answered`);
     await page.context().close();
-    // Interrupt: the answer stops where it is, what is written stays, and the message goes at once.
+    // A plain chat cannot steer. Its follow-up waits without stopping the current answer.
     page = await fresh(scheme, w, h, 'interject');
-    await send(page, 'SCRIPT:slow 600');
+    let stopped = false;
+    page.on('request', request => { if (new URL(request.url()).pathname === '/api/chat/stop') stopped = true; });
+    await send(page, 'SCRIPT:slow 80');
     await page.locator('.st-msg--assistant').first().waitFor({ timeout: 15000 });
     await page.waitForTimeout(800);
-    await page.locator('textarea').first().fill('SCRIPT:echo interrupted and answered');
-    check(/Enter stops the answer here and sends it now/.test(await page.locator('.composer__busy-hint').innerText()), `${tag}: Interrupt: the hint says what Enter will do`);
-    await page.keyboard.press('Enter');
-    const t0 = Date.now();
+    await page.locator('textarea').first().fill('SCRIPT:echo follow-up answered');
+    check(/Enter sends it at the next step, or after the answer if needed/.test(await page.locator('.composer__busy-hint').innerText()), `${tag}: Live message: the hint covers the fallback`);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.locator('.parked').waitFor({ timeout: 3000 });
     await page.locator('.st-msg--assistant').nth(1).waitFor({ timeout: 30000 });
-    check(Date.now() - t0 < 12000, `${tag}: Interrupt: the new message was answered long before the first answer would have ended`, `${Date.now() - t0} ms`);
-    const cut = await page.locator('.st-msg--assistant .st-bubble').first().innerText();
-    check(cut.includes('w0') && !cut.includes('w599'), `${tag}: Interrupt: the first answer stopped where it was and stays`, `${cut.length} characters`);
-    await page.waitForFunction(() => /interrupted and answered/.test([...document.querySelectorAll('.st-msg--assistant .st-bubble')].at(-1)?.innerText ?? ''), null, { timeout: 15000 }).catch(() => {});
-    check(/interrupted and answered/.test(await lastReply(page).innerText()), `${tag}: Interrupt: the second message was answered`);
-    if (scheme === 'light') await shot(page, `4783-${tag}-interrupted`);
+    const finished = await page.locator('.st-msg--assistant .st-bubble').first().innerText();
+    check(finished.includes('w79') && !stopped, `${tag}: Live message: the first answer runs to completion without Stop`);
+    await page.waitForFunction(() => /follow-up answered/.test([...document.querySelectorAll('.st-msg--assistant .st-bubble')].at(-1)?.innerText ?? ''), null, { timeout: 15000 });
+    check(/follow-up answered/.test(await lastReply(page).innerText()), `${tag}: Live message: the parked follow-up is answered`);
+    if (scheme === 'light') await shot(page, `4783-${tag}-follow-up`);
     check(page.problems.length === 0, `${tag}: no page error`, page.problems.join('; '));
     await page.context().close();
   }
@@ -768,6 +773,22 @@ INFO after:  ${JSON.stringify(sel1.slice(0, 40))} ... ${JSON.stringify(sel1.slic
     check(Math.abs(top1 - top0) < 40, 'streaming: the view is not pulled away from the selection', `${Math.round(top0)} -> ${Math.round(top1)}`);
   } else console.log('INFO streaming: the older reply was not on screen, nothing to select');
   await page2.context().close();
+};
+
+cases['pause-for-update'] = async () => {
+  const page = await open('light', 900, 720, [chat('pause-chat', 'Update', [])], { prefs: { language: 'de' }, locale: 'de-DE' });
+  const button = page.getByRole('button', { name: 'Für Update pausieren', exact: true });
+  await button.waitFor({ state: 'visible' });
+  await shot(page, 'pause-for-update');
+  await page.setViewportSize({ width: 390, height: 800 });
+  const bounds = await button.boundingBox();
+  check(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 390, 'the pause button fits a narrow chat window');
+  const response = page.waitForResponse(r => r.url().endsWith('/api/chat/pause-for-update') && r.request().method() === 'POST');
+  await button.click();
+  const result = await response;
+  check(result.ok() && existsSync((await result.json()).checkpoint), 'the visible German chat button saves a checkpoint');
+  await page.getByText('Arbeitsstand gesichert. Bereit für das Update.', { exact: true }).waitFor();
+  await page.context().close();
 };
 
 /* ------------------------------------------------------------------------------------------------------------------ run */

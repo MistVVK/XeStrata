@@ -93,6 +93,24 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     mine = user_args.capture(cfg)
     if mine:
         args = user_args.merge(args, mine)
+    # #6497: honor a configured CPU thread limit (`--pool-workers N`) on Inkling by translating it to `--threads N`.
+    if "--pool-workers" in args:
+        pw_val = None
+        out_args: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--pool-workers":
+                if i + 1 < len(args) and not str(args[i + 1]).startswith("--"):
+                    pw_val = str(args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            else:
+                out_args.append(args[i])
+                i += 1
+        args = out_args
+        if pw_val and pw_val.isdigit() and int(pw_val) > 0 and "--threads" not in args:
+            args += ["--threads", pw_val]
     # Propagate top-level cfg["parallel"] (1..64) into `--parallel <N>` when not explicitly in args
     par = cfg.get("parallel")
     if isinstance(par, int) and 1 <= par <= inkling_family.MAX_PARALLEL and "--parallel" not in args:

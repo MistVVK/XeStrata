@@ -19,7 +19,8 @@ import { materializeSkills, parseSkillFile, skillSlug, writeCreatedSkill } from 
 import { systemFonts } from './fonts.mjs';
 import { tuningDir } from './platform-paths.mjs';
 import { createAgentBridge, plainTurnFailure } from './agent/agent-bridge.mjs';
-import { mcpSkippedNotices, setCompactionChoice, compactionNumber, thresholdRatio, headroomFraction, compactionThreshold, localOutputBudget, DEFAULT_THRESHOLD_RATIO, DEFAULT_HEADROOM_FRACTION } from './agent/profile.mjs';
+import { contextOptimizerSettings, probeContextOptimizer, savedContextOptimizer } from './agent/context-optimizer.mjs';
+import { connectionReasoningEfforts, mcpSkippedNotices, setCompactionChoice, compactionNumber, thresholdRatio, headroomFraction, compactionThreshold, localOutputBudget, DEFAULT_THRESHOLD_RATIO, DEFAULT_HEADROOM_FRACTION } from './agent/profile.mjs';
 import { createAgentTools } from './agent/tools-settings.mjs';
 import { withPlainStatus } from './agent/status.mjs';
 import { findBrowser, findPlaywrightMcp } from './agent/browser-probe.mjs';
@@ -48,7 +49,8 @@ import * as engine from './engine.mjs';
 import * as monitor from './monitor.mjs';
 import * as serving from './serving.mjs';
 import * as store from './store.mjs';
-import { createChatStore, storeFailure } from './chat-store.mjs';
+import { createChatStore, storeFailure, validChatId } from './chat-store.mjs';
+import { busyHelper, createHelperRecords, recordFor, validHelperId } from './chat-helper-records.mjs';
 import { makePrivateDir } from './private-file.mjs';
 import * as supervisor from './supervisor.mjs';
 import { detectBackend, currentBackend, streamChat, inferenceLine } from './inference.mjs';
@@ -126,6 +128,7 @@ const insideApp = path => { const rel = relative(ROOT, resolve(path)); return re
 const hub = new EventHub();
 /** The chats, as files in the profile's data folder (chat-store.mjs). */
 const chatStore = createChatStore({ dir: store.DATA_DIR, privateDir: makePrivateDir });
+const helperRecords = createHelperRecords(chatStore.root);
 const modelProviders = createModelProviders({ directory: store.DATA_DIR, knownThinks: (connection, modelId) => visionProbe.knownThinks(connection, modelId), changed: value => hub.send('providers', withPictureAnswers(value)) });
 const imageModels = createImageModels({ dataDir: store.DATA_DIR, modelsDir: () => store.MODELS_DIR, real: models.REAL, changed: value => hub.send('image-models', value) });
 /* The installed app ships Strata Control (python + strata_control) next to the host; a source checkout has none and keeps its older paths. */
@@ -170,7 +173,7 @@ if (control) {
     return answer && !answer.usable && bundledWrongMake ? { ...answer, notice: bundledWrongMake, wrongMake: true } : answer;
   };
 }
-const native=createNativeControl({control,ready:bundledEngine,appUpdater,hardwareProbe:()=>(hardware.cachedHardware()?.gpus??[]).map((g,n)=>({index:g.index??n,vram_gb:g.vramGb})),directory:store.DATA_DIR,modelsDirectory:()=>store.MODELS_DIR,nativeDataDirectory:store.nativeDataDirectory,beforeLoad:async()=>{if(models.REAL&&models.library().loaded){if(serving.state().requests.some(r=>runtimeModels.state().instances.some(i=>i.id===r.instanceId)&&["queued","generating"].includes(r.state)))throw new Error("Finish requests before switching engines.");await models.unload();runtimeState();}},requests:()=>serving.state().requests,changed:value=>hub.send('native',value)});
+const native=createNativeControl({control,beforeUpdate:()=>agent.prepareForUpdate(),ready:bundledEngine,appUpdater,hardwareProbe:()=>(hardware.cachedHardware()?.gpus??[]).map((g,n)=>({index:g.index??n,vram_gb:g.vramGb})),directory:store.DATA_DIR,modelsDirectory:()=>store.MODELS_DIR,nativeDataDirectory:store.nativeDataDirectory,beforeLoad:async()=>{if(models.REAL&&models.library().loaded){if(serving.state().requests.some(r=>runtimeModels.state().instances.some(i=>i.id===r.instanceId)&&["queued","generating"].includes(r.state)))throw new Error("Finish requests before switching engines.");await models.unload();runtimeState();}},requests:()=>serving.state().requests,changed:value=>hub.send('native',value)});
 /* The agent: chats become DeepSeek Harness sessions when that component is installed. It is a separate
    pinned component (STRATA_HARNESS_DIR), not part of this host, so its absence is a visible capability
    state and the chat falls back to the direct path with a notice, never silently to another model. */
@@ -186,7 +189,7 @@ function withPictureAnswers(list) {
     const asked = visionProbe.known(c, m.id);
     if ((m.vision == null || m.reasoning == null) && asked === undefined && c.protocol === 'openai-chat' && secrets.has(c.id)) void visionProbe.check(secrets.get(c.id), m.id).catch(() => {});
     // Pictures are on unless the person or the server says no; a model that thinks says so too (OpenRouter's supported_parameters).
-    return { ...m, reads: readsPicturesByDefault(m, asked), thinks: m.reasoning ?? visionProbe.knownThinks(c, m.id) ?? null };
+    return { ...m, reads: readsPicturesByDefault(m, asked), thinks: !!connectionReasoningEfforts(c, { reasoning: m.reasoning ?? visionProbe.knownThinks(c, m.id) }) };
   }) }));
   return { ...list, connections };
 }
@@ -199,7 +202,9 @@ async function pictureRefusal(connection, model) {
   const fix = `open Settings → Models, edit "${connection.name}" and turn on "Read pictures with this model"`;
   return `"${model.name}" is set not to read pictures (or its server says it cannot: a llama-server started without --mmproj, or a text-only model). If that is wrong, ${fix}. Otherwise choose a model that reads pictures.`;
 }
+const optimizerSettings = () => savedContextOptimizer(store.get().agentChat?.contextOptimizer);
 const agent = createAgentBridge({
+  contextOptimizer: optimizerSettings,
   tools: () => agentTools.profileView(),
   skillsDir: () => AGENT_SKILLS,
   onGoal: (chatId, goal) => hub.send('goal', { chatId, goal }),
@@ -661,7 +666,7 @@ async function runAgentTurn({ res, controller, chatId, body, message, workspaceI
       : researchLine ? await agent.researchCommand({ ...turnOptions, line: researchLine[1] ?? '' })
       : planLine ? await agent.planCommand({ ...turnOptions, line: planLine[1] ?? '' })
       : goalLine ? await agent.goalCommand({ ...turnOptions, line: goalLine[1] ?? '' }) : await agent.runTurn(turnOptions);
-    if (result?.detached) void result.ended.then(r => settle(r?.tokensOut ?? null), () => settle(null));
+    if (result?.detached) void result.ended.then(r => settle(r?.tokensOut ?? null, r?.failure ? 'The agent turn failed.' : undefined), () => settle(null));
     else settle(result?.tokensOut ?? null, result?.error ? 'The agent turn failed.' : undefined);
   } catch (err) {
     const plain = plainTurnFailure(err);
@@ -1030,6 +1035,21 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+async function savedChat(sessionId) {
+  const text = await chatStore.read(sessionId);
+  return text ? JSON.parse(text).session : null;
+}
+
+function chatHelperRow(sessionId, helperId, saved) {
+  if (Array.isArray(saved?.dismissedAgentIds) && saved.dismissedAgentIds.includes(helperId)) return null;
+  const recent = agent.helperState(sessionId, helperId);
+  const rows = Array.isArray(saved?.agents) ? saved.agents : [];
+  const row = recent ?? rows.find(row => row?.id === helperId) ?? null;
+  return busyHelper(row) && (!recent || !agent.isRunning(sessionId))
+    ? { ...row, status: 'cancelled', description: 'This helper is no longer running.' }
+    : row;
+}
+
 async function api(req, res, path, method, url) {
   if(path==='/api/fonts'&&method==='GET')return json(res,200,await systemFonts());
   // --- chats: one file each in the data folder -----------------------------
@@ -1065,6 +1085,7 @@ async function api(req, res, path, method, url) {
       }
       if (id && method === 'DELETE') {
         const removed = await chatStore.remove(id);
+        try { helperRecords.forget(id); } catch (err) { console.warn('[strata] Could not remove helper history:', err.code); }
         hub.send('chats', { id, deleted: true, from });
         return json(res, 200, removed);
       }
@@ -1080,6 +1101,12 @@ async function api(req, res, path, method, url) {
   if(path.startsWith('/api/native')){try{
   if(path==='/api/native'&&method==='GET')return json(res,200,await native.refresh(url.searchParams.get('refresh')==='1'));
   if(path==='/api/native'&&method==='PATCH')return json(res,200,await native.configure(await readBody(req)));
+  if(path==='/api/native/ram-reserve'&&method==='GET')return json(res,200,native.ramReserve());
+  if(path==='/api/native/ram-reserve'&&method==='POST')return json(res,200,native.saveRamReserve((await readBody(req))?.gib));
+  if(path==='/api/native/model-port'&&method==='GET')return json(res,200,native.modelPort());
+  if(path==='/api/native/model-port'&&method==='POST')return json(res,200,native.saveModelPort((await readBody(req))?.port??null));
+  if(path==='/api/native/prompt-cache-spread'&&method==='GET')return json(res,200,native.promptCacheSpread());
+  if(path==='/api/native/prompt-cache-spread'&&method==='POST')return json(res,200,native.savePromptCacheSpread((await readBody(req))?.enabled??null));
   if(path==='/api/native/directory'&&method==='POST')return json(res,200,native.setDownloadDirectory((await readBody(req)).directory));
   /* Settings > Storage > Models folder: pick (or type) a folder, say what it means, then start the choice. Copying is Control's (strata models move). */
   if(path==='/api/native/models-folder/plan'&&method==='POST'){
@@ -1977,6 +2004,28 @@ async function api(req, res, path, method, url) {
   }
   // When the assistant summarises an old part of a chat (Settings -> Chat). null puts a name back to automatic;
   // the running assistant picks the new number up on its next message (it is part of the profile's signature).
+  if (path === '/api/agent/context-optimizer' || path === '/api/agent/context-optimizer/test') {
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) {
+      return error(res, 403, 'Open the local Strata app to manage Context Optimizer.');
+    }
+    if (path === '/api/agent/context-optimizer' && method === 'GET') return json(res, 200, optimizerSettings());
+    if (method !== 'POST') return error(res, 405, 'Method not allowed.');
+    const body = await readBody(req, 4096);
+    let config;
+    try { config = contextOptimizerSettings(body); }
+    catch (e) { return error(res, 400, e.message); }
+    if (path.endsWith('/test')) {
+      if (!config.baseUrl || !config.model) return error(res, 400, 'Enter a local server address and model ID to test.');
+      const start = performance.now();
+      const signal = new AbortController();
+      res.once('close', () => signal.abort());
+      const ok = await probeContextOptimizer(config, signal.signal);
+      if (res.destroyed) return;
+      return json(res, 200, { ok, durationMs: Math.round(performance.now() - start) });
+    }
+    store.update({ agentChat: { ...(store.get().agentChat ?? {}), contextOptimizer: config } });
+    return json(res, 200, config);
+  }
   if (path === '/api/agent/compaction' && method === 'GET') return json(res, 200, compactionView());
   if (path === '/api/agent/helper-limit' && method === 'GET') return json(res, 200, { helperLimitMin: helperLimitMin(store.get().agentChat?.helperLimitMin) });
   if (path === '/api/agent/helper-limit' && method === 'POST') {
@@ -2021,6 +2070,17 @@ async function api(req, res, path, method, url) {
     try { return json(res, 200, agent.planControl({ chatId: String(body.sessionId ?? body.chatId ?? ''), planId: typeof body.planId === 'string' ? body.planId : null, action: planAct[1], steps: body.steps, title: body.title })); }
     catch (e) { return error(res, e.code === 'plan-gone' || e.code === 'plan-used' ? 409 : 400, e.message); }
   }
+  if (path === '/api/chat/pause-for-update' && method === 'POST') {
+    try { return json(res, 200, await agent.prepareForUpdate()); }
+    catch (e) { return error(res, 409, e.message); }
+  }
+  // A follow-up for the live parent on the same Harness session.
+  if (path === '/api/chat/steer' && method === 'POST') {
+    const { sessionId, message } = await readBody(req);
+    if (!validChatId(sessionId)) return error(res, 400, 'That is not a chat id.');
+    try { return json(res, 200, await agent.steerMessage({ chatId: sessionId, text: message })); }
+    catch (e) { return error(res, e.code === 'steer-idle' ? 409 : e.code === 'steer-empty' ? 400 : 502, e.message); }
+  }
   // Messages typed while a goal runs: queued (shown as queued), taken back, or listed.
   if (path === '/api/chat/queue' && method === 'GET') return json(res, 200, agent.takeQueue(url.searchParams.get('sessionId') ?? '', { release: url.searchParams.get('release') === '1' }));
   if (path === '/api/chat/queue' && method === 'POST') {
@@ -2034,11 +2094,67 @@ async function api(req, res, path, method, url) {
     try { return json(res, 200, await agent.answerQuestion({ chatId: String(body.sessionId ?? ''), callId: String(body.callId ?? ''), answers: body.answers, skip: body.skip === true })); }
     catch (e) { return error(res, e.code === 'question-gone' ? 409 : 400, e.message); }
   }
-  // A message for one helper (#4749).
+  if (path === '/api/chat/helpers' && method === 'GET') {
+    const sessionId = url.searchParams.get('sessionId');
+    if (!validChatId(sessionId)) return error(res, 400, 'That is not a chat id.');
+    return json(res, 200, helperRecords.read(sessionId));
+  }
+  if (path === '/api/chat/helpers' && method === 'POST') {
+    const { sessionId, action, helperIds } = await readBody(req);
+    if (!validChatId(sessionId) || !['archive', 'restore'].includes(action) ||
+        !Array.isArray(helperIds) || !helperIds.length || !helperIds.every(validHelperId)) {
+      return error(res, 400, 'Choose the helpers you want to update.');
+    }
+    const saved = await savedChat(sessionId);
+    const records = helperRecords.read(sessionId);
+    const ids = [...new Set(helperIds)].filter(id => {
+      if (action === 'restore') return recordFor(records, id)?.archived;
+      const row = chatHelperRow(sessionId, id, saved);
+      return row && !busyHelper(row);
+    });
+    if (!ids.length && action === 'restore') return json(res, 200, records);
+    if (!ids.length) return error(res, 409, 'No helpers could be updated. A helper that is still running must finish or be stopped first.');
+    return json(res, 200, helperRecords.archive(sessionId, ids, action === 'archive'));
+  }
+  // A message for one helper (#4749). A receipt means the Harness accepted it for delivery.
   if (path === '/api/chat/helper' && method === 'POST') {
-    const body = await readBody(req);
-    try { return json(res, 200, await agent.messageHelper({ chatId: String(body.sessionId ?? ''), helperId: body.helperId, text: body.message, delivery: body.delivery })); }
+    const { sessionId, helperId, message, delivery } = await readBody(req);
+    if (!validChatId(sessionId) || !validHelperId(helperId)) return error(res, 400, 'That helper is not known.');
+    if (recordFor(helperRecords.read(sessionId), helperId)?.archived &&
+        !(agent.isRunning(sessionId) && busyHelper(agent.helperState(sessionId, helperId)))) {
+      return error(res, 409, 'Restore this helper before sending it a message.');
+    }
+    const text = typeof message === 'string' ? message.trim().slice(0, 8000) : '';
+    let receipt;
+    try { receipt = await agent.messageHelper({ chatId: sessionId, helperId, text, delivery }); }
     catch (e) { return error(res, e.code === 'helper-idle' || e.code === 'helper-refused' ? 409 : 400, e.message); }
+    try {
+      return json(res, 200, { ...receipt, message: helperRecords.message(sessionId, helperId, receipt, text) });
+    } catch (err) {
+      // The helper already has the message. Returning a delivery error would invite a duplicate.
+      console.warn('[strata] Could not save helper message history:', err.code);
+      return json(res, 200, { ...receipt, historySaved: false });
+    }
+  }
+  if (path === '/api/chat/helper/stop' && method === 'POST') {
+    const body = await readBody(req);
+    try { return json(res, 200, await agent.stopHelper({ chatId: String(body.sessionId ?? ''), helperId: body.helperId })); }
+    catch (e) { return error(res, e.code === 'helper-gone' ? 409 : 400, e.message); }
+  }
+  if (path === '/api/chat/helper/window' && method === 'POST') {
+    const { sessionId, helperId, name } = await readBody(req);
+    if (!validChatId(sessionId) || !validHelperId(helperId)) return error(res, 400, 'That helper is not known.');
+    try { return json(res, 200, await appUi.openHelper(sessionId, helperId, String(name ?? '').slice(0, 80))); }
+    catch (e) { return error(res, 502, e.message); }
+  }
+  if (path === '/api/chat/helper/state' && method === 'GET') {
+    const sessionId = url.searchParams.get('sessionId') ?? '';
+    const helperId = url.searchParams.get('helperId') ?? '';
+    if (!validChatId(sessionId) || !validHelperId(helperId)) return error(res, 400, 'That helper is not known.');
+    const recent = agent.helperState(sessionId, helperId);
+    const active = agent.isRunning(sessionId);
+    if (recent && active) return json(res, 200, { agent: recent, active });
+    return json(res, 200, { agent: chatHelperRow(sessionId, helperId, await savedChat(sessionId)), active });
   }
   if (path === '/api/chat/queue/cancel' && method === 'POST') {
     const body = await readBody(req);

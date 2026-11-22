@@ -104,6 +104,24 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     mine = user_args.capture(cfg)
     if mine:
         args = user_args.merge(args, mine)
+    # #6497: honor a configured CPU thread limit (`--pool-workers N`) on Hy4 by translating it to `--threads N`.
+    if "--pool-workers" in args:
+        pw_val = None
+        out_args: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--pool-workers":
+                if i + 1 < len(args) and not str(args[i + 1]).startswith("--"):
+                    pw_val = str(args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            else:
+                out_args.append(args[i])
+                i += 1
+        args = out_args
+        if pw_val and pw_val.isdigit() and int(pw_val) > 0 and "--threads" not in args:
+            args += ["--threads", pw_val]
     wants_images = "--vision" in args
     need_draft = "--draft" not in args and wants_drafter(cfg)
     info = probe(exe, args, cfg) if (exe and (wants_images or need_draft)) else None

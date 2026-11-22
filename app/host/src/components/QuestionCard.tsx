@@ -29,6 +29,7 @@ export function QuestionCard({ sessionId, ask }: { sessionId: string; ask: Agent
         catch (e) { setProblem(plainFailureText(e instanceof Error ? e.message : String(e)).message); setBusy(false); }
     }
     return <section className="askcard askq" role="group" aria-label={tr("The assistant has a question for you")}>
+      {ask.agentName && <p className="xs muted">{ask.agentName}</p>}
       {ask.questions.map(q => {
         const cur = current(q);
         return <div className="askq__item" key={q.id}>

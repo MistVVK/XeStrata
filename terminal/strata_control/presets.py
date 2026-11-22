@@ -133,6 +133,32 @@ def slot_key(choices: dict[str, Any], model_digest: str | None) -> str:
 
 # --------------------------------------------------------------------------- identity and staleness
 
+def memory_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Launch inputs that affect where a conversation can be kept."""
+    args = [str(arg) for arg in cfg.get("args") or []]
+    flags = {}
+    for flag, value in zip(args, args[1:]):
+        if (flag.startswith(("--conversation-cache-", "--conversation-spill-", "--prompt-cache-"))
+                or flag in ("--ram-keep-gib", "--resident-budget-gib", "--prompt-cache")) and not value.startswith("--"):
+            flags[flag] = value
+    switches = ("--prompt-cache-tail", "--prompt-cache-spread", "--resident-experts",
+                "--resident-cpu-experts", "--mmap-experts")
+    flags.update({flag: True for flag in switches if flag in args})
+    configured = cfg.get("env") or {}
+    reserve_names = ("STRATA_RAM_KEEP_GIB", "STRATA_RESIDENT_HEADROOM_GIB")
+    env = {key: str(configured[key]) if key in configured else os.environ[key]
+           for key in reserve_names if key in configured or key in os.environ}
+    return {"args": flags, "env": env}
+
+
+def engine_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    if not old or not new:
+        return False
+    if int(old.get("tuning_epoch") or 0) != int(new.get("tuning_epoch") or 0):
+        return True
+    return bool(old.get("sha256") and new.get("sha256") and old["sha256"] != new["sha256"])
+
+
 def current_identity(cfg: dict[str, Any], *, exe: str | None = None, pcie: str | None = None) -> dict[str, Any]:
     """The identity this PC, engine and model file have now."""
     from strata_control import engine_component
@@ -152,7 +178,8 @@ def current_identity(cfg: dict[str, Any], *, exe: str | None = None, pcie: str |
             engine_path = cfg.get("exe")
     return {"hardware": tune_machine.hardware_identity(pcie=pcie),
             "engine": tune_machine.engine_identity(engine_path) if engine_path else {},
-            "model": tune_machine.model_identity([first]) if first and Path(first).is_file() else {}}
+            "model": tune_machine.model_identity([first]) if first and Path(first).is_file() else {},
+            "memory_policy": memory_policy(cfg)}
 
 
 def staleness(preset: dict[str, Any], now: dict[str, Any], *, today: float | None = None) -> dict[str, Any]:
@@ -178,12 +205,10 @@ def staleness(preset: dict[str, Any], now: dict[str, Any], *, today: float | Non
     oe, ne = (old.get("engine") or {}), (now.get("engine") or {})
     if oe.get("backend") and ne.get("backend") and oe["backend"] != ne["backend"]:
         hard.append("the engine's graphics backend changed")
-    if oe and ne and int(oe.get("tuning_epoch") or 0) != int(ne.get("tuning_epoch") or 0):
-        soft.append("the engine was updated in a way that can change speed")
-    elif oe.get("version") and ne.get("version") and oe["version"] != ne["version"] and \
-            oe.get("sha256") and ne.get("sha256") and oe["sha256"] != ne["sha256"] and \
-            int(oe.get("tuning_epoch") or 0) != int(ne.get("tuning_epoch") or 0):
-        soft.append("the engine was updated")
+    if engine_changed(oe, ne):
+        soft.append("the engine build changed")
+    if "memory_policy" in now and old.get("memory_policy") != now["memory_policy"]:
+        soft.append("the RAM and conversation cache settings have not been checked for this tuning")
     os_, ns = (old.get("hardware") or {}).get("soft") or {}, (now.get("hardware") or {}).get("soft") or {}
     if os_.get("driver") and ns.get("driver") and os_["driver"] != ns["driver"]:
         soft.append("the graphics driver changed")

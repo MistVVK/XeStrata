@@ -1407,6 +1407,7 @@ class AdvancedScreen(Base):
 
     BINDINGS = Base.BINDINGS + [
         Binding("e", "edit", show=False), Binding("delete", "reset", show=False), Binding("backspace", "reset", show=False),
+        Binding("ctrl+h", "reset", show=False),
         Binding("x", "experimental", show=False), Binding("slash", "filter", show=False), Binding("a", "add", show=False),
         Binding("c", "copy", show=False), Binding("n", "go_next", show=False), Binding("right", "go_next", show=False),
         Binding("tab", "scroll_command", show=False)]
@@ -1583,12 +1584,33 @@ class AdvancedScreen(Base):
         cur = self.menu().current
         if cur is None or cur.key in (None, "__add__"):
             return
-        if self.ctx.settings.extra.pop(cur.key, None) is not None:
+        key = cur.key
+        extra = self.ctx.settings.extra
+        popped = extra.pop(key, None)
+        if popped is None and isinstance(key, str) and key.startswith("--"):
+            popped = extra.pop(key[2:], None)
+        if popped is not None:
             self.ctx.invalidate_rows()
             self.rows = self.ctx.advanced_rows()
             self.build()
-            self.say(f"{cur.key} is back to the tuned value.")
+            self.say(f"{key} is back to the tuned value.")
             self.paint()
+            return
+        row = next((x for x in self.rows if x.name == key), None)
+        if row is not None and not row.known:
+            # #6519: an unknown (red-marked) flag coming from the installed or tuned config is not in s.extra yet;
+            # turning it off in s.extra removes it from this launch's command (pressing Del again puts it back).
+            extra[key] = "off"
+            self.ctx.invalidate_rows()
+            self.rows = self.ctx.advanced_rows()
+            self.build()
+            self.say(f"{key} turned off for this launch (Del again puts it back).")
+            self.paint()
+            return
+        if row is not None and row.tuned and row.tuned != row.default:
+            self.say(f"{key} is already at its tuned value.")
+        else:
+            self.say(f"{key} is already at its default value.")
 
     def action_experimental(self) -> None:
         if self.mode:

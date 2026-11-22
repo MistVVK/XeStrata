@@ -6,7 +6,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startScriptedWorker } from './helpers/scripted-worker.mjs';
@@ -124,6 +125,108 @@ test('two helpers run at the same time as two rows, the run ends when both have 
   assert.equal(r.worker.requests.filter(q => q.directive === 'slow').length, 2);
 });
 
+test('update preparation checkpoints two active helpers, confirms exit and fences new turns', { skip, timeout: 60_000 }, async t => {
+  const r = await rig(t);
+  const working = new Set();
+  execFileSync('git', ['init', '--quiet', r.ws]);
+  const file = join(r.ws, 'progress.txt');
+  writeFileSync(file, 'first result\n');
+  execFileSync('git', ['-C', r.ws, 'add', 'progress.txt']);
+  writeFileSync(file, 'next result\n');
+  let pause;
+  await r.run('update-chat', 'SCRIPT:spawn 2 slow 110', { onFrame(frame) {
+    if (frame.type !== 'agent' || frame.agent.status !== 'working') return;
+    working.add(frame.agent.id);
+    if (working.size === 2 && !pause) {
+      pause = r.bridge.prepareForUpdate();
+      pause.catch(() => {});
+    }
+  } });
+  assert.ok(pause);
+  const report = await pause;
+  const saved = JSON.parse(readFileSync(report.checkpoint, 'utf8'));
+  assert.deepEqual(saved.receipts.map(row => row.helperId ?? 'parent').sort(), [...working, 'parent'].sort());
+  assert.ok(saved.receipts.every(row => row.confirmed));
+  assert.equal(saved.chats[0].parent.helpers.length, 2);
+  assert.equal(saved.workspaces[0].cwd, r.ws);
+  assert.match(saved.workspaces[0].staged, /\+first result/);
+  assert.match(saved.workspaces[0].unstaged, /\+next result/);
+  assert.equal(r.bridge.status().runtime, null);
+  assert.deepEqual(await r.bridge.prepareForUpdate(), report);
+  await assert.rejects(r.run('new-chat', 'resume'), { code: 'update-paused' });
+});
+
+test('after an update the parent discovers and resumes its paused helper on the same session', { skip, timeout: 60_000 }, async t => {
+  const r = await rig(t);
+  const chatId = 'resume-after-update';
+  let helperId, paused;
+  await r.run(chatId, 'SCRIPT:spawn 1 slow 120', { onFrame(frame) {
+    if (paused || frame.type !== 'agent' || frame.agent.status !== 'working') return;
+    helperId = frame.agent.id;
+    paused = r.bridge.prepareForUpdate();
+    paused.catch(() => {});
+  } });
+  assert.ok((await paused).receipts.some(row => row.helperId === helperId && row.confirmed));
+  const parentId = r.bridge.sessionOf(chatId);
+  const restarted = createAgentBridge({ dataDir: r.dir, connections: () => [],
+    localInstances: () => [{ id: 'inst-1', label: 'Scripted', baseUrl: r.worker.url, modelId: 'scripted-model', context: 32768, slots: 4 }] });
+  t.after(() => restarted.close());
+  const frames = [];
+  const resume = message => restarted.runTurn({ chatId, message, workspacePath: r.ws, mode: 'bypass', onFrame: f => frames.push(f) });
+  await resume('SCRIPT:call list_agents {}');
+  assert.equal(restarted.sessionOf(chatId), parentId);
+  assert.ok(r.worker.requests.some(req => JSON.parse(req.raw).messages.some(m => m.role === 'tool' && JSON.stringify(m.content).includes(helperId + ' [inactive]'))));
+  await resume('SCRIPT:call send_message ' + JSON.stringify({ agent_id: helperId, message: 'SCRIPT:echo Continued existing assignment' }));
+  assert.deepEqual([...rows(frames).keys()], [helperId]);
+  assert.equal(rows(frames).get(helperId).at(-1).status, 'completed');
+  assert.ok(r.worker.requests.some(req => req.directive === 'echo' && req.raw.includes('SCRIPT:slow 120')), 'the resumed helper sees its own original task');
+});
+
+test('the packaged Harness accepts a browser message addressed to a single working helper', { skip, timeout: 40_000 }, async t => {
+  const r = await rig(t);
+  const chatId = 'message-one-helper';
+  const message = 'SCRIPT:echo Accepted browser message';
+  let received;
+  await r.run(chatId, 'SCRIPT:spawn 2 slow 40', { onFrame: f => {
+    if (received || f.type !== 'agent' || f.agent.name !== 'Helper 1' || f.agent.status !== 'working') return;
+    received = r.bridge.messageHelper({ chatId, helperId: f.agent.id, text: message, delivery: 'steer' }).catch(error => error);
+  } });
+  assert.ok(received, 'the first helper was working');
+  const receipt = await received;
+  assert.ok(receipt.ok, receipt.message);
+  assert.equal(receipt.delivery, 'steer');
+  assert.ok(receipt.messageId);
+});
+
+test('a live message reaches the parent while both helpers finish on their original sessions', { skip, timeout: 40_000 }, async t => {
+  const r = await rig(t);
+  const chatId = 'live-parent-follow-up';
+  const message = 'SCRIPT:echo Parent follow-up received';
+  const working = new Set();
+  let sent;
+  const { frames } = await r.run(chatId, 'SCRIPT:spawn 2 slow 110', { onFrame: frame => {
+    if (frame.type !== 'agent' || frame.agent.status !== 'working') return;
+    working.add(frame.agent.id);
+    if (working.size === 2 && !sent) sent = r.bridge.steerMessage({ chatId, text: message }).catch(error => error);
+  } });
+  assert.ok(sent, 'both helpers were working when the follow-up was sent');
+  assert.equal((await sent).ok, true);
+  const updates = frames.filter(f => f.type === 'agent-follow-up');
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].message.text, message);
+  const firstDone = frames.findIndex(f => f.type === 'agent' && f.agent.status === 'completed');
+  const responseAt = frames.findIndex(f => f.type === 'delta' && f.text.includes('Parent follow-up received'));
+  assert.ok(responseAt >= 0 && responseAt < firstDone, 'the parent answered before the helpers finished');
+  assert.deepEqual([...rows(frames).keys()].sort(), [...working].sort());
+  assert.deepEqual([...rows(frames).values()].map(history => history.at(-1).status), ['completed', 'completed']);
+  assert.equal(r.worker.requests.filter(q => q.directive === 'slow').length, 2, 'neither helper was restarted');
+  assert.equal(r.worker.aborted, 0);
+  const replay = [];
+  const requestId = frames.find(f => f.type === 'start').requestId;
+  assert.ok(r.bridge.attach({ chatId, requestId, onFrame: f => replay.push(f) }));
+  assert.deepEqual(replay.filter(f => f.type === 'agent-follow-up').map(f => f.message), updates.map(f => f.message));
+});
+
 test('helpers are limited to the Harness cap (4, or the slot count if larger); the fifth is refused with a message the model reads', { skip }, async (t) => {
   const r = await rig(t, { slots: 2 });
   const { frames } = await r.run('few', 'SCRIPT:spawn 5 slow 30');
@@ -160,6 +263,21 @@ test("a chat cannot answer another chat's helper question", { skip }, async (t) 
   assert.equal(existsSync(file), false);
 });
 
+test('a helper can ask the person through its own chat and receive the answer', { skip, timeout: 40_000 }, async t => {
+  const r = await rig(t);
+  let asked;
+  const run = r.run('helper-question', 'SCRIPT:spawn 1 ask', { mode: 'manual', onFrame: f => {
+    if (f.type === 'agent-question') asked = f;
+  } });
+  for (let i = 0; i < 250 && !asked; i++) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(asked?.agentName, 'Helper 1');
+  await assert.rejects(r.bridge.answerQuestion({ chatId: 'another-chat', callId: asked.callId, skip: true }), /already answered/);
+  await r.bridge.answerQuestion({ chatId: 'helper-question', callId: asked.callId, answers: [{ id: asked.questions[0].id, selected: ['Blue'] }] });
+  const { frames } = await run;
+  assert.equal(frames.at(-1).type, 'done');
+  assert.equal([...rows(frames).values()][0]?.at(-1).status, 'completed');
+});
+
 test('Stop on the chat stops its helpers, ends the run quickly and starts no further turn', { skip }, async (t) => {
   const r = await rig(t);
   const started = Date.now();
@@ -176,6 +294,22 @@ test('Stop on the chat stops its helpers, ends the run quickly and starts no fur
   assert.equal(done.type, 'done'); assert.equal(done.cancelled, true);
   assert.equal(r.bridge.isRunning('stopper'), false);
   assert.ok(!/Noted/.test(text(frames)), 'the parent was not woken to comment on stopped helpers');
+});
+
+test('Stop on one helper leaves its sibling and the parent running', { skip, timeout: 40_000 }, async t => {
+  const r = await rig(t);
+  let stop;
+  const { frames } = await r.run('one-helper-stop', 'SCRIPT:spawn 2 slow 80', { onFrame: f => {
+    if (!stop && f.type === 'agent' && f.agent.name === 'Helper 1' && f.agent.status === 'working') {
+      stop = r.bridge.stopHelper({ chatId: 'one-helper-stop', helperId: f.agent.id });
+    }
+  } });
+  assert.ok(stop, 'the first helper went live');
+  assert.equal((await stop).ok, true);
+  const final = Object.fromEntries([...rows(frames).values()].map(history => [history.at(-1).name, history.at(-1).status]));
+  assert.deepEqual(final, { 'Helper 1': 'cancelled', 'Helper 2': 'completed' });
+  assert.equal(frames.at(-1).type, 'done');
+  assert.notEqual(frames.at(-1).cancelled, true);
 });
 
 test('/goal: sets a goal, runs its rounds in the chat, says how it ended, refuses a second unfinished goal, and Stop pauses it', { skip }, async (t) => {

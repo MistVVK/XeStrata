@@ -11,8 +11,9 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, realpa
 import { join, resolve, dirname, basename, sep, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
-import { draftingHint, NATIVE_FIELDS, APP_OWNED_FIELDS, withoutDraftLayer, resolveDrafter, validateNativeSettings, validateMcpServers, publicMcpServers, publicNativeEnv, restoreNativeEnv, speedSwitchRows } from './native-settings.mjs';
-import { resourceSettings, saferStart, reserveChoice, launchBudgetArgs } from './native-resources.mjs';
+import { draftingHint, NATIVE_FIELDS, APP_OWNED_FIELDS, withoutDraftLayer, withPromptCacheSpread, withoutPromptCacheSpread, resolveDrafter, validateNativeSettings, validateMcpServers, publicMcpServers, publicNativeEnv, restoreNativeEnv, speedSwitchRows } from './native-settings.mjs';
+import { validModelPort } from './ports.mjs';
+import { resourceSettings, saferStart, reserveChoice, validRamReserve, withRamReserve, launchBudgetArgs } from './native-resources.mjs';
 import { USER_KEY, capture as captureUserArgs, merge as mergeUserArgs, setFlag as setUserFlag, stamped as stampedUserArgs } from './native-user-args.mjs';
 import { resolvePython, venvPython } from './python-resolver.mjs';
 import os from 'node:os';
@@ -20,7 +21,7 @@ import { markPictures, runtimeVision } from './native-vision.mjs';
 import { componentsDirectory, installerEnvironment, controlEnvironment, sourceServerEnvironment, UPDATE_LOCK_HELD } from './control-runtime.mjs';
 import { createEngineStep } from './engine-step.mjs';
 import { dataFolderFromPick, isDriveRoot, makeFolder, rememberDataFolder, syncDataFolder, terminalSettingsFile } from './model-folder.mjs';
-import { createAutoTune, writeTuneConfig } from './native-autotune.mjs';
+import { createAutoTune, withTuneConfig } from './native-autotune.mjs';
 import { plainError, PHASE_TEXT, UPDATE_WAITING_FOR_LOCK, APP_UPDATER_NOT_READY, APP_CHECK_FAILED } from './update-messages.mjs';
 import { checkAndParseRunConfig, checkRunConfig, describeIssues } from './run-config-check.mjs';
 import { openTextFile } from './open-text-file.mjs';
@@ -71,10 +72,54 @@ function savedKv(config,model,catalog){
 
 /** The plain words for "no usable engine": the model still downloads, but loading needs the engine (owner decision 2026-10-18). */
 export const ENGINE_NOT_RECOGNISED='Strata didn’t recognise an engine for this computer. The model is downloaded, but it can’t run until the right engine is installed. Open Settings → About.';
-export function createNativeControl({directory,requests=()=>[],changed=()=>{},spawnProcess=spawn,fetcher=fetch,modelsDirectory,nativeDataDirectory=value=>value,beforeLoad=async()=>{},hardwareProbe=()=>[],control=null,ready=null,appUpdater=null,lockWaitMs=60000,lockPollMs=2000,defaultRepo=process.env.STRATA_NATIVE_REPO??resolve(ROOT,'../../Strata')}={}){
+export function createNativeControl({directory,requests=()=>[],changed=()=>{},spawnProcess=spawn,fetcher=fetch,modelsDirectory,nativeDataDirectory=value=>value,beforeUpdate=async()=>{},beforeLoad=async()=>{},hardwareProbe=()=>[],control=null,ready=null,appUpdater=null,lockWaitMs=60000,lockPollMs=2000,defaultRepo=process.env.STRATA_NATIVE_REPO??resolve(ROOT,'../../Strata')}={}){
  mkdirSync(directory,{recursive:true});
  const settingsPath=join(directory,'native-host.json');
  let preferences=readJson(settingsPath,{repo:defaultRepo});
+ function ramReserve(){
+  const value=preferences.ramReserveGiB;
+  return {gib:validRamReserve(value)?value:null};
+ }
+ function saveRamReserve(gib){
+  if(gib!==null&&!validRamReserve(gib))throw new Error('Enter a whole number of GiB above zero, or choose Automatic.');
+  const next={...preferences,ramReserveGiB:gib};
+  const temp=settingsPath+'.ram-reserve-tmp';
+  writeFileSync(temp,JSON.stringify(next,null,2),{mode:0o600});
+  renameSync(temp,settingsPath);
+  preferences=next;
+  return ramReserve();
+ }
+ /* Preferred model server port (#6475): defaults to automatic (18500+ range) and suppresses fallback probing of port 8080 so Strata does not collide with Spring Boot or other local services. */
+ function modelPort(){
+  const value=preferences.modelPort;
+  return {port:validModelPort(value)?value:null,defaultPort:18500,activePorts:[...instances.values()].map(i=>i.port).filter(p=>Number.isInteger(p))};
+ }
+ function saveModelPort(port){
+  if(port!==null&&!validModelPort(port))throw new Error('Choose a port between 1024 and 65535, or leave it empty for automatic.');
+  const next={...preferences,modelPort:port};
+  const temp=settingsPath+'.model-port-tmp';
+  writeFileSync(temp,JSON.stringify(next,null,2),{mode:0o600});
+  renameSync(temp,settingsPath);
+  preferences=next;
+  disconnect();
+  return modelPort();
+ }
+ /* --prompt-cache-spread (#6469): keeps checkpoints geometrically spaced back through long agent chats so compaction resumes near the cut instead of re-reading from the system prompt. On by default in the packaged desktop app for Flash-Next/Gyro models. */
+ function promptCacheSpread(){
+  const custom=typeof preferences.promptCacheSpread==='boolean';
+  return {enabled:custom?preferences.promptCacheSpread:packaged,customized:custom};
+ }
+ function savePromptCacheSpread(enabled){
+  if(enabled!==null&&typeof enabled!=='boolean')throw new Error('Choose on, off, or default.');
+  const next={...preferences};
+  if(enabled===null)delete next.promptCacheSpread;
+  else next.promptCacheSpread=enabled;
+  const temp=settingsPath+'.prompt-cache-spread-tmp';
+  writeFileSync(temp,JSON.stringify(next,null,2),{mode:0o600});
+  renameSync(temp,settingsPath);
+  preferences=next;
+  return promptCacheSpread();
+ }
  let child=null,seq=0,buffer='',pending=new Map(),definitions=[],refreshing=null,lastRead=0,connecting=null,installStart=null;
  /* QAGUI 0213: until Control has answered once, the state says it is still being asked (`checking`), not that nothing is installed. A failed read during Control's start is read again after a few seconds instead of standing for 45 s; after READ_TRIES failures the answer is final and the error shows. */
  let everRead=false,failedReads=0;const READ_TRIES=4,RETRY_MS=3000;
@@ -117,7 +162,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
  function state(){const checking=!everRead&&failedReads<READ_TRIES;const folder=preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder),space=folder?diskSpace(folder):null;return {...snapshot,checking,downloadDirectory:folder,downloadFreeBytes:space?.free??null,downloadTotalBytes:space?.total??null,fields:nativeFields(),instances:[...instances.values()].map(({key,configPath,fingerprint,mcpServers,...i})=>structuredClone(i)),defaultId,stoppedForUpdate:stoppedForUpdate?{updated:stoppedForUpdate.updated,at:stoppedForUpdate.at,models:stoppedForUpdate.instances.map(i=>({id:i.id,label:i.label}))}:null,jobs:[...jobs.values()].slice(-12).map(({process,abort,engineAbort,rawResult,...j})=>j),capabilities:{responses:sourceText().includes('/v1/responses'),updates:!!snapshot.available,rollback:previousEngine(),componentUpdates:packaged&&typeof control.update==='function',calibration:packaged?false:snapshot.hardware?.gpus?.some(g=>/nvidia/i.test(g.name??''))??false,dflash2:dflash2Served===true,dflash2Support,dflash2Selq4,dflash2Split}};}
  let sourceCache={path:'',time:0,text:''};
  function sourceText(){try{const path=join(packaged?control.control.dir:repo(),'serve/server.py'),time=statSync(path).mtimeMs;if(sourceCache.path===path&&sourceCache.time===time)return sourceCache.text;sourceCache={path,time,text:readFileSync(path,'utf8')};return sourceCache.text;}catch{return '';}}
- function nativeFields(){const source=sourceText();return NATIVE_FIELDS.map(field=>({...field,supported:APP_OWNED_FIELDS.includes(field.id)||field.id.startsWith('vision_')||field.id.startsWith('mcp_')||field.id==='vram_reserve_mib'||source.includes(field.id)}));}
+ function nativeFields(){const source=sourceText();return NATIVE_FIELDS.map(field=>({...field,supported:APP_OWNED_FIELDS.includes(field.id)||field.id.startsWith('vision_')||field.id.startsWith('mcp_')||field.id==='vram_reserve_mib'||field.id==='prompt_cache_spread'||source.includes(field.id)}));}
  const modelArena=id=>({arenaGb:(snapshot.catalog?.families??[]).flatMap(f=>f.sizes??[]).find(s=>s.id===id)?.experts_gb,engineVersion:snapshot.engine?.version??snapshot.installed?.engine?.version??null});
  /* A start that ends with `server_exited` carries the engine's last log line with it; the app turns the code into words and
     keeps this text under "Details" (src/lib/plain-errors.ts). */
@@ -151,7 +196,9 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
   const folder=repo();
   buffer='';const py0=packaged?{command:control.control.python,args:[]}:python();
   const script=packaged?join(control.control.dir,'tools/strata_mcp.py'):join(folder,'tools/strata_mcp.py');
-  const client=child=spawnProcess(py0.command,[...py0.args,script,...(packaged?['--root',folder,'--src',control.control.dir]:[])],{cwd:packaged?control.control.dir:folder,windowsHide:true,stdio:['pipe','pipe','pipe'],env:packaged?installerEnvironment(control.control,{installDir:folder}):{...process.env,PYTHONUNBUFFERED:'1',PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'}});
+  const configuredPort=modelPort().port;
+  const portEnv={...(configuredPort?{STRATA_MODEL_PORT:String(configuredPort)}:{}),...(configuredPort!==8080?{STRATA_NO_DEFAULT_PORT:'1'}:{})};
+  const client=child=spawnProcess(py0.command,[...py0.args,script,...(packaged?['--root',folder,'--src',control.control.dir]:[])],{cwd:packaged?control.control.dir:folder,windowsHide:true,stdio:['pipe','pipe','pipe'],env:packaged?installerEnvironment(control.control,{installDir:folder,modelPort:configuredPort}):{...process.env,PYTHONUNBUFFERED:'1',PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',...portEnv}});
   client.stdout.on('data',chunk=>{if(child!==client)return;buffer+=chunk.toString();let end;while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);let message;try{message=JSON.parse(line);}catch{continue;}const p=pending.get(message.id);if(p){clearTimeout(p.alarm);pending.delete(message.id);message.error?p.reject(new Error(message.error.message)):p.resolve(message.result);}}});
   child.stderr.on('data',chunk=>append('control',chunk.toString()));
   client.on('error',error=>{if(child===client){snapshot.error=error.message;disconnect();}});
@@ -361,8 +408,6 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   else   if(args.gpus!==undefined&&!(args.gpusFromRecommendation&&namedInFile)){const detected=new Set((snapshot.hardware?.gpus??[]).map(g=>g.index));if(!Array.isArray(args.gpus)||!args.gpus.length||new Set(args.gpus).size!==args.gpus.length||args.gpus.some(g=>!Number.isInteger(g)||!detected.has(g)))throw new Error('Choose distinct detected GPUs. CPU-only text inference is not supported by this native adapter.');cfg.gpu=args.gpus.length===1?args.gpus[0]:args.gpus;for(const k of ['gpu_roles','gpu_cards','gpu_none'])delete cfg[k];delete cfg.hip_ordinal;cfg.layer_split=args.gpus.length>1?validateNativeSettings({layer_split:args.layerSplit??'auto'}).layer_split:'auto';if(cfg.layer_split!=='auto'&&cfg.layer_split.split(',').length!==args.gpus.length-1)throw new Error('Choose one layer split point between each pair of GPUs.');}
   if(!isHy4(cfg)&&!isInkling(cfg)&&cfg.vram_reserve_mib!==undefined&&cfg.vram_reserve_mib!==null){cfg.args=[...(cfg.args??[])];const at=cfg.args.indexOf('--vram-reserve-mib');if(at>=0)cfg.args.splice(at,2);cfg.args.push('--vram-reserve-mib',String(cfg.vram_reserve_mib));}
   if(mine.length){cfg.args=mergeUserArgs(cfg.args??[],mine);cfg[USER_KEY]=mine;}else delete cfg[USER_KEY];
-  /* "Leave 20% for my work" starts the engine with the RAM budget of setup's second number ("ui_budget_work_gib"); this copy only. What is saved (`resources`, never `cfg`) keeps setup's own, which is what a Terminal start reads. */
-  if(args.resourceProfile&&Array.isArray(cfg.args))cfg.args=launchBudgetArgs(cfg,args.resourceProfile);
   if(cfg.vision){if(cfg.vision_tokens!=null)cfg.vision={...cfg.vision,max_tokens:cfg.vision_tokens};if(cfg.vision_min_tokens!=null)cfg.vision={...cfg.vision,min_tokens:cfg.vision_min_tokens};}cfg.mcp={...(cfg.mcp??{}),...(cfg.mcp_timeout_s!=null?{timeout_s:cfg.mcp_timeout_s}:{}),...(cfg.mcp_max_rounds!=null?{max_rounds:cfg.mcp_max_rounds}:{}),...(cfg.mcp_max_result_chars!=null?{max_result_chars:cfg.mcp_max_result_chars}:{})};
   /* The model's own choices win over what setup wrote into the arguments: "Draft layer (MTP)" off leaves --mtp out of every start, and a picture reading that is off leaves --vision out (setup writes both again whenever it runs; the saved settings are applied here, on every load). */
   if((cfg.mtp===false||cfg.drafting==='off')&&Array.isArray(cfg.args))cfg.args=withoutDraftLayer(cfg.args);
@@ -378,7 +423,16 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   /* The agent asks for long answers (a thinking model can use most of the window): let the engine clamp the output to what is left of the context instead of refusing the request. */
   if(packaged&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;
   if(parallelChoice){const applied=applyParallel(cfg,parallelChoice);for(const k of Object.keys(cfg))if(!(k in applied.cfg))delete cfg[k];Object.assign(cfg,applied.cfg);parallelNote=applied.note;}
-  return {cfg,resources,visionPreferences,parallelChoice,parallelNote};
+  const launch=withRamReserve(cfg,ramReserve().gib);
+  /* Apply the Work budget only to the launch copy, after the user's shared reserve. */
+  if(args.resourceProfile&&Array.isArray(launch.args))launch.args=launchBudgetArgs(launch,args.resourceProfile);
+  /* #6469: keep prompt cache checkpoints spaced geometrically back through long agent chats on Flash-Next/Gyro models so compaction resumes near the cut. */
+  if(!isHy4(launch)&&!isInkling(launch)&&Array.isArray(launch.args)){
+   const spread=launch.prompt_cache_spread===false?false:launch.prompt_cache_spread===true?true:mine.includes('--prompt-cache-spread')?true:promptCacheSpread().enabled;
+   if(spread)launch.args=withPromptCacheSpread(launch.args);
+   else if(launch.prompt_cache_spread===false)launch.args=withoutPromptCacheSpread(launch.args);
+  }
+  return {cfg:launch,resources,visionPreferences,parallelChoice,parallelNote};
  }
  /* One drafter per run. Control (strata_control/drafting.py) says which one this load runs and whether its file is on this computer: the plan of the saved model file with the choice the Load carries. */
  /* The engines this Load is about to unload (the load below unloads every instance unless it adds one beside them): their graphics memory is given back before the new engine starts, so Control must not count it as busy memory when it asks whether the all-cards split engine fits (`--engines-unloading`; the Terminal does the same, Runner.card_probe). A model added beside the others (`multiple`) keeps their memory busy. */
@@ -646,7 +700,20 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(job.state!=='running'){await unload(id);return;}
   if(instance.profile)await control.stop(instance.profile).catch(()=>{});else await stopProcess(proc);instance.status='error';instance.error='Loading took more than five minutes. Check the engine log and free memory.';throw new Error(instance.error);
  }
- async function freePort(requested){for(let port=Number(requested??18500);port<=Number(requested??18500)+20;port++){if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('Choose a port from 1024 to 65535.');if([...instances.values()].some(i=>i.port===port)){if(requested)throw new Error('This private engine port is already in use.');continue;}const available=await new Promise(resolve=>{const probe=createServer();probe.once('error',()=>resolve(false));probe.listen(port,'127.0.0.1',()=>probe.close(()=>resolve(true)));});if(available)return port;if(requested)throw new Error('This private engine port is already in use.');}throw new Error('No free private engine port was found.');}
+ async function freePort(requested){
+  const configured=modelPort().port;
+  const base=Number(requested??configured??18500);
+  if(!Number.isInteger(base)||base<1024||base>65535)throw new Error('Choose a port from 1024 to 65535.');
+  const allow8080=Number(requested)===8080||configured===8080;
+  for(let port=base;port<=Math.min(65535,base+20);port++){
+   if(!allow8080&&port===8080)continue;
+   if([...instances.values()].some(i=>i.port===port)){if(requested)throw new Error('This private engine port is already in use. Choose another model server port in Settings → General, or stop the other program.');continue;}
+   const available=await new Promise(resolve=>{const probe=createServer();probe.once('error',()=>resolve(false));probe.listen(port,'127.0.0.1',()=>probe.close(()=>resolve(true)));});
+   if(available)return port;
+   if(requested)throw new Error('This private engine port is already in use. Choose another model server port in Settings → General, or stop the other program.');
+  }
+  throw new Error('No free private engine port was found. Choose another model server port in Settings → General.');
+ }
  let pollCount=0;
  /* The engine's metrics carry every finished request with `?requests=all`: a long session makes that a large JSON that the host parses and
     pushes to the window every 2 s. The last dozen is what the app shows live; the full list is refreshed every tenth poll. */
@@ -659,7 +726,12 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  /* FIX-APP A7: a model whose load FAILED stays listed in state error (its engine process is gone or was stopped), and it made both Settings -> Updates jobs refuse with "Unload native models before changing engine files."
     for the person who went there to fix the failure. An instance in error holds no engine file open: it is unloaded here, so the update goes on. A model that is loading, ready or unloading still refuses. */
  async function dropFailedInstances(){for(const [id,instance] of [...instances]){if(instance.status!=='error')continue;try{await unload(id,true);}catch{instances.delete(id);processes.delete(id);}}}
- async function program(job,args){if(packaged)return componentProgram(job,args);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');await dropFailedInstances();if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
+ async function program(job,args){
+  if(job.kind==='update-strata'){
+   await beforeUpdate();
+   if(closing || job.state!=='running') throw new Error('The Strata update was cancelled.');
+  }
+  if(packaged)return componentProgram(job,args);if(externalRunning().length)throw new Error('Stop the native server running outside this UI before changing engine files.');await dropFailedInstances();if(instances.size)throw new Error('Unload native models before changing engine files.');const folder=repo();let {command,args:prefix}=python(),argv;
   if(job.kind==='calibrate'||job.kind==='tune'){if(!state().capabilities.calibration)throw new Error('This installation calibrates NVIDIA GPUs only. Use the short benchmark on other devices.');const model=args.model??snapshot.installed?.models?.[0]?.model;const chosen=record(model);if(!chosen.entry.ready)throw new Error('Prepare this model before calibrating.');command=venvPython(folder);prefix=[];if(!existsSync(command))throw new Error('Prepare the Python environment first.');argv=['-c','import sys; from pathlib import Path; import setup; sys.exit(0 if setup.calibrate_config(Path(sys.argv[1])) else 1)',chosen.path];}
   else if(job.kind==='rollback'){if(!previousEngine())throw new Error('No saved previous engine is available.');argv=[join(folder,'setup.py'),'--rollback-engine'];}
   else if(job.kind==='update-engine'){if(!snapshot.installed?.models?.length)throw new Error('Prepare a model first. Its installer downloads the matching engine.');argv=[join(folder,'setup.py'),'--update'];}
@@ -829,14 +901,14 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   return {...loaded,...measured,summary:'Your model is tuned and ready.',profile:args.profile};
  }
  /* What the tuner measures is what a load would start: the saved model config with the user's choices and the resource profile. */
- function tuneConfig(args){const {config,entry}=record(args.model);if(!entry.ready)throw new Error('Prepare the model before tuning it.');const {cfg}=buildConfig({model:args.model,vision:args.vision,resourceProfile:args.resourceProfile,gpus:args.gpus,values:args.values},config);return {path:writeTuneConfig(directory,args.model,cfg),entry};}
- async function tuneStatus(args){await refresh();const {path}=tuneConfig(args);return autotuner.status(path);}
- async function tuneEffective(args){await refresh();const {path}=tuneConfig(args);return autotuner.effective(path);}
- async function tuneOff(args){await refresh();const {path}=tuneConfig(args);return autotuner.off(path);}
+ function tuneConfig(args){const {config,entry}=record(args.model);if(!entry.ready)throw new Error('Prepare the model before tuning it.');const {cfg}=buildConfig({model:args.model,vision:args.vision,resourceProfile:args.resourceProfile,gpus:args.gpus,values:args.values},config);return cfg;}
+ async function tuneStatus(args){await refresh();return withTuneConfig(directory,tuneConfig(args),path=>autotuner.status(path));}
+ async function tuneEffective(args){await refresh();return withTuneConfig(directory,tuneConfig(args),path=>autotuner.effective(path));}
+ async function tuneOff(args){await refresh();return withTuneConfig(directory,tuneConfig(args),path=>autotuner.off(path));}
  async function autotune(job,args){
   await refresh(true);if(job.state!=='running')return;
   if(packaged){const engine=await control.engine();if(!engine.usable)throw new Error(ENGINE_NOT_RECOGNISED+(engine.notice?` ${engine.notice}`:''));}
-  const {path}=tuneConfig(args);
+  const cfg=tuneConfig(args);
   if(externalRunning().length)throw new Error('Stop the native server running outside this UI before tuning.');
   if(busy(requests().filter(r=>instances.has(r.instanceId))))throw new Error('Finish requests before tuning.');
   await autoDrafterFor(job,args.model,'Finding the fastest settings for your PC…');if(job.state!=='running')return;
@@ -844,7 +916,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   if(job.state!=='running')return;
   job.summary='Finding the fastest settings for your PC…';emit();
   const room=args.resourceProfile==='work';
-  return autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}});
+  return withTuneConfig(directory,cfg,path=>autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}}));
  }
  function operation(kind,args={}){if(!['install','load','pictures','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','install-engine-file','remove','restart-models'].includes(kind))throw new Error('Choose a supported native operation.');if(kind==='restart-models'&&!packaged)throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&(COMPONENT_KINDS.includes(kind)||kind==='restart-models')))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='pictures'?picturesOnly(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):kind==='restart-models'?restartStopped(job):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
  /* ---- The models folder card (0.2.2): what a picked folder means, and the three choices. The copying is Control's (strata models move). ---- */
@@ -968,5 +1040,5 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  // Remove nonserializable process references from public jobs.
  const publicState=()=>{const value=state();value.jobs=value.jobs.map(({process,engineAbort,rawResult,...job})=>job);return value;};
  async function localPreview(path){if(!packaged)throw new Error('Checking local model files is part of the Strata app.');if(typeof path!=='string'||!path.trim()||[...path].some(c=>c.charCodeAt(0)<32))throw new Error('Choose a folder.');return control.importPlan(path.trim());}
- return {state:publicState,settingsHints,tuneStatus,tuneEffective,tuneOff,tunePresets:{list:()=>autotuner.list(),action:(kind,id,extra)=>autotuner.action(kind,id,extra),undoFor:async args=>autotuner.undoFor(tuneConfig(args).path)},refresh,localPreview,configure,setDownloadDirectory,planModelsFolder,startModelsFolder,interruptedMove,finishInterruptedMove,leaveInterruptedMove,plan,settings,save,settingsFile,openSettingsFile,operation,dismissRestart,cancel,unload,resolveInstance,poll,logs:()=>logs.slice(),benchmarkReport:()=>readJson(join(directory,'native-benchmark.json'),null),setDefault(id){defaultId=resolveInstance(id).id;emit();return publicState();},hasLive:()=>[...instances.values()].some(i=>i.status==='ready'),readyInstances:()=>[...instances.values()].filter(i=>i.status==='ready'),defaultInstanceId:()=>defaultId,close};
+ return {state:publicState,ramReserve,saveRamReserve,modelPort,saveModelPort,promptCacheSpread,savePromptCacheSpread,settingsHints,tuneStatus,tuneEffective,tuneOff,tunePresets:{list:()=>autotuner.list(),action:(kind,id,extra)=>autotuner.action(kind,id,extra),undoFor:async args=>withTuneConfig(directory,tuneConfig(args),path=>autotuner.undoFor(path))},refresh,localPreview,configure,setDownloadDirectory,planModelsFolder,startModelsFolder,interruptedMove,finishInterruptedMove,leaveInterruptedMove,plan,settings,save,settingsFile,openSettingsFile,operation,dismissRestart,cancel,unload,resolveInstance,poll,logs:()=>logs.slice(),benchmarkReport:()=>readJson(join(directory,'native-benchmark.json'),null),setDefault(id){defaultId=resolveInstance(id).id;emit();return publicState();},hasLive:()=>[...instances.values()].some(i=>i.status==='ready'),readyInstances:()=>[...instances.values()].filter(i=>i.status==='ready'),defaultInstanceId:()=>defaultId,close};
 }

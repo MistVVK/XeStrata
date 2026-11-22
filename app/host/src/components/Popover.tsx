@@ -3,6 +3,17 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { IconBtn } from './ui';
 import { measureFrame } from '../lib/overlay-place';
+/** True when a pointer event outside the popover and its anchor should dismiss it.
+ *  Clicks inside a portaled modal dialog (.dialog-layer / aria-modal) never dismiss an underlying popover (#6516). */
+export function shouldClosePopover(target: EventTarget | null, popover: Node | null, anchor: Node | null): boolean {
+    const node = target as Node | null;
+    if (!node) return false;
+    if (popover?.contains(node) || anchor?.contains(node)) return false;
+    const element = node instanceof Element ? node : (node as { parentElement?: Element | null }).parentElement ?? null;
+    if (element?.closest?.('.dialog-layer, [role="dialog"][aria-modal="true"]')) return false;
+    return true;
+}
+
 /** Anchored, non-modal surface. Focus and dismissal stay with its own trigger. */
 export function Popover({ anchor, title, detail, onClose, children, above = false, width = 360 }: {
     anchor: HTMLElement | null;
@@ -23,7 +34,7 @@ export function Popover({ anchor, title, detail, onClose, children, above = fals
         place();
         ref.current?.focus({ preventScroll: true });
         const outside = (e: PointerEvent) => {
-            if (!ref.current?.contains(e.target as Node) && !anchor?.contains(e.target as Node))
+            if (shouldClosePopover(e.target, ref.current, anchor))
                 onClose();
         };
         const resize = new ResizeObserver(place);

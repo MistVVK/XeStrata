@@ -132,6 +132,7 @@ With `"vram_elastic": true` as well (opt-in) the expert cache gives the room ins
   sends `VRAM` with that reserve again, so the cache grows back to the size it had (0, not the start's reserve: that
   would leave it a segment or more smaller).
 - **A CPU reader that took over** needs no VRAM: the cache grows back at once.
+- **A CPU reader by choice** (no `"gpu"` in the vision section) needs none either: it just starts, without the `VRAM` command.
 - **`POST /v1/vram` while the encoder runs** keeps the asked reserve on top of the encoder's share; the encoder's stop
   then goes back to the asked reserve.
 - An unload of the model stops the encoder too. A picture that was encoded before (a conversation sends its pictures with every turn)

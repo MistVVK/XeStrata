@@ -78,7 +78,7 @@ test('7 and 8: Model files has no explanatory sentence and holds "Other local mo
 
 test('12: with no subagents the dropdown is one row, "No subagents recorded" and the X, with no icon and no explanation', () => {
   const bar = read('src/components/ChatToolbar.tsx');
-  assert.match(bar, /title=\{tr\(session\?\.agents\?\.length \? "Subagents" : "No subagents recorded"\)\}/, 'the empty state is the title');
+  assert.match(bar, /title=\{visible\.length \|\| archived\.length \? "Subagents" : "No subagents recorded"\}/, 'only a genuinely empty overview uses the empty title');
   assert.ok(!/subagents-empty|Subagents that run in this conversation/.test(bar), 'no icon, no explanatory text');
   assert.ok(!/subagents-empty/.test(read('src/styles/annotation-fixes.css')), 'no dead rule');
   assert.match(read('src/styles/app.css'), /\.telepop__head:last-child \{ align-items: center; padding-bottom: 0; margin-bottom: 0; border-bottom: 0; \}/, 'no empty body under the title');
@@ -187,7 +187,7 @@ test('the tune dialog also runs without pictures and saves nothing when the engi
   assert.match(models, /vision=\{selectedSize\.images \? vision : 'no'\} visionUnavailable=\{noReader\}/);
   assert.match(read('src/components/NativeTune.tsx'), /\.\.\.\(visionUnavailable \? \{ visionUnavailable: true \} : \{\}\)/);
   const host = read('server/native-control.mjs');
-  assert.match(host, /vision:\(isHy4\(current\.config\)\|\|current\.config\.vision\)\?args\.vision:'no',\.\.\.\(args\.visionUnavailable===true\?\{visionUnavailable:true\}:\{\}\)/);
+  assert.match(host, /vision:\(isHy4\(current\.config\)\|\|isInkling\(current\.config\)\|\|current\.config\.vision\)\?args\.vision:'no',\.\.\.\(args\.visionUnavailable===true\?\{visionUnavailable:true\}:\{\}\)/);
   assert.match(host, /args\.contextChosen===true\|\|JSON\.stringify\(cfg\[USER_KEY\]/, 'a load that carries the context marker writes it to the saved settings');
 });
 

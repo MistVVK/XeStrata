@@ -10,7 +10,7 @@ const store = readFileSync(new URL('../src/lib/store.ts', import.meta.url), 'utf
 
 test('Off is sent as none and Max as high for Qwen (Max as max for Hy4-Flash); the budget only with thinking on', () => {
   assert.match(host, /\(\{off:'none',max:'high'\}\[String\(thinking\)\.toLowerCase\(\)\]/);
-  assert.match(host, /\(\{off:'none',low:'high',medium:'high',high:'high',max:'max'\}\[String\(thinking\)\.toLowerCase\(\)\]/);
+  assert.match(host, /\(\{off:'none',(?:minimal:'high',)?low:'high',medium:'high',high:'high',max:'max'\}\[String\(thinking\)\.toLowerCase\(\)\]/);
   assert.match(host, /thinkingBudget>0&&String\(thinking\)\.toLowerCase\(\)!=='off'\?\{reasoning_budget_tokens:thinkingBudget\}/);
 });
 

@@ -45,12 +45,12 @@ class Connect(unittest.TestCase):
             self.assertIn("also reachable at http://192.168.1.5:8080/v1", t)
             self.assertIn("key sk-strata-", t)
             self.assertNotIn("abcdefghijklmnop", t)                      # masked until k
-            for name in ("OpenCode", "Codex CLI", "Claude Code", "oh-my-pi", "pi (pi.dev)", "Hermes Agent", "OpenClaw", "DeepSeek Harness"):
+            for name in ("OpenCode", "Codex CLI", "Claude Code", "Cline", "oh-my-pi", "pi (pi.dev)", "Hermes Agent", "OpenClaw", "DeepSeek Harness"):
                 self.assertIn(name, t)
             self.assertIn("Vendor tested", t)
             self.assertIn("This server", t)
             self.assertIn("Not checked", t)
-            self.assertIn("opencode 1.19.3", t)
+            self.assertIn("opencode 2.2.3", t)
             self.assertIn("OpenCode setup", t)
             self.assertIn("~/.config/opencode/opencode.json", t)
             await pilot.press("k")
@@ -75,7 +75,7 @@ class Connect(unittest.TestCase):
     def test_choosing_an_app_shows_its_limits_in_words(self):
         async def case(app, pilot):
             await pilot.press("7")
-            for _ in range(5):
+            for _ in range(6):
                 await pilot.press("down")
             await pilot.pause(0.2)
             t = flat(app)
@@ -88,7 +88,7 @@ class Connect(unittest.TestCase):
             await pilot.press("down")
             await pilot.pause(0.2)
             self.assertIn("built into the Strata app", flat(app))
-            await pilot.press("up", "up", "up", "up", "up", "up", "up")
+            await pilot.press("up", "up", "up", "up", "up", "up", "up", "up")
             await pilot.pause(0.2)
             self.assertIn("OpenCode setup", flat(app))
         self.run_app(case)
@@ -124,7 +124,7 @@ class Connect(unittest.TestCase):
             self.run_app(case)
             data = json.loads(target.read_text())
             self.assertEqual(data["theme"], "dark")
-            self.assertIn("strata", data["provider"])
+            self.assertIn("strata", data["providers"])
             self.assertEqual(len(list(target.parent.glob("opencode.json.strata-bak-*"))), 1)
 
     def test_write_can_be_declined(self):

@@ -7,7 +7,8 @@ Swift, Coder and Gyro files, not for q4rehearsal-a", for a model on the Strata e
   * no Flash-Next draft layer for it; an entry that says drafter: none writes "mtp": false and "drafting": "off" (as setup_config writes it);
   * a model of its own shape names its engine component (component:strata-q4-lite) and the model's title for the engine's refusal;
   * the expert profile comes from setup_config.neutral_profile_if_other_shape (the shipped one, or a neutral one for another shape);
-  * a family that is neither built in nor of the feed is refused with the same words as before, and the built-in families' configs are what they were.
+  * a family that is neither built in nor of the feed is refused with the same words as before, and the built-in families' configs are what they were;
+  * Swift's two files name shard 1 as --ple-gguf: its n-gram table is there, as setup.py finds it by tensor name.
 Offline: nothing runs but Python."""
 
 from __future__ import annotations
@@ -134,6 +135,18 @@ class AdoptFeedModels(unittest.TestCase):
                                        "--ple-io", "ram", "--vram-reserve-mib", "1024"])
         self.assertEqual(sorted(cfg), ["args", "backend", "cwd", "exe", "lib_dirs", "log", "model_name", "port", "tokenizer"])
         self.assertEqual(self.profiles, [], "a built-in family never reads its GGUF for the profile")
+
+    def test_swift_names_shard_1_as_ple_gguf_because_its_n_gram_table_is_there(self):
+        t = Tree(self.root, "swift-iq3_xxs", ["Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+                                             "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"])
+        cfg, problems = t.plan("swift", "IQ3_XXS", setup.FAMILIES["swift"])
+        self.assertEqual(problems, [])
+        self.assertEqual(cfg["args"], ["--pack", str(t.pack), "--native", str(t.files[0]), "--ple-gguf", str(t.files[0]),
+                                       "--expert-profile", str(t.src / "data" / "expert-profile.bin"), "--expert-cache", "auto", "--prefill", "auto",
+                                       "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(t.data / "mtp" / "rt"), "--max-context", "32768", "--kv", "int8",
+                                       "--ple-io", "ram", "--vram-reserve-mib", "1024"],
+                         "shard 2 as --ple-gguf stopped the engine with 'per_layer_token_embd.weight is not in ...'")
+        self.assertEqual(self.profiles, [])
 
 
 class AppArcPath(unittest.TestCase):

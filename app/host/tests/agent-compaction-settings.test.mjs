@@ -82,6 +82,7 @@ async function startHost(t, home) {
   const port = await freePort();
   const ws = join(home, 'workspace'); mkdirSync(ws, { recursive: true });
   const env = { ...process.env, STRATA_HOME: home, STRATA_PORT: String(port), STRATA_WORKSPACE: ws, STRATA_REAL_ENGINE: '0', STRATA_COMPONENTS_DIR: join(home, 'components') };
+  env.STRATA_MODELS_DIR = join(home, 'models');
   delete env.STRATA_HARNESS_DIR; delete env.STRATA_COMPACTION_THRESHOLD_RATIO; delete env.STRATA_COMPACTION_HEADROOM_FRACTION;
   const child = spawn(process.execPath, [HOST], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   let log = '';
@@ -99,9 +100,9 @@ async function startHost(t, home) {
     if (child.exitCode !== null) throw new Error(`the host exited: ${log.slice(-500)}`);
     await sleep(200);
   }
-  const get = async () => { const res = await fetch(`${base}/api/agent/compaction`); return { status: res.status, body: await res.json() }; };
-  const post = async body => {
-    const res = await fetch(`${base}/api/agent/compaction`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const get = async (route = 'compaction') => { const res = await fetch(`${base}/api/agent/${route}`); return { status: res.status, body: await res.json() }; };
+  const post = async (body, route = 'compaction') => {
+    const res = await fetch(`${base}/api/agent/${route}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     return { status: res.status, body: await res.json().catch(() => null) };
   };
   return { get, post, stop, log: () => log };
@@ -137,4 +138,24 @@ test('the host reads and writes the choice, refuses nonsense, and keeps it acros
 
   const back = await again.post({ thresholdRatio: null, headroomFraction: null });
   assert.equal(back.body.effective.thresholdRatio, DEFAULT_THRESHOLD_RATIO, 'Automatic returns to Strata’s own number');
+});
+
+test('Context Optimizer is off by default, validates local configuration, and survives a host restart', async t => {
+  const route = 'context-optimizer';
+  const home = mkdtempSync(join(tmpdir(), 'strata-optimizer-setting-'));
+  t.after(() => cleanup(home));
+  const host = await startHost(t, home);
+  assert.equal((await host.get(route)).body.enabled, false);
+  const port = await freePort();
+  const config = { enabled: true, baseUrl: `http://127.0.0.1:${port}/v1`, model: 'tiny', timeoutMs: 1000 };
+  assert.equal((await host.post({ ...config, baseUrl: 'http://example.org/v1' }, route)).status, 400);
+  const probe = await host.post(config, route + '/test');
+  assert.equal(probe.status, 200);
+  assert.equal(probe.body.ok, false, 'a closed port does not pass the check');
+  assert.equal((await host.get(route)).body.enabled, false, 'testing settings does not save them');
+  assert.deepEqual((await host.post(config, route)).body, config);
+  await host.stop();
+  const restarted = await startHost(t, home);
+  assert.deepEqual((await restarted.get(route)).body, config);
+  assert.equal((await restarted.post({ ...config, enabled: false }, route)).body.enabled, false);
 });

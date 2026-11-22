@@ -13,13 +13,13 @@ const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARN
 const wait = ms => new Promise(r => setTimeout(r, ms));
 const words = frames => frames.filter(f => f.type === 'delta').map(f => f.text).join('');
 
-async function rig(t) {
+async function rig(t, env = process.env) {
   const worker = await startScriptedWorker({});
   const dir = mkdtempSync(join(tmpdir(), 'strata-planrun-'));
   const ws = join(dir, 'ws'); mkdirSync(ws, { recursive: true });
   const events = { plan: [], queue: [], goal: [] };
   const local = [{ id: 'inst-1', label: 'Scripted', baseUrl: worker.url, modelId: 'scripted-model', context: 32768, slots: 2 }];
-  const bridge = createAgentBridge({ dataDir: dir, localInstances: () => local, connections: () => [], env: process.env, startTimeoutMs: 90_000,
+  const bridge = createAgentBridge({ dataDir: dir, localInstances: () => local, connections: () => [], env, startTimeoutMs: 90_000,
     onPlan: (chatId, event, plan) => events.plan.push({ chatId, event, plan }), onQueue: (chatId, queue) => events.queue.push({ chatId, queue }), onGoal: (chatId, goal) => events.goal.push({ chatId, goal }) });
   t.after(async () => { await bridge.close(); await worker.close(); try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* best effort */ } });
   const base = (chatId, onFrame = () => {}) => ({ chatId, workspacePath: ws, mode: 'bypass', onFrame });
@@ -155,4 +155,24 @@ test('/research: gathering is not shown, a run that opened no pages is sent back
   const help = [];
   await r.bridge.researchCommand({ ...r.base('rs2', f => help.push(f)), line: '' });
   assert.match(words(help), /Type \/research followed by/);
+});
+
+test('an opted-in plan pauses and can retry when the model claims completion without its Read receipt', { skip, timeout: 240_000 }, async t => {
+  const r = await rig(t, { ...process.env, STRATA_AGENT_PLAN_BRIEF: '1' });
+  const chat = 'p-proof';
+  await r.bridge.planCommand({ ...r.base(chat), mode: 'manual', line: 'SCRIPT:planreply' });
+  const plan = r.bridge.planState(chat);
+  r.bridge.planControl({ chatId: chat, planId: plan.id, action: 'edit', steps: [
+    'Check the file SCRIPT:goalstep [verify-read missing.txt | READY]',
+    'Do the next step SCRIPT:goalstep',
+  ] });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const frames = [];
+    await r.bridge.planGoal({ ...r.base(chat, f => frames.push(f)), planId: plan.id });
+    assert.match(words(frames), /until the required line is verified with Read/);
+    assert.doesNotMatch(words(frames), /The goal is complete/);
+    assert.equal(r.bridge.planState(chat).state, 'paused');
+    assert.deepEqual(r.bridge.planState(chat).steps.map(s => s.state), ['pending', 'pending']);
+    assert.equal((await r.bridge.goalState(chat)).phase, 'paused');
+  }
 });

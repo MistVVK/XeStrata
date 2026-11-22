@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -133,8 +134,137 @@ def size_words(nbytes: int) -> str:
 _DONTNEED = getattr(os, "POSIX_FADV_DONTNEED", None)
 
 
+_GGUF_MAGIC = b"GGUF"
+_GGUF_SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}   # GGUF v2/v3 metadata scalar sizes
+_PLE_TENSOR = b"per_layer_token_embd.weight"
+_GGUF_SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def _gguf_split_siblings(path: Path) -> list[Path]:
+    """Existing shards of a split GGUF (`<name>-00001-of-0000N.gguf` .. `<name>-0000N-of-0000N.gguf`, matching gguf_split.hpp)
+    in split order, keeping the caller's directory/stem (symlinked Hugging Face snapshots keep their names). Any other path returns `[path]` if it exists."""
+    try:
+        if not path.is_file():
+            return []
+    except OSError:
+        return []
+    m = _GGUF_SPLIT_RE.match(path.name)
+    if m is not None:
+        stem, no, total = m.group(1), int(m.group(2)), int(m.group(3))
+        if 2 <= total <= 1024 and 1 <= no <= total:
+            shards: list[Path] = []
+            for i in range(1, total + 1):
+                cand = path.with_name(f"{stem}-{i:05d}-of-{total:05d}.gguf")
+                try:
+                    if cand.is_file():
+                        shards.append(cand)
+                except OSError:
+                    continue
+            return shards
+    return [path]
+
+
+def _native_shards(args) -> list[Path]:
+    """Existing GGUF shard(s) referenced by `--native` (including split siblings), in split order, deduplicated by file identity."""
+    items = [str(a) for a in args]
+    out: list[Path] = []
+    for i, a in enumerate(items[:-1]):
+        if a != "--native" or not os.path.isabs(items[i + 1]):
+            continue
+        for shard in _gguf_split_siblings(Path(items[i + 1])):
+            if not any(_same_file(shard, seen) for seen in out):
+                out.append(shard)
+    return out
+
+
+def _gguf_has_tensor(path: Path, target: bytes = _PLE_TENSOR) -> bool:
+    """Whether `path` is a GGUF v2/v3 file whose header lists a tensor named `target` (header-only; never reads tensor payloads; never raises)."""
+    try:
+        with path.open("rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size < 24:
+                return False
+            header = fh.read(24)
+            if len(header) != 24 or header[:4] != _GGUF_MAGIC:
+                return False
+            version, n_tensors, n_kv = struct.unpack("<IQQ", header[4:])
+            if version not in (2, 3) or n_tensors == 0:
+                return False
+            if n_kv * 12 > size - 24 or n_tensors * 24 > size - 24:
+                return False
+            pos = 24
+
+            def read_exact(n: int) -> bytes:
+                nonlocal pos
+                if n < 0 or n > size - pos:
+                    raise ValueError("eof")
+                data = fh.read(n)
+                if len(data) != n:
+                    raise ValueError("eof")
+                pos += n
+                return data
+
+            def skip_bytes(n: int) -> None:
+                nonlocal pos
+                if n < 0 or n > size - pos:
+                    raise ValueError("eof")
+                if n <= 4096:
+                    read_exact(n)
+                else:
+                    fh.seek(pos + n)
+                    pos += n
+
+            def skip_str() -> None:
+                (n,) = struct.unpack("<Q", read_exact(8))
+                skip_bytes(n)
+
+            def skip_value(vtype: int, depth: int = 0) -> None:
+                if vtype in _GGUF_SCALAR:
+                    skip_bytes(_GGUF_SCALAR[vtype])
+                elif vtype == 8:
+                    skip_str()
+                elif vtype == 9 and depth < 4:
+                    et, count = struct.unpack("<IQ", read_exact(12))
+                    if et in _GGUF_SCALAR:
+                        skip_bytes(count * _GGUF_SCALAR[et])
+                    elif et == 8:
+                        if count * 8 > size - pos:
+                            raise ValueError("eof")
+                        for _ in range(count):
+                            skip_str()
+                    elif et == 9:
+                        if count * 12 > size - pos:
+                            raise ValueError("eof")
+                        for _ in range(count):
+                            skip_value(9, depth + 1)
+                    else:
+                        raise ValueError("unknown array element type")
+                else:
+                    raise ValueError("unknown value type")
+
+            for _ in range(n_kv):
+                skip_str()
+                (vt,) = struct.unpack("<I", read_exact(4))
+                skip_value(vt)
+            for _ in range(n_tensors):
+                (nlen,) = struct.unpack("<Q", read_exact(8))
+                if nlen == len(target):
+                    if read_exact(nlen) == target:
+                        return True
+                else:
+                    skip_bytes(nlen)
+                (ndims,) = struct.unpack("<I", read_exact(4))
+                if ndims == 0 or ndims > 16:
+                    return False
+                skip_bytes(ndims * 8 + 12)                   # shape (ndims * u64) + type (u32) + offset (u64)
+            return False
+    except (OSError, ValueError, struct.error):
+        return False
+
+
 def _arg_files(args) -> list[Path]:
-    """The files the engine is about to read: every existing absolute path among its arguments (a folder: the files under it)."""
+    """The files the engine is about to read: every existing absolute path among its arguments (plus split GGUF siblings of `--native`;
+    a folder: the files under it)."""
     found: list[Path] = []
     folders: list[Path] = []
     for item in args:                                    # the named files first (the big model files), then the folders' files (a pack is ~24,000 small ones)
@@ -149,6 +279,11 @@ def _arg_files(args) -> list[Path]:
                 folders.append(p)
         except OSError:
             continue
+    for shard in _native_shards(args):                   # 3+ shard GGUFs only pass shard 1 after --native; the engine reads every sibling shard
+        if not any(_same_file(shard, seen) for seen in found):
+            found.append(shard)
+    if len(found) >= ROOM_MAX_FILES:
+        return found[:ROOM_MAX_FILES]
     for folder in folders:
         for root, _dirs, files in os.walk(folder):
             for name in files:
@@ -159,18 +294,27 @@ def _arg_files(args) -> list[Path]:
 
 
 def ple_table_file(args) -> Path | None:
-    """The file named by --ple-gguf when the engine keeps its table in RAM or maps it (--ple-io ram / mmap / not given); None for --ple-io direct (random 4 KiB reads: it
-    gains nothing from the cache) and when there is no --ple-gguf. Its cache is the one the engine needs again at its start: make_room leaves it."""
+    """The GGUF shard holding the PLE table when the engine keeps it in RAM or maps it (--ple-io ram / mmap / not given); None for
+    --ple-io direct (random 4 KiB reads: it gains nothing from the cache), --no-ple, and models without a PLE table. Uses --ple-gguf
+    when named, else inspects the --native shard(s)' GGUF headers for per_layer_token_embd.weight, matching the engine's own resolution
+    (generate.cpp). Its cache is the one the engine needs again at its start: make_room leaves it."""
     items = [str(a) for a in args]
+    if "--no-ple" in items:
+        return None
     io = None
+    explicit = None
     for i, a in enumerate(items):
         if a == "--ple-io" and i + 1 < len(items):
             io = items[i + 1]
+        elif a == "--ple-gguf" and i + 1 < len(items):
+            explicit = items[i + 1]
     if io == "direct":
         return None
-    for i, a in enumerate(items):
-        if a == "--ple-gguf" and i + 1 < len(items) and os.path.isabs(items[i + 1]):
-            return Path(items[i + 1])
+    if explicit is not None:
+        return Path(explicit) if os.path.isabs(explicit) else None
+    for shard in _native_shards(items):
+        if _gguf_has_tensor(shard):
+            return shard
     return None
 
 
@@ -421,9 +565,10 @@ def killed_words(rc, environ=None) -> str:
 
 
 def trim_files(args) -> list[Path]:
-    """The big model file the engine reads its experts from, once: the path after --native (not the PLE table, which is read at random later)."""
-    items = [str(a) for a in args]
-    return [Path(items[i + 1]) for i, a in enumerate(items[:-1]) if a == "--native" and os.path.isabs(items[i + 1]) and Path(items[i + 1]).is_file()]
+    """The big model file(s) the engine reads its experts from, once: the `--native` shard(s) (including split siblings),
+    excluding the PLE table when its cache is kept (not the PLE table, which is read at random later)."""
+    kept = ple_table_file(args)
+    return [p for p in _native_shards(args) if kept is None or not _same_file(p, kept)]
 
 
 def start(proc, loading: threading.Event, say=None, args=None) -> threading.Thread | None:

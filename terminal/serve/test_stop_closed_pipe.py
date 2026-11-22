@@ -34,7 +34,7 @@ def engine() -> StrataEngine:
     e.batch, e.multi, e.silence_s, e.can_stop = 0, 0, 0, True
     e.lines = queue.Queue()
     e.proc = FakeProc()
-    e.sampling_keys = lambda sampling: ""
+    e.sampling_keys = lambda sampling, **kw: ""
     e.exit_code = lambda: 1
     return e
 

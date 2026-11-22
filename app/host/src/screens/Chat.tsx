@@ -37,7 +37,8 @@ import { useLiveStatus } from '../lib/live-status';
 import { ApprovalDock, SCOPE } from '../components/ApprovalCard';
 import { artifactFromUrl, type PreviewArtifact } from '../lib/artifacts';
 import { openExternal } from '../lib/open-external';
-import { busyPlan, parkedReady } from '../lib/while-busy';
+import { api } from '../lib/client';
+import { busyPlan, isLiveFollowUp, parkedReady } from '../lib/while-busy';
 import { composeNumbered, composeQuoted, parseQuoted, rememberQuoteSources, type Quote, type QuoteSource } from '../lib/quotes';
 /** Chat — talk to the one loaded model. */
 import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -46,7 +47,7 @@ import { Btn, Icon, IconBtn, ErrorNotice, type IconName } from '../components/ui
 import { composerCap, scrollBehavior } from '../lib/responsive';
 import { relTime, cx, duration, tokens, tps } from '../lib/format';
 import { chosenRemote, hasModelToChat, showNoModelHint } from '../lib/composer-model';
-import { addQuote, clearQuotes, removeQuote, createSubagentExample, parkMessage, takeParked, pushToast, setPreviewTabClosed, setPreviewPanelClosed, branchFrom, continueLast, markRead, retryLast, selectSession, rewindTo, sendMessage, stopStreaming, useStore, } from '../lib/store';
+import { addQuote, clearQuotes, removeQuote, createSubagentExample, getState, parkMessage, takeParked, pushToast, setPreviewTabClosed, setPreviewPanelClosed, branchFrom, continueLast, markRead, retryLast, selectSession, rewindTo, sendMessage, steerMessage, stopStreaming, useStore, } from '../lib/store';
 import { CopyBtn, CopyMenuItem, MenuCloseContext } from '../components/CopyBtn';
 import { KEYS_UP, PILL_DISTANCE, distanceFromBottom, followAfterScroll, wheelLeavesBottom } from '../lib/follow-scroll';
 import { getSlashCommands } from '../lib/commands';
@@ -102,7 +103,7 @@ export function ChatScreen() {
         document.addEventListener('selectionchange', read);
         return () => document.removeEventListener('selectionchange', read);
     }, [session?.id]);
-    // Messages parked while an answer was written (Send after, Interrupt) go one by one, each when the chat is quiet again,
+    // Messages parked while an answer was written go one by one, each when the chat is quiet again,
     // and only from the chat that is also the active one: sendMessage sends to that one (#5806, parkedReady).
     useEffect(() => {
         if (!session || !parkedReady(session.id, activeId, streaming, parked?.length ?? 0))
@@ -112,6 +113,7 @@ export function ChatScreen() {
             void sendMessage(next);
     }, [streaming, parked?.length, session?.id, activeId]);
     const [draft, setDraft] = useState('');
+    const steering = useRef(new Set<string>());
     const draftKey = `strata.chat-draft.${session?.id ?? 'new'}`;
     useEffect(() => {
         setDraft(sessionStorage.getItem(draftKey) ?? '');
@@ -349,7 +351,7 @@ export function ChatScreen() {
         // The reader's own scrolling decides (#4014): a wheel notch is about 100 px and used to land inside a 120 px band that pulled
         // the view back on every token. `pinned` is set by the scroller's wheel, touch, key and scroll handlers below.
         const count = session?.messages.length ?? 0;
-        const sent = count > seenMessages.current && session?.messages.at(-1)?.role === 'user';
+        const sent = count > seenMessages.current && session?.messages.slice(seenMessages.current).some(message => message.role === 'user');
         seenMessages.current = count;
         // Sending a message always brings the reader to it, as it did before; only the answer's growth waits for the reader.
         if (pinned.current && !sent && readerHasSelection(el)) {
@@ -451,6 +453,7 @@ export function ChatScreen() {
     }, [setupVisible, readyForChat, session?.id, messageCount]);
     function submit() {
         const text = draft.trim();
+        if (text === '/pause-for-update') { updateDraft(''); void pauseForUpdate(); return; }
         if (!text && !queuedPhotos.length)
             return;
         if (streaming) {
@@ -459,12 +462,22 @@ export function ChatScreen() {
                 return;
             const plan = busyPlan(whileBusy);
             const out = quotedMessage(quotes, text, numberQuotes);
-            // Interrupt: the answer stops where it is (what is written stays) and the message goes as soon as it has stopped (the effect below sends it).
-            if (plan === 'interrupt') {
-                updateDraft('');
-                clearQuotes(session.id);
-                parkMessage(session.id, out);
-                stopStreaming();
+            if (plan === 'steer') {
+                const id = session.id;
+                if (steering.current.has(id)) return;
+                steering.current.add(id);
+                // Pictures use the ordinary send path. Leave them attached for the parked message.
+                const sent = queuedPhotos.length ? Promise.resolve(false) : steerMessage(id, out);
+                void sent.then(delivered => {
+                    if (!delivered) parkMessage(id, out);
+                    if (sessionStorage.getItem(draftKey) === draft) {
+                        sessionStorage.removeItem(draftKey);
+                        if (getState().activeSession === id) setDraft('');
+                    }
+                    if (getState().quotes[id] === quotes) clearQuotes(id);
+                }, error => {
+                    pushToast('error', plainFailureText(error instanceof Error ? error.message : String(error)).message);
+                }).finally(() => steering.current.delete(id));
                 return;
             }
             updateDraft('');
@@ -488,7 +501,7 @@ export function ChatScreen() {
     function onComposerKey(_e: React.KeyboardEvent) { }
     if (!session) {
         return (<>
-        <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
+        <ChatToolbar onPauseForUpdate={pauseForUpdate} previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
         <div className="chatsplit" style={splitStyle} data-timeskip={!!selectedRun || undefined} ref={splitRef} data-preview={!!selectedPreview && inlinePreview || undefined} data-expanded={expanded && !!selectedPreview && inlinePreview || undefined}>
          <DropZone className="chatcol">
           <div className="main__body chat" ref={scroller}>
@@ -507,7 +520,7 @@ export function ChatScreen() {
     }
     return (<>
       {tr(selection && session ? <button type="button" className="quote-selection" style={{ left: selection.x, top: selection.y }} onMouseDown={e => e.preventDefault()} onClick={() => { addQuote(session.id, selection.text, selection.messageId, selection.role); window.getSelection()?.removeAllRanges(); setSelection(null); }}>{tr("Quote")}</button> : null)}
-      <ChatToolbar previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
+      <ChatToolbar onPauseForUpdate={pauseForUpdate} previewWidth={paneWidth} extraTabs={extraTabs} session={session} items={previews} onCloseTab={closeTab} selected={setupVisible ? null : selectedPreview} onSelect={selectPreview} onClose={() => { setSelectedPreview(null); setExpanded(false); closePreviewPanel(); }} inline={inlinePreview} expanded={expanded} onExpand={() => setExpanded(v => !v)}/>
 
       {/* The composer belongs to the conversation column, not the window: with
                 the context panel open, a full-width composer sat underneath the panel
@@ -559,6 +572,16 @@ interface SlashCommand {
     icon: IconName;
     run: () => void;
 }
+async function pauseForUpdate() {
+    pushToast('info', 'Saving agent work and preparing the update…');
+    try {
+        const result = await api.post<{ checkpoint: string; receipts: { chatId: string; helperId?: string }[] }>('/api/chat/pause-for-update', {});
+        const agents = result.receipts.map(row => (row.helperId ?? row.chatId) + ' ✓');
+        pushToast('info', 'Agent work saved. Ready for update.', [...agents, result.checkpoint].join('\n'));
+    } catch (error) {
+        pushToast('error', 'Update preparation failed', error instanceof Error ? error.message : String(error));
+    }
+}
 function useSlashCommands(clear: () => void, setDraft: (value: string) => void): SlashCommand[] {
     const demo = useStore(s => s.library?.mode === 'simulated');
     return [
@@ -570,6 +593,7 @@ function useSlashCommands(clear: () => void, setDraft: (value: string) => void):
         { id: 'loop', label: '/loop', hint: 'Repeat a message every few minutes while this chat is open', icon: 'refresh', run: () => setDraft('/loop 10m ') },
         { id: 'website', label: '/website', hint: 'Open a website in the preview sidebar', icon: 'link', run: () => { clear(); window.dispatchEvent(new Event('strata:open-website')); } },
         { id: 'preview', label: '/preview', hint: 'Open a local file in the preview sidebar', icon: 'file', run: () => { clear(); window.dispatchEvent(new Event('strata:open-preview')); } },
+        { id: 'pause-for-update', label: '/pause-for-update', hint: 'Save progress and pause all agents for an update', icon: 'stop', run: () => { clear(); void pauseForUpdate(); } },
         ...(demo ? [{ id: 'subagents', label: '/subagents', hint: 'Preview subagent statistics', icon: 'experts' as const, run: () => { clear(); createSubagentExample(); } }] : []),
         ...getSlashCommands().map(command => ({ ...command, run: () => { clear(); command.run(); } }))
     ];
@@ -713,10 +737,13 @@ function Composer({ draft, setDraft, loaded, streaming, onSubmit, onKey, session
         }}/>
           <div className="st-composer__bar">
             <ComposerControls draft={draft} onDraft={setDraft} session={session} onPreview={onPreview} streaming={streaming} onSlash={() => { setSlashDismissed(false); setSlashOpen(true); requestAnimationFrame(() => textareaRef.current?.focus()); }} onError={setFileError} onAttach={(name, text) => { setDraft(`${draft}${draft ? '\n\n' : ''}Attached ${name}\n\n${text}`); requestAnimationFrame(() => textareaRef.current?.focus()); }}/>
-            {tr(streaming ? (<Btn variant="secondary" size="sm" icon="stop" onClick={stopStreaming}>{tr("Stop")}</Btn>) : (<Btn variant="primary" size="sm" icon="send" disabled={(!draft.trim() && !photos.length) || draft.trim() === '/' || (!canChat && timeSkipPrompt(draft) === null)} onClick={onSubmit}>{tr("Send")}</Btn>))}
+            {streaming ? <>
+              {whileBusy !== 'wait' && !!draft.trim() && <Btn variant="primary" size="sm" icon="send" onClick={onSubmit}>{tr('Send')}</Btn>}
+              <Btn variant="secondary" size="sm" icon="stop" onClick={stopStreaming}>{tr('Stop')}</Btn>
+            </> : <Btn variant="primary" size="sm" icon="send" disabled={(!draft.trim() && !photos.length) || draft.trim() === '/' || (!canChat && timeSkipPrompt(draft) === null)} onClick={onSubmit}>{tr('Send')}</Btn>}
           </div>
         </div>
-        {tr(streaming && draft.trim() && whileBusy !== 'wait' ? <p className="xs muted composer__busy-hint" role="status">{tr(whileBusy === 'queue' ? "Enter sends it when the answer is done." : "Enter stops the answer here and sends it now.")}</p> : null)}
+        {tr(streaming && draft.trim() && whileBusy !== 'wait' ? <p className="xs muted composer__busy-hint" role="status">{tr(whileBusy === 'queue' ? "Enter sends it when the answer is done." : "Enter sends it at the next step, or after the answer if needed.")}</p> : null)}
         {tr(showNoModelHint({ streaming, canChat, hasText: !!draft.trim(), hasPhotos: photos.length > 0, bareSlash: draft.trim() === '/', isTimeSkip: timeSkipPrompt(draft) !== null }) ? <p className="xs muted composer__busy-hint" role="status">{tr("No model is loaded. Load one in Models to send this message.")}</p> : null)}
         <ChatTelemetry session={session}/>
         </div>
@@ -762,10 +789,11 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
     // #5993: which of this message's numbered quotes still have their source message in the chat ('1' / '0' each; '' when it has none), so a deleted source shows its label without the jump
     const quoteSourcesHere = useStore(s => m.quotes?.length ? m.quotes.map(q => s.sessions.find(x => x.id === activeSession)?.messages.some(y => y.id === q.messageId) ? '1' : '0').join('') : '');
     if (m.role === 'user') {
-        return (<div className="st-msg st-msg--user" data-message-id={m.id} onMouseEnter={() => setSentTime(relTime(m.at))} onFocus={() => setSentTime(relTime(m.at))}>
+        const followUp = isLiveFollowUp(m);
+        return (<div className={cx('st-msg st-msg--user', followUp && 'st-msg--follow-up')} data-message-id={m.id} onMouseEnter={() => setSentTime(relTime(m.at))} onFocus={() => setSentTime(relTime(m.at))}>
         <div className="st-bubble">{tr(m.photos?.length ? <ChatPhotos photos={m.photos}/> : null)}{sentQuote ? <><SentQuotes quotes={sentQuote.quotes} numbered={sentQuote.numbered} sources={m.quotes} exists={id => { const i = m.quotes?.findIndex(q => q.messageId === id) ?? -1; return i >= 0 && quoteSourcesHere[i] === '1'; }}/><span className="st-bubble__text">{sentQuote.reply}</span></> : m.markdown ? <Markdown text={m.content} onOpenLink={onOpenLink} imageSession={activeSession}/> : <span className="st-bubble__text">{m.content}</span>}</div>
         <div className="st-msg__meta">
-          <time dateTime={m.at} title={tr(new Date(m.at).toLocaleString(localeTag()))}>{tr(sentTime)}</time>
+          <time dateTime={m.at} title={tr(new Date(m.at).toLocaleString(localeTag()))}>{followUp ? new Date(m.at).toLocaleTimeString(localeTag(), { timeStyle: 'medium' }) : tr(sentTime)}</time>
           <span className="st-msg__actions">
             <CopyBtn text={m.content} label="Message" title="Copy message"/>
             <IconBtn name="refresh" title={tr("Rewind to here")} disabled={streaming} onClick={() => {
@@ -786,9 +814,10 @@ function MessageView({ message: m, isLast, onEditPrompt, onPreview, onClosePrevi
           card stays only for what needs the person: a question waiting, a denied or failed call. A card that came and went above the text moved the whole reply. */}
       {tr((m.tools ?? []).filter(t => !grouped || t.state === 'proposed' || t.state === 'denied' || t.state === 'error').map((t) => (<ToolCard key={t.id} tool={t}/>)))}
 
-      {tr(!(m.timeSkipId && timeSkipReal && !timeSkipDone) && (m.content || m.error || !m.streaming || !liveStatus || !!m.drafts?.length) ? <div className="st-bubble">
+      {tr(!(m.timeSkipId && timeSkipReal && !timeSkipDone) && (m.content || m.error || m.activity?.length || !m.streaming || !liveStatus || !!m.drafts?.length) ? <div className="st-bubble">
         {tr(planCard ? <PlanCard chatId={activeSession} planId={m.planId!}/> : null)}
         {tr(m.error ? (<ErrorNotice message={m.error} detail={m.errorDetail} {...contextRecovery(m.errorCode)}/>) : null)}
+        {tr(m.activity?.length ? <details className="activity-history" open={m.streaming}><summary>{tr('Work log')} · {tr(m.activity.length)}</summary><ol>{tr(m.activity.map((entry, i) => <li key={`${entry.at}-${i}`}>{tr(entry.text)}</li>))}</ol></details> : null)}
         {tr(grouped && !planCard && !m.timeSkipId ? m.blocks!.map((b, i) => b.kind === 'group' ? <ActivityLine key={b.id} group={b} sessionId={activeSession ?? ''} onPreview={onPreview}/> : <Markdown key={i} text={b.text} onOpenLink={onOpenLink} imageSession={activeSession} previewId={`${m.id}-b${i}`} onPreview={onPreview} onClosePreview={onClosePreview}/>) : null)}
         {tr(m.content && !planCard && !grouped ? (<Markdown text={m.timeSkipId && !timeSkipReal ? hostLive ? tr('This was a sample run made while the app could not reach its host.') : timeSkipDone ? tr('The result is ready. Switch between Original and Updated, or compare them side by side. This example uses sample outputs and simulated checks.') : tr('Revising the saved draft. Follow the result in the sidebar. This example uses sample outputs and simulated checks.') : m.content} onOpenLink={onOpenLink} imageSession={activeSession} previewId={m.id} onPreview={onPreview} onClosePreview={onClosePreview}/>) : !m.error && m.streaming && !liveStatus ? (<span className="typing" aria-label={tr("Generating")}>
             <i />

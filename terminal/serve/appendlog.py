@@ -24,6 +24,45 @@ def open_append(path, encoding: str = "utf-8"):
         return open(path, "a", encoding=encoding)          # the old behaviour: never fail a start over the log's open mode
 
 
+class _AppendLog:
+    """#6467: os.fdopen(fd, 'a') exposes the integer fd as .name on Windows, so helpers that read getattr(log, 'name')
+    as a file path passed the fd to open(fd, 'rb') and closed the server's log descriptor on context exit. Keep the real
+    path string on .name while forwarding file operations and fileno() (for subprocess Popen stderr=) to the stream."""
+
+    def __init__(self, stream, path: str):
+        self._stream = stream
+        self.name = path
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def write(self, s: str) -> int:
+        return self._stream.write(s)
+
+    def writelines(self, lines) -> None:
+        return self._stream.writelines(lines)
+
+    def flush(self) -> None:
+        return self._stream.flush()
+
+    def close(self) -> None:
+        return self._stream.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._stream.closed
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __getattr__(self, item: str):
+        return getattr(self._stream, item)
+
+
 def _open_append_windows(path: str, encoding: str):
     import ctypes
     import msvcrt
@@ -44,4 +83,4 @@ def _open_append_windows(path: str, encoding: str):
     except OSError:
         kernel32.CloseHandle(handle)
         raise
-    return os.fdopen(fd, "a", encoding=encoding)
+    return _AppendLog(os.fdopen(fd, "a", encoding=encoding), path)

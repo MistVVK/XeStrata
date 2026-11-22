@@ -10632,7 +10632,7 @@ def mac_control_setup(a) -> int:
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     env = dict(os.environ, **gguf_py_env())
-    shards = [files[0], files[0]] if family == "gyro" else files      # Gyro: one file, the model and its n-gram table
+    shards = [files[0], files[0]] if family in ("gyro", "swift") else files      # Gyro (one file) and Swift (n-gram table in shard 1)
     pack_todo = not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists()
     prep_lock = mac_prepare_lock(native) if repacked and (pack_todo or not (native.exists() and done(native))) else None
     try:

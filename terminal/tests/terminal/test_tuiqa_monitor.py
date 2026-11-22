@@ -225,7 +225,7 @@ class ConnectStatus(unittest.TestCase):
                 await pilot.press("down")
                 await pilot.pause(0.1)
             shown = text_of(app)
-            self.assertEqual(shown.count("Not checked"), 6)                # 8 apps, 2 checked
+            self.assertEqual(shown.count("Not checked"), len(harness.HARNESSES) - 2)  # 2 checked
         self.run_app(case)
 
     def test_narrow_widths_keep_the_this_server_column(self):

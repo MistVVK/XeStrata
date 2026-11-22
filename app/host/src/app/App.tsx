@@ -15,6 +15,10 @@ import { useMedia } from '../lib/responsive';
 import { Btn, Dialog, IconBtn, Toasts } from '../components/ui';
 import { Brand } from '../components/Brand';
 import { ChatScreen } from '../screens/Chat';
+import { SubagentRow } from '../components/SubagentRow';
+import { api } from '../lib/client';
+import { recordOf, useHelperRecords } from '../lib/helper-records';
+import type { SessionAgent } from '../lib/types';
 import { lazyScreen, useLoadedModule } from '../lib/lazy-screen';
 // The start screen is Chat. Every other screen loads the first time it is opened (7.1), so the first start reads and runs less code.
 const loadSetup = () => import('../screens/Setup');
@@ -216,4 +220,47 @@ class AppBoundary extends Component<{
         return <div className="app-recovery"><h1 className="h2">{tr("Strata couldn\u2019t show this screen")}</h1><p>{tr("Your saved conversations and settings are still available.")}</p><Btn variant="primary" onClick={() => { void bootstrap().then(() => this.setState({ failed: false })); }}>{tr("Retry")}</Btn></div>;
     }
 }
-export function App() { return <AppBoundary><AppShell /></AppBoundary>; }
+
+/** A native helper window is the same trusted app, but without navigation or the
+ * parent chat. Its query is written only by the desktop shell. */
+function HelperWindow() {
+    const query = new URLSearchParams(window.location.search);
+    const sessionId = query.get('sessionId') ?? '';
+    const helperId = query.get('helperId') ?? '';
+    const record = recordOf(useHelperRecords(sessionId), helperId);
+    const messageCount = record?.messages?.length ?? 0;
+    const [agent, setAgent] = useState<SessionAgent | null>();
+    const [disconnected, setDisconnected] = useState(false);
+    useEffect(() => {
+      const controller = new AbortController();
+      const search = new URLSearchParams({ sessionId, helperId });
+      let timer: ReturnType<typeof setTimeout>;
+      async function read() {
+        try {
+          const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]);
+          const result = await api.get<{ agent: SessionAgent | null; active: boolean }>(`/api/chat/helper/state?${search}`, signal);
+          if (controller.signal.aborted) return;
+          setAgent(result.agent);
+          setDisconnected(false);
+          if (!result.active) return;
+        } catch {
+          if (controller.signal.aborted) return;
+          setDisconnected(true);
+        }
+        timer = setTimeout(() => void read(), 1000);
+      }
+      void read();
+      return () => { controller.abort(); clearTimeout(timer); };
+    }, [sessionId, helperId, messageCount]);
+    return <main className="main helper-window"><div className="main__body"><div className="wrap stack">
+      <header className="main__head"><h1>{tr(agent?.name ?? 'Subagent')}</h1></header>
+      {disconnected && <p className="muted" role="status">{tr('Reconnecting…')}</p>}
+      {agent === null
+        ? <p className="muted">{tr('This helper is no longer available in this chat.')}</p>
+        : agent ? <SubagentRow agent={agent} sessionId={sessionId} record={record} panel /> : <BootSkeleton />}
+    </div></div></main>;
+}
+export function App() {
+    const helper = new URLSearchParams(window.location.search).get('helperWindow') === '1';
+    return <AppBoundary>{helper ? <HelperWindow /> : <AppShell />}</AppBoundary>;
+}

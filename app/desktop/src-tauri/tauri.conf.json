@@ -3,6 +3,7 @@
   "productName": "Strata",
   "identifier": "ai.strata.desktop",
   "build": {
+    "beforeBuildCommand": "node scripts/prepare-harness-bundle.mjs",
     "frontendDist": "../../host/dist"
   },
   "app": {

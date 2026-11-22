@@ -3,5 +3,14 @@
  "fixa02": "Das dauert einige Sekunden.",
  "fixa03": "Noch herunterzuladen",
  "fixa04": "Ein kleiner Helfer, der die Antworten schneller macht, wird heruntergeladen. Das geschieht nur einmal.",
- "fixa05": "Es wird noch geprüft. Beim ersten Start kann das bis zu einer Minute dauern."
+ "fixa05": "Es wird noch geprüft. Beim ersten Start kann das bis zu einer Minute dauern.",
+ "contextOptimizerHint": "Wenn der Coding-Assistent Platz im Kontext schafft, wählt ein kleines lokales Modell Auszüge aus älteren Assistentennachrichten und Werkzeugergebnissen aus. Standardmäßig aus. Schlägt die Auswahl fehl, übernimmt die normale Zusammenfassung.",
+ "contextOptimizerConfigure": "Lokales Modell konfigurieren",
+ "contextOptimizerEnable": "Context Optimizer aktivieren",
+ "contextOptimizerTimeout": "Zeitlimit in Sekunden",
+ "contextOptimizerUnavailable": "Die Einstellungen für den Context Optimizer sind nicht verfügbar.",
+ "contextOptimizerTest": "Modell testen",
+ "contextOptimizerTestSuccess": "Modelltest bestanden ({0} ms).",
+ "contextOptimizerTestFailure": "Das lokale Modell hat keine gültige Auswahl geliefert. Prüfen Sie Server, Modell-ID und Zeitlimit.",
+ "contextOptimizerSaved": "Gespeichert. Die nächste Anfrage an den Assistenten übernimmt die Einstellung, sobald laufende Chats fertig sind."
 }

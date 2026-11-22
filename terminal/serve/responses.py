@@ -292,6 +292,20 @@ def input_messages(req: dict) -> list[dict]:
             (held if unanswered else messages).append(message)
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools the client adds as an input item; see request_tools
+        elif kind == "compaction_trigger":
+            # #6459 (Codex): remote compaction trigger input item; accept cleanly instead of HTTP 400 so long sessions
+            # can compact without aborting. Preserve any explicit prompt/content if supplied, otherwise ignore the marker.
+            if item.get("content") not in (None, "", []):
+                open_turn = None
+                thinking.clear()
+                messages.append({"role": "user", "content": _content(item.get("content"), param + ".content")})
+            else:
+                text = item.get("prompt") or item.get("text")
+                if isinstance(text, str) and text.strip():
+                    open_turn = None
+                    thinking.clear()
+                    messages.append({"role": "user", "content": text})
+            continue
         elif kind == "item_reference":
             raise ResponsesError("item references need stored responses, and this server keeps none: send the items "
                                  "themselves", param, "unsupported_parameter")
