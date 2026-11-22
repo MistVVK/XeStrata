@@ -2161,6 +2161,16 @@ inline void dq_one(const void* vx, int64_t ibs, const Out& o, int tid) {
 
 struct IqGemmPtrs { const uint8_t* p[kIqGemmGroup]; };
 
+// IqGemmKernel's TYPE for R1Q2 blobs (bih3_r1q2_gemm_grouped_f16): each expert's gate/up and down K, the layer's p2,
+// its widths and which product
+constexpr int kBih3Tile = 180;
+struct Bih3Tile {
+    uint8_t gk[kIqGemmGroup], dk[kIqGemmGroup];
+    float p2[3][4];
+    int n, ff;
+    bool down;
+};
+
 // 256 x 128 work-group tiles, K 128 at a time: one tile of rows takes an expert's 80-240 rows, so its weights are
 // dequantized once (128 x 256 tiles dequantized most experts' twice and were 10% slower)
 template<int TYPE>
@@ -2175,12 +2185,60 @@ struct IqGemmKernel {
     size_t row_bytes;
     int64_t inter, ldy, tiles_m, nN, N, K;
     sycl::local_accessor<sycl::half, 1> wt;     // [KC][LDN]: K by weight rows (B row-major)
+    Bih3Tile bt;                                // kBih3Tile only
+
+    // kBih3Tile: block k0 / 128 of the WN weight rows from n0, a work-item 4 neighbouring rows by 4 states (16 values),
+    // the values bih3_r1q2_dequant_f16 writes (its expression, the same rounding), stored as dequant()'s below
+    void dequant_bih3(int lid, int64_t ex, int64_t n0, int64_t k0) const {
+        const uint8_t* blob = W.p[ex];
+        const int n = bt.n, ff = bt.ff, gk = bt.gk[ex], dk = bt.dk[ex], b = (int) (k0 / 128);
+        const size_t grow = (size_t) (n / 128) * 4 * (size_t) gk, drow = (size_t) (ff / 128) * 4 * (size_t) dk;
+        const size_t up = grow * (size_t) ff, dn = 2 * up;
+        const size_t scale_off = (dn + drow * (size_t) n + 15) & ~(size_t) 15;
+        const size_t gu_scale = (size_t) ff * 2 + (size_t) (n / 128) * 2 + (size_t) ff * (size_t) ((n / 128 + 3) / 4);
+        const int width = bt.down ? ff : n, nb = width / 128, qbytes = (nb + 3) / 4, k = bt.down ? dk : gk;
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        for (int t = lid; t < (WN / 4) * 8; t += WG) {
+            const int r4 = t % (WN / 4) * 4, part = t / (WN / 4);   // states 4 part .. 4 part + 3
+            sycl::half v[4][16];
+            for (int q = 0; q < 4; ++q) {
+                // gate/up: weight row 2 r + m is matrix m's row r (iq_dequant_gu_f16's interleaving)
+                const int64_t nn = n0 + r4 + q;
+                const int m = bt.down ? 2 : (int) (nn & 1), r = (int) (bt.down ? nn : nn >> 1);
+                const uint8_t* bases = blob + scale_off + (size_t) m * gu_scale;
+                const uint8_t* cols = bases + (size_t) (bt.down ? n : ff) * 2;
+                const uint8_t qb = cols[(size_t) nb * 2 + (size_t) r * qbytes + b / 4];
+                const float scale = half_at(cols + (size_t) b * 2) * bt.p2[m][(qb >> (2 * (b % 4))) & 3] *
+                                    (1.f / 128.f) * half_at(bases + (size_t) r * 2);
+                const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (bt.down ? drow : grow) +
+                                      (size_t) b * 4 * (size_t) k;
+                for (int s = 0; s < 4; ++s) {
+                    const xe::Bih3Planes pl = xe::bih3_planes_w(code, k, 4 * part + s);
+                    for (int c = 0; c < 4; ++c) {
+                        int num = 0;
+                        for (int p = 0; p < 3; ++p) num += (int) (int8_t) (pl.v[p] >> (8 * c));
+                        v[q][4 * s + c] = sycl::half((float) num * scale);
+                    }
+                }
+            }
+            for (int j = 0; j < 16; ++j)
+                *reinterpret_cast<sycl::vec<sycl::half, 4>*>(&wt[(size_t) (16 * part + j) * LDN + (size_t) r4]) =
+                    sycl::vec<sycl::half, 4>(v[0][j], v[1][j], v[2][j], v[3][j]);
+        }
+    }
 
     // Block k0 of K into the tile: a work-item dequantizes the same 8 values of 4 neighbouring weight rows and writes
     // them as 8 bytes a row of the tile, neighbouring work-items the next 4 rows.  B column-major took vector stores
     // of one weight row but loaded for the products at half the speed; row-major with 2-byte stores, one weight row
     // a work-item, dequantized at half the speed.
-    void dequant(int lid, const uint8_t* w, int64_t n0, int64_t k0) const {
+    void dequant(int lid, int64_t ex, int64_t n0, int64_t k0) const {
+        if constexpr (TYPE == kBih3Tile) dequant_bih3(lid, ex, n0, k0);
+        else dequant_blocks(lid, W.p[ex], n0, k0);
+    }
+
+    void dequant_blocks(int lid, const uint8_t* w, int64_t n0, int64_t k0) const {
         const int piece = (int) (k0 % 256);
         for (int t = lid; t < (WN / 4) * (KC / 8); t += WG) {
             const int r4 = t % (WN / 4) * 4, tt = t / (WN / 4);
@@ -2229,15 +2287,15 @@ struct IqGemmKernel {
     // let some work-items dequantize the next block while others still read the last; choosing the loads per tile
     // inside one loop ran several times slower.)
     template<bool WHOLE>
-    void loop(sycl::nd_item<1> it, const sycl::half* x, int64_t rows, int64_t m0, int nl, const uint8_t* w,
-              int64_t wn0,
+    void loop(sycl::nd_item<1> it, const sycl::half* x, int64_t rows, int64_t m0, int nl, int64_t ex, int64_t wn0,
               mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, GT_M, GT_N> (&c)[G_SGM][G_SGN]) const {
         const auto sg = it.get_sub_group();
         const int lid = (int) it.get_local_linear_id();
         for (int64_t k0 = 0; k0 < K; k0 += KC) {
-            dequant(lid, w, wn0, k0);
+            dequant(lid, ex, wn0, k0);
             sycl::group_barrier(it.get_group());
-            block<WHOLE>(sg, x, rows, m0, nl, k0, c);
+            // a sub-group past the expert's rows only dequantizes (block has no barrier)
+            if (WHOLE || m0 < rows) block<WHOLE>(sg, x, rows, m0, nl, k0, c);
             sycl::group_barrier(it.get_group());
         }
     }
@@ -2261,8 +2319,8 @@ struct IqGemmKernel {
         for (int i = 0; i < G_SGM; ++i)
             for (int j = 0; j < G_SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
         const sycl::half* x = X + row0 * K;
-        if (tm * WM + WM <= rows) loop<true>(it, x, rows, m0, nl, W.p[ex], wn0, c);
-        else loop<false>(it, x, rows, m0, nl, W.p[ex], wn0, c);
+        if (tm * WM + WM <= rows) loop<true>(it, x, rows, m0, nl, ex, wn0, c);
+        else loop<false>(it, x, rows, m0, nl, ex, wn0, c);
         if (m0 >= rows) return;
         const bool whole = m0 + G_MS <= rows;
         auto gy = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
@@ -2282,13 +2340,14 @@ struct IqGemmKernel {
 
 template<int TYPE>
 sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs& W, int64_t inter, float* Y,
-                           int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K) {
+                           int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K,
+                           const Bih3Tile& bt = {}) {
     using Kn = IqGemmKernel<TYPE>;
     const int64_t tiles_m = (max_rows + Kn::WM - 1) / Kn::WM, nN = N / Kn::WN;
-    const size_t row_bytes = iq_row_bytes(TYPE, K);
+    const size_t row_bytes = TYPE == kBih3Tile ? 0 : iq_row_bytes(TYPE, K);
     return q.submit([&](sycl::handler& h) {
         Kn k{X, W, Y, bounds, row_bytes, inter, ldy, tiles_m, nN, N, K,
-             sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::KC * Kn::LDN), h)};
+             sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::KC * Kn::LDN), h), bt};
         h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * nN) * Kn::WG, Kn::WG), k);
     });
 }
@@ -3477,6 +3536,29 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
         default: e = launch_iq_gemm<42>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
     }
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");
+}
+
+void bih3_r1q2_gemm_grouped_f16(const Bih3R1q2Layer& L, bool down, const uint16_t* X, const void* const* blob,
+                                const int32_t* k, float* Y, int64_t ldy, const int32_t* bounds, int G,
+                                int64_t max_rows, void* stream) {
+    if (G <= 0 || max_rows <= 0) return;
+    const int64_t N = down ? L.n_embd : 2 * L.n_ff, K = down ? L.n_ff : L.n_embd;
+    require(L.n_embd % 128 == 0 && L.n_ff % 128 == 0 && ldy >= N && G <= kIqGemmGroup, "bih3_r1q2_gemm_grouped_f16");
+    IqGemmPtrs w{};
+    Bih3Tile bt{};
+    for (int e = 0; e < G; ++e) {
+        w.p[e] = static_cast<const uint8_t*>(blob[e]);
+        const int gk = k[e] & 0xff, dk = k[e] >> 8;
+        require(gk >= 2 && gk <= 14 && dk >= 2 && dk <= 14, "bih3_r1q2_gemm_grouped_f16: K");
+        bt.gk[e] = (uint8_t) gk;
+        bt.dk[e] = (uint8_t) dk;
+    }
+    std::memcpy(bt.p2, L.p2, sizeof bt.p2);
+    bt.n = L.n_embd; bt.ff = L.n_ff; bt.down = down;
+    auto& q = queue_for(stream);
+    const sycl::event e = launch_iq_gemm<kBih3Tile>(q, reinterpret_cast<const sycl::half*>(X), w, down ? 0 : L.n_ff,
+                                                    Y, ldy, bounds, G, max_rows, N, K, bt);
+    sync_if_needed(stream, e, "bih3_r1q2_gemm_grouped_f16");
 }
 
 bool iq_mmq_f16_ok(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols) {

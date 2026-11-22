@@ -2854,10 +2854,11 @@ int plain_main(int argc, char** argv) {
                 strata::core::detail::set_ram_reserve_bytes((uint64_t) conv_ram_reserve << 20);
             continue;
         }
-        // --expert-cache: plain's own (int64 slots, clamped to 0; generate's is an int without the clamp)
+        // --expert-cache: auto (-1), off (0) or a cap on slots; parsed once for both engines
         if (a == "--expert-cache") {
             const std::string v = next("--expert-cache");
-            opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
+            const int64_t want = strata::program::expert_cache_request(v);
+            opt.expert_slots = want < 0 ? -1 : want;   // one meaning of --expert-cache in both engines
             continue;
         }
         if (a == "--native") (void) next("--native");

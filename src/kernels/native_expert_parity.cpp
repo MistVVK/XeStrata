@@ -27,6 +27,8 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/nvfp4.hpp"
@@ -887,6 +889,46 @@ static int check_bih3_grouped(void* stream) {
         dq_error = std::max(dq_error, rel(dq_got, dq_want));
     }
     std::printf("bih3 FP16 dequantization against the CPU rows: rel %.9g\n", dq_error);
+    // The products with the codes decoded in the tile (bih3_r1q2_gemm_grouped_f16) against dequantizing and multiplying
+    // (bih3_r1q2_dequant_f16, xmx_gemm_grouped): the same FP16 weights, so the same bits are expected
+    double tile_error = 0;
+    if (strata::kernels::has_form(strata::kernels::MatrixForm::f16_from_blocks)) {
+        constexpr int TR = 5;   // expert 0 two rows, expert 1 three
+        std::vector<uint16_t> xg((size_t) TR * H), xd((size_t) TR * FF);
+        for (auto& v : xg) v = ggml_fp32_to_fp16(dist(rng));
+        for (auto& v : xd) v = ggml_fp32_to_fp16(dist(rng));
+        const auto* dxg = dev.upload(xg);
+        const auto* dxd = dev.upload(xd);
+        const auto* tb = dev.upload(std::vector<int32_t>{0, 2, TR});
+        auto* dgu = dev.alloc<uint16_t>((size_t) 2 * 2 * FF * H);
+        auto* ddn = dev.alloc<uint16_t>((size_t) 2 * H * FF);
+        for (int e = 0; e < 2; ++e)
+            strata::kernels::bih3_r1q2_dequant_f16(L, reinterpret_cast<const uint8_t*>(ptr[(size_t) e]),
+                                                  f[e].gu_type - 180, f[e].d_type - 180, dgu + (size_t) e * 2 * FF * H,
+                                                  ddn + (size_t) e * H * FF, stream);
+        auto* want_gu = dev.alloc<float>((size_t) TR * 2 * FF);
+        auto* want_dn = dev.alloc<float>((size_t) TR * H);
+        auto* got_gu = dev.alloc<float>((size_t) TR * 2 * FF);
+        auto* got_dn = dev.alloc<float>((size_t) TR * H);
+        strata::kernels::xmx_gemm_grouped(dxg, dgu, (int64_t) 2 * FF * H, want_gu, tb, 2, 3, 2 * FF, H, stream);
+        strata::kernels::xmx_gemm_grouped(dxd, ddn, (int64_t) H * FF, want_dn, tb, 2, 3, H, FF, stream);
+        const void* blobs_dev[] = {reinterpret_cast<const void*>(ptr[0]), reinterpret_cast<const void*>(ptr[1])};
+        const int32_t kp[] = {(f[0].gu_type - 180) | (f[0].d_type - 180) << 8,
+                              (f[1].gu_type - 180) | (f[1].d_type - 180) << 8};
+        strata::kernels::bih3_r1q2_gemm_grouped_f16(L, false, dxg, blobs_dev, kp, got_gu, 2 * FF, tb, 2, 3, stream);
+        strata::kernels::bih3_r1q2_gemm_grouped_f16(L, true, dxd, blobs_dev, kp, got_dn, H, tb, 2, 3, stream);
+        std::vector<float> a((size_t) TR * 2 * FF), b(a.size()), c((size_t) TR * H), d(c.size());
+        strata::parity::copy_out(a.data(), got_gu, a.size());
+        strata::parity::copy_out(b.data(), want_gu, b.size());
+        strata::parity::copy_out(c.data(), got_dn, c.size());
+        strata::parity::copy_out(d.data(), want_dn, d.size());
+        size_t differ = 0;
+        for (size_t i = 0; i < a.size(); ++i) differ += a[i] != b[i];
+        for (size_t i = 0; i < c.size(); ++i) differ += c[i] != d[i];
+        tile_error = std::max(rel(a, b), rel(c, d));
+        std::printf("bih3 FP16 products decoded in the tile against dequantized: rel %.9g, %zu of %zu values differ\n",
+                    tile_error, differ, a.size() + c.size());
+    }
     std::vector<float> signs(FF);
     for (int i = 0; i < FF; ++i) signs[i] = i % 3 ? 1.f : -1.f;
     for (auto& fmt : f) { fmt.had_d = true; fmt.had_block = FF; fmt.d_signs = signs.data(); }
@@ -909,7 +951,8 @@ static int check_bih3_grouped(void* stream) {
     std::printf("bih3 grouped scalar with Hadamard: rel %.9g\n", had_error);
     return std::isfinite(error) && error < 1e-2 && std::isfinite(scalar_error) && scalar_error < 1e-2 &&
            std::isfinite(prompt_error) && prompt_error < 1e-2 && std::isfinite(groups_error) && groups_error < 1e-2 &&
-           std::isfinite(had_error) && had_error < 1e-2 && std::isfinite(dq_error) && dq_error < 1e-3 ? 0 : 1;
+           std::isfinite(had_error) && had_error < 1e-2 && std::isfinite(dq_error) && dq_error < 1e-3 &&
+           std::isfinite(tile_error) && tile_error < 1e-5 ? 0 : 1;
 }
 
 // Isolate the product's device time; gathering and activation quantization finish before the warm-up.

@@ -3529,11 +3529,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
                         }();
                         const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
-                        const bool fuse_res = fused_on && !lay.mixed() && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
+                        // A mixed (R1Q2) layer on the FP16 path takes its resident experts the same way
+                        // (bih3_r1q2_gemm_grouped_f16: the codes decoded in the tile to bih3_r1q2_dequant_f16's values).
+                        const bool fuse_bih3 = lay.mixed() && !bih3_own && ffmt != nullptr && ffmt->n_embd % 128 == 0 &&
+                                               ffmt->n_ff % 128 == 0;
+                        const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
                                               strata::kernels::has_form(strata::kernels::MatrixForm::f16_from_blocks) &&
-                                              ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
-                                              strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
-                                              strata::kernels::iq_gemm_grouped_ok(ffmt->d_type, ffmt->n_embd, ffmt->n_ff);
+                                              (fuse_bih3 ||
+                                               (!lay.mixed() && ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
+                                                strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
+                                                strata::kernels::iq_gemm_grouped_ok(ffmt->d_type, ffmt->n_embd, ffmt->n_ff)));
                         auto fusable = [&](int32_t e) {
                             return fuse_res && m.cnt[(size_t) e] <= strata::kernels::kIqGemmTileRows &&
                                    m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
@@ -3822,28 +3827,48 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.xb_host.to_device(m.xb_dev, m.cs);
                             // F8: the fusable resident experts, kIqGemmGroup a launch
                             std::vector<const void*> fgu, fd;
+                            std::vector<int32_t> fk;
+                            strata::kernels::Bih3R1q2Layer bl;
+                            if (fuse_bih3) {
+                                bl.n_embd = (int) ffmt->n_embd; bl.n_ff = (int) ffmt->n_ff;
+                                std::memcpy(bl.p2, lay.format(l, 0).p2, sizeof bl.p2);
+                            }
                             for (size_t j0 = 0; j0 < nf; j0 += (size_t) strata::kernels::kIqGemmGroup) {
                                 const size_t j1 = std::min(nf, j0 + (size_t) strata::kernels::kIqGemmGroup);
                                 fgu.clear();
                                 fd.clear();
+                                fk.clear();
                                 int64_t maxr = 0;
                                 for (size_t j = j0; j < j1; ++j) {
                                     const int32_t e = order[j];
                                     const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     fgu.push_back(b);
-                                    fd.push_back(b + ffmt->down_off);
+                                    if (fuse_bih3) {
+                                        const auto& f = lay.format(l, e);
+                                        fk.push_back((f.gu_type - 180) | (f.d_type - 180) << 8);
+                                    } else {
+                                        fd.push_back(b + ffmt->down_off);
+                                    }
                                     maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
                                 }
                                 const int G = (int) (j1 - j0);
                                 const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j1] - r0;
                                 pt.mark(kPfGemmGU, cs);
-                                strata::kernels::iq_gemm_grouped_f16(ffmt->gu_type, m.Xs, fgu.data(), ffmt->n_ff, m.GU, 1280,
-                                                                     m.xb_dev + j0, G, maxr, 1280, N, m.cs);
+                                if (fuse_bih3)
+                                    strata::kernels::bih3_r1q2_gemm_grouped_f16(bl, false, m.Xs, fgu.data(), fk.data(), m.GU,
+                                                                                1280, m.xb_dev + j0, G, maxr, m.cs);
+                                else
+                                    strata::kernels::iq_gemm_grouped_f16(ffmt->gu_type, m.Xs, fgu.data(), ffmt->n_ff, m.GU,
+                                                                         1280, m.xb_dev + j0, G, maxr, 1280, N, m.cs);
                                 swiglu_interleaved(m.GU + r0 * 1280, m.Hh + r0 * 640, nr, m.cs);
                                 if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * 640, nr, 640, had_block, had_sh, m.cs);
                                 pt.mark(kPfGemmD, cs);
-                                strata::kernels::iq_gemm_grouped_f16(ffmt->d_type, m.Hh, fd.data(), 0, m.Dm, N,
-                                                                     m.xb_dev + j0, G, maxr, N, 640, m.cs);
+                                if (fuse_bih3)
+                                    strata::kernels::bih3_r1q2_gemm_grouped_f16(bl, true, m.Hh, fgu.data(), fk.data(), m.Dm, N,
+                                                                                m.xb_dev + j0, G, maxr, m.cs);
+                                else
+                                    strata::kernels::iq_gemm_grouped_f16(ffmt->d_type, m.Hh, fd.data(), 0, m.Dm, N,
+                                                                         m.xb_dev + j0, G, maxr, N, 640, m.cs);
                                 stats_.experts_resident += G;
                             }
                         }

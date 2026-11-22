@@ -19,14 +19,14 @@
 //   * `h_layer` held-out is **0.0456** - only 4.6% of (layer, token) pairs have all ten experts resident - so
 //     this cannot be a per-layer grouped kernel and the three-way split is not an optimisation.
 //
-// **WHAT THIS FILE IS AND IS NOT, TODAY.** It is the SLOT STORAGE and the RESIDENCY TABLE: it allocates the
-// VRAM, fills it from the host arena, and answers `(layer, expert) -> slot or -1`. It does **not** yet compute
-// anything - `moe_hit_grouped_s2` does not exist and the hit/miss split is not wired into the graph - so with
-// the cache on and nothing consuming it, **the engine is slower by the fill cost and faster by nothing.**
-// That is stated here rather than discovered from a benchmark, and it is why `--expert-cache` defaults to 0.
-//
-// The order of work is `Memory/R4-design-note.md` §7: slots and residency first, then the split, then the
-// kernel. This is that first step, and the step it unblocks is the one that can be measured.
+// **WHAT THIS FILE IS TODAY.** It is the SLOT STORAGE and the RESIDENCY TABLE: it allocates the VRAM, fills it
+// from the host arena or the mapped experts, and answers `(layer, expert) -> slot or -1`. The hit kernel and the
+// hit/miss split are wired in both engines (`expert_hit_run`, `src/core/hit_hook.hpp`). Sizing is capacity-led
+// in both: the engine asks the device for what is free after the weights, session and K/V, keeps the reserve
+// `core::vram_room` reports, and takes the slots that fit; the expert source's RAM or the file supplies the
+// copies. Both engines default to this auto tier; `--expert-cache 0` is the explicit off. A profile is an
+// optional ranked head start. Without one, the adaptive tier in `expert_tier.hpp` fills the slots from the
+// routing the run actually sees, so no profile has to be made by hand.
 #pragma once
 
 #include <cstddef>
