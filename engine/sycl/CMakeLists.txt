@@ -364,6 +364,13 @@ if(STRATA_SYCL_PARITY)   # (the option is declared above, next to STRATA_OWN_CPU
   add_executable(runtime_files_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/runtime_files_test.cpp)   # #5914: the loaded runtime files (host only)
   target_include_directories(runtime_files_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME runtime_files_test COMMAND runtime_files_test)
+  # Host-only: the conversation cache's SSD tier - its folder per engine process and its budget (conversation_spill.hpp).
+  # No GPU, no model; the same source the CUDA/HIP engine builds under STRATA_BUILD_CONVERSATION_TESTS.
+  add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp ${STRATA_ROOT}/src/core/conversation_file.cpp)
+  target_include_directories(conversation_spill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include)
+  target_compile_features(conversation_spill_test PRIVATE cxx_std_17)
+  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
   add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
   target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
