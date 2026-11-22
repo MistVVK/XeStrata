@@ -24,6 +24,10 @@
 
 #include "hy4_graph.hip.h"
 
+#if defined(HY4_CUDA) && HY4_CUDA && !defined(hipMemcpyDefault)
+#define hipMemcpyDefault cudaMemcpyDefault
+#endif
+
 namespace hy4 {
 
 struct CcHeader {

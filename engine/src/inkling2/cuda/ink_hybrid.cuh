@@ -1481,7 +1481,6 @@ inline void launch_ink_moe_hybrid(
             unpin_buf_slots(0);
             unpin_buf_slots(1);
         }
-        }
     }
 
     // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304]
