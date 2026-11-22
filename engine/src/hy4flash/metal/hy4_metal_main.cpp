@@ -370,7 +370,30 @@ public:
     uint64_t exp_tick = 0;
     uint64_t exp_cache_hits = 0, exp_cache_misses = 0;
     double t_cold_io = 0;
-    std::vector<Buffer> kcache, ivg, pooled;
+    std::vector<Buffer> kcache, ivg, pooled;  // the ACTIVE conversation slot's KV set (serve swaps these with the parked slots)
+    size_t kv_set_bytes = 0;
+    int plan_slots = 1;              // serve: --conversation-slots, --conversation-cache-mib, SSD tier on: the cold-expert cache leaves room for the KV sets they allocate after init
+    size_t plan_conv_mib = 0;
+    bool plan_spill = false;
+    // one conversation's KV set (SWA ring / sparse cache / index vectors / pooled keys); returns its size in bytes. Zero-init is not needed.
+    size_t alloc_kv_set(std::vector<Buffer>& kc, std::vector<Buffer>& iv, std::vector<Buffer>& pl) {
+        kc.assign(c.n_layers, Buffer());
+        iv.assign(c.n_layers, Buffer());
+        pl.assign(c.n_layers, Buffer());
+        size_t kvbytes = 0;
+        for (int il = 0; il < c.n_layers; ++il) {
+            size_t by = (size_t) (c.is_swa[il] ? ring : slots_sparse) * 576 * 2;
+            kc[il] = cx.alloc(by);
+            kvbytes += by;
+            if (!c.is_swa[il]) {
+                size_t b1 = (size_t) (max_ctx + 8) * 256 * 2, b2 = (size_t) (max_ctx / 4 + 8) * 128 * 2;
+                iv[il] = cx.alloc(b1);
+                pl[il] = cx.alloc(b2);
+                kvbytes += b1 + b2;
+            }
+        }
+        return kvbytes;
+    }
     Buffer ik_f, iv_f, ig_f, ik_h, iq_f, iq_h, hw_f, score, keys, nkeys, tmp_pooled;
     size_t ldS = 0;
     int ring = 0, slots_sparse = 0, logit_rows = 1;
@@ -586,19 +609,7 @@ public:
         // kv caches
         ring = ((512 + Tc + ring_slack + 15) / 16) * 16;
         slots_sparse = ((max_ctx + 8 + 15) / 16) * 16;
-        kcache.resize(c.n_layers);
-        ivg.resize(c.n_layers);
-        pooled.resize(c.n_layers);
-        size_t kvbytes = 0;
-        for (int il = 0; il < c.n_layers; ++il) {
-            size_t by = (size_t) (c.is_swa[il] ? ring : slots_sparse) * 576 * 2;
-            kcache[il] = A(by);
-            kvbytes += by;
-            if (!c.is_swa[il]) {
-                ivg[il] = A((size_t) (max_ctx + 8) * 256 * 2);
-                pooled[il] = A((size_t) (max_ctx / 4 + 8) * 128 * 2);
-            }
-        }
+        size_t kvbytes = kv_set_bytes = alloc_kv_set(kcache, ivg, pooled);
         ik_f = A((size_t) Tc * 128 * 4);
         iv_f = A((size_t) Tc * 128 * 4);
         ig_f = A((size_t) Tc * 128 * 4);
@@ -627,6 +638,17 @@ public:
             size_t budget = (work_set > used_now + (size_t) 4 * 1024 * 1024 * 1024ULL) ? (work_set - used_now - (size_t) 4 * 1024 * 1024 * 1024ULL) : ((size_t) 2 * 1024 * 1024 * 1024ULL);
             const char* env_gb = getenv("STRATA_METAL_EXP_CACHE_GB");
             if (env_gb && *env_gb) budget = (size_t) (atof(env_gb) * 1e9);
+            // later allocations (further conversation-slot KV sets) must still fit the working set
+            size_t extra_kv = 0;
+            if (plan_slots > 1 || plan_spill) {
+                const size_t fit = plan_conv_mib * 1048576 / std::max<size_t>(kv_set_bytes, 1);
+                const size_t eff = std::max<size_t>(1, std::min<size_t>((size_t) plan_slots, fit));
+                extra_kv = (eff - 1 + (plan_spill ? 1 : 0)) * kv_set_bytes;
+            }
+            budget = budget > extra_kv ? budget - extra_kv : 0;
+            // one Metal buffer cannot exceed maxBufferLength
+            const size_t max_buf = cx.max_buffer_length();
+            budget = std::min(budget, max_buf > ((size_t) 1 << 30) ? max_buf - ((size_t) 1 << 30) : max_buf / 2);
             budget = std::min(budget, (size_t) 41 * 512 * exp_slot_bytes);
             budget = std::max(budget, (size_t) 512 * exp_slot_bytes);  // at least 1 full layer (512 experts) for prefill!
             exp_n_slots = (int) (budget / exp_slot_bytes);
@@ -1412,6 +1434,9 @@ int main(int argc, char** argv) {
     bool no_lin2 = false, no_moe2 = false, save_logits = false, no_f32x = false, no_pipe = false;
     int pipe_segs_arg = 8;
     bool serve = false, session_reuse = false;
+    int ring_slack_arg = -1, conv_slots_arg = -1, conv_mib_arg = 16384, conv_min_arg = 1024, spill_mib_arg = 32768;
+    std::string spill_dir_arg;
+    bool spill_persist = false;
     std::string vision, dfly_override;
     std::vector<std::string> image_files;
     int64_t image_max_pixels = 4194304;
@@ -1487,7 +1512,14 @@ int main(int argc, char** argv) {
         else if (a == "--ab") ab_rounds = atoi(nxt().c_str());
         else if (a == "--bench-m") bench_m = atoi(nxt().c_str());
         else if (a == "--par-m") par_m = atoi(nxt().c_str());
-        else if (a == "--info") return print_info(nxt());
+        else if (a == "--info") {
+            if (i + 1 >= argc) {
+                // no model: the facts serve needs (drafter / images support) are the build's
+                printf("arch=hy4flash drafter=dfly2 images=%d backend=metal\n", HY4_METAL_IMAGES);
+                return 0;
+            }
+            return print_info(nxt());
+        }
         else if (a == "--version") {
             printf("strata-hy4 %s\n", STRATA_HY4_VERSION);
             return 0;
@@ -1498,6 +1530,13 @@ int main(int argc, char** argv) {
         else if (a == "--native") model = nxt();
         else if (a == "--max-context") max_ctx = atoi(nxt().c_str());
         else if (a == "--session-reuse") session_reuse = atoi(nxt().c_str()) != 0;
+        else if (a == "--ring-slack") ring_slack_arg = atoi(nxt().c_str());
+        else if (a == "--conversation-slots" || a == "--conversation-cache-slots") conv_slots_arg = atoi(nxt().c_str());
+        else if (a == "--conversation-cache-mib") conv_mib_arg = atoi(nxt().c_str());
+        else if (a == "--conversation-min-tokens") conv_min_arg = atoi(nxt().c_str());
+        else if (a == "--conversation-spill-dir") spill_dir_arg = nxt();
+        else if (a == "--conversation-spill-mib") spill_mib_arg = atoi(nxt().c_str());
+        else if (a == "--conversation-spill-persist") spill_persist = true;
         else if (a == "--vision") vision = nxt();
         else if (a == "--image") image_files.push_back(nxt());  // HY4-VISION (offline runs): one picture file per image-pad token of --tokens, in order
         else if (a == "--image-max-pixels") image_max_pixels = atoll(nxt().c_str());
@@ -1546,6 +1585,13 @@ int main(int argc, char** argv) {
         so.no_index = no_index;
         so.no_engram = no_engram;
         so.session_reuse = session_reuse;
+        so.ring_slack = ring_slack_arg >= 0 ? ring_slack_arg : (session_reuse ? 8192 : 0);
+        so.conv_slots = conv_slots_arg > 0 ? conv_slots_arg : (session_reuse ? 4 : 1);
+        so.conv_mib = conv_mib_arg;
+        so.reuse_min = conv_min_arg;
+        so.spill_root = hy4_spill_root(spill_dir_arg, model, session_reuse);
+        so.spill_mib = spill_mib_arg;
+        so.spill_persist = spill_persist;
         so.draft = draft;
         so.spec = scfg;
         if (draft != "off" && draft != "dfly2" && draft != "auto") {
