@@ -105,6 +105,18 @@ HUNYUANIMAGE3_PRE = "hunyuanimage3"
 # its regex on (`use_regex`, the default; tokenizers' `byte_level.rs`, GPT-2's encoder.py), `add_prefix_space` off.
 GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 
+# `inkling2` (Inkling-2-Mini, Thinking Machines): o200k's split as its `tokenizer.json` writes it (Unsloth's GGUF names
+# it `inkling2`), with `model.ignore_merges` set.
+INKLING2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -114,6 +126,7 @@ PRE_TYPES = {
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
     "gpt2": (GPT2_PATTERN, False, "Hugging Face tokenizers' ByteLevel pre-tokenizer (byte_level.rs), GPT-2's"),
+    "inkling2": (INKLING2_PATTERN, True, "strata-engine/Inkling-2-Mini-Strata's tokenizer.json (04996a1e), 2026-11-23"),
 }
 
 # The strings a file's pre-tokenizer regex is compared against another shape's on: enough of the classes
@@ -695,7 +708,13 @@ def extract(gguf_path, out_dir) -> dict:
         if tpl:
             (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
         return cfg
-    tk = Tokenizer.from_gguf(gguf_path)
+    return write_bpe(Tokenizer.from_gguf(gguf_path), out, md.get("tokenizer.chat_template"))
+
+
+def write_bpe(tk: Tokenizer, out: pathlib.Path, tpl: str | None) -> dict:
+    """A byte-level BPE tokenizer into `out` (a pack's `tokenizer/`), with the model's chat template where it has one
+    (fine-tunes change it: Swift 1.5 differs from Qwen3.8-Flash-Next's)."""
+    out.mkdir(parents=True, exist_ok=True)
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -714,10 +733,6 @@ def extract(gguf_path, out_dir) -> dict:
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
@@ -726,11 +741,19 @@ def extract(gguf_path, out_dir) -> dict:
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--gguf")
+    src.add_argument("--tokenizer-json", help="Hugging Face's tokenizer.json (a model without a GGUF: Inkling-2-Mini's "
+                                              ".strata), with --chat-template")
+    ap.add_argument("--chat-template", help="the chat template beside --tokenizer-json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
     args = ap.parse_args()
-    cfg = extract(args.gguf, args.out)
+    if args.tokenizer_json:
+        tpl = pathlib.Path(args.chat_template).read_text(encoding="utf-8") if args.chat_template else None
+        cfg = write_bpe(Tokenizer.from_hf(args.tokenizer_json), pathlib.Path(args.out) / "tokenizer", tpl)
+    else:
+        cfg = extract(args.gguf, args.out)
     if cfg["model"] == "t5":
         print("tokenizer/: Unigram, vocab %d, specials %s" % (cfg["vocab_size"], cfg["special_ids"]))
         if args.check:   # the round trip is byte-level BPE's property: Unigram normalizes its input
@@ -742,7 +765,7 @@ def main() -> int:
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:
-        tk = Tokenizer.from_gguf(args.gguf)
+        tk = Tokenizer.from_hf(args.tokenizer_json) if args.tokenizer_json else Tokenizer.from_gguf(args.gguf)
         corpus = ["", "Hello, world!", "  leading and trailing  ", "a\n\n\nb",
                   "def f(x):\n\treturn x  # comment\n", "\u4f60\u597d\uff0c\u4e16\u754c",
                   "\u0645\u0631\u062d\u0628\u0627",

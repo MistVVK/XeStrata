@@ -2594,8 +2594,7 @@ static void plain_usage(const std::string& arch) {
                  "                       the model's DFlash2 pack (--draft-model; GLM-5.3-Flash, Qwen3.6-35B-A3B);\n"
                  "                       auto: --serve measures the MTP, DFlash2 and none at its start and keeps the\n"
                  "                       fastest; without --serve the MTP\n"
-                 "  --draft dspark       Inkling-2-Mini's DSpark (greedy, command line only)\n"
-                 "  --draft-model FILE   the model's DFlash2 pack or DSpark GGUF\n"
+                 "  --draft-model FILE   the model's DFlash2 pack\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
@@ -2669,9 +2668,8 @@ static void plain_usage(const std::string& arch) {
                  "  --vision             --serve takes pictures too (GENI; qwen35, qwen35moe and sensenova_loop, the rows from xestrata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --device cpu|gpu     where the forward runs (default gpu; the dense Qwen3.5 models, qwen35, run on\n"
-                 "                       the CPU as well, and take it when no GPU is there; Inkling-2-Mini also runs on the CPU)\n"
-                 "  --cpu-threads N      --device cpu: forward threads (default: physical cores, subject to the CPU quota;\n"
-                 "                       Inkling-2-Mini: logical CPUs / 8, at least 1)\n"
+                 "                       the CPU as well, and take it when no GPU is there)\n"
+                 "  --cpu-threads N      --device cpu: forward threads (default: physical cores, subject to the CPU quota)\n"
                  "  --gpu-layers N       dense models: the first N blocks and the head on the GPU, the rest on the CPU\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory, and\n"
@@ -2691,6 +2689,11 @@ int plain_main(int argc, char** argv) {
     if (gguf.empty()) return -1;
     const std::string arch = architecture(gguf);
     if (arch.empty() || arch == "qwen4exp") return -1;
+    if (arch == "inkling2_loop") {   // Inkling-2-Mini runs from its .strata files (src/inkling2), not from a GGUF
+        std::fprintf(stderr, "xestrata (inkling2_loop): %s is a GGUF of Inkling-2-Mini; the engine reads its .strata "
+                             "v1.1 files (setup installs them)\n", gguf.c_str());
+        return 2;
+    }
     linkless_gpu_adapter();
 
     strata::core::PlainOptions opt;
@@ -3041,9 +3044,6 @@ int plain_main(int argc, char** argv) {
     }
     // the CPU: asked for, or a dense model (Qwen3.5, PLaMo 3) on a PC whose SYCL runtime lists no GPU it can use
     const bool dense_arch = arch == "qwen35" || arch == "plamo3";
-    // inkling2_loop's CPU reference (plain_inkling.cpp) is not dense, but it is the only path for this arch in this
-    // stage; --device cpu must reach it rather than the dense-only guard below.
-    const bool cpu_arch = dense_arch || arch == "inkling2_loop";
     if (!opt.cpu && !device_given && dense_arch) {
         int gpus = 0;
         try {
@@ -3057,9 +3057,9 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (opt.cpu) {
-        if (!cpu_arch) {
-            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense models (qwen35, plamo3) and "
-                                 "inkling2_loop only\n", arch.c_str());
+        if (!dense_arch) {
+            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense models (qwen35, plamo3) only\n",
+                         arch.c_str());
             return 2;
         }
         if (opt.vision) {
@@ -3076,16 +3076,6 @@ int plain_main(int argc, char** argv) {
         opt.kv_grow = 0;
         opt.vram_elastic = false;
         opt.batch_slots = 0;
-    }
-    const bool dspark = opt.draft == "dspark";
-    if (dspark) {
-        if (arch != "inkling2_loop" || opt.max_t < 2 || serve || sp.temperature != 0.0f || !follow.empty()) {
-            std::fprintf(stderr, "xestrata: --draft dspark needs inkling2_loop, --max-t >= 2 and greedy CLI decoding "
-                                 "without --spec-follow\n");
-            return 2;
-        }
-        if (opt.draft_model.empty())
-            opt.draft_model = (std::filesystem::path(gguf).parent_path() / "dspark-Inkling-2-Mini-Q8_0.gguf").string();
     }
     auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
 
@@ -3334,21 +3324,7 @@ int plain_main(int argc, char** argv) {
         return 1;
     }
     const std::vector<int32_t> stop = stop_eos ? eos : std::vector<int32_t>();
-    int64_t draft_blocks = 0, proposed_total = 0, accepted_total = 0;
     while ((int64_t) produced.size() < n_new && !at_eos(produced.back())) {
-        if (dspark && n_new - (int64_t) produced.size() > 1) {
-            const int count = (int) std::min<int64_t>({7, T - 1, n_new - (int64_t) produced.size() - 1});
-            int n_emit = 0, n_accept = 0;
-            if (!model.dspark_step(produced.back(), pos, count, stop, out.data(), lg, n_emit, n_accept, err))
-                return start_failed(err);
-            ++draft_blocks;
-            proposed_total += count;
-            accepted_total += n_accept;
-            for (int row = 0; row < n_emit; ++row)
-                if (!emit(row)) return 1;
-            pos += n_emit;
-            continue;
-        }
         if (spec) {
             int n_emit = 0;
             const size_t at = produced.size();   // the continuation's tokens after the pending one
@@ -3395,10 +3371,6 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
                              "them out of a stage buffer (XESTRATA_RAM_ADAPT)\n", arch.c_str(),
                      (long long) model.ram_adapts(), (long long) model.ram_staged());
-    if (draft_blocks > 0)
-        std::fprintf(stderr, "xestrata (%s): DSpark %lld blocks, %lld proposals, %lld accepted (%.1f%%)\n",
-                     arch.c_str(), (long long) draft_blocks, (long long) proposed_total, (long long) accepted_total,
-                     100.0 * (double) accepted_total / (double) proposed_total);
     if (model.spec_windows() > 0)
         std::fprintf(stderr, "xestrata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",

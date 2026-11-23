@@ -83,7 +83,10 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
-        self.source = keep_thinking_switch(Path(path).read_text(encoding="utf-8"))
+        # Hugging Face's {% generation %} ... {% endgeneration %} only mark the assistant's tokens for training
+        # (Inkling-2-Mini's template has them): Jinja has no such tag, and rendering needs nothing of them
+        self.source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "",
+                             keep_thinking_switch(Path(path).read_text(encoding="utf-8")))
         self.template = env.from_string(self.source)
         # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
         self.harmony = "<|channel|>" in self.source
@@ -93,6 +96,9 @@ class ChatTemplate:
         # GLM's templates (GLM-5.3-Flash): a call is `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
         # </tool_call>`, read through GlmCallRewriter; the thinking always opened, its effort low, high or max
         self.call_form = "glm" if "<arg_key>" in self.source else "qwen"
+        # Inkling-2-Mini's template: its replies are channel tokens (serve/inkling_dialect.py reads them), its calls'
+        # arguments parsed objects, and no thinking (upstream inkling2's no-thinking mode)
+        self.inkling = "<|content_invoke_tool_json|>" in self.source
         self.caps = self._detect_caps()
         self.thinking = self._thinking_levels()
 
@@ -101,6 +107,8 @@ class ChatTemplate:
         (/health's "thinking", the web page's buttons): GLM-5.3-Flash's low, high and max; Harmony's (llm-jp-4.1's)
         low, medium and high, medium its default; Qwen3.8-Flash-Next's low, medium and high (xhigh); a template that
         only turns its thinking on and off, on; none at all, no levels."""
+        if self.inkling:
+            return {"levels": [], "default": None}
         if self.call_form == "glm":
             return {"levels": ["none", "low", "high", "max"], "default": "max"}
         if self.harmony:
@@ -131,6 +139,9 @@ class ChatTemplate:
                         m.pop("content", None)
                 adjusted.append(m)
             messages = adjusted
+        if self.inkling:
+            from serve import inkling_dialect
+            messages, kwargs = inkling_dialect.prepare_messages(messages), inkling_dialect.template_kwargs(kwargs)
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         if self.call_form == "glm":        # its efforts: low, high and max (the default), taken by name

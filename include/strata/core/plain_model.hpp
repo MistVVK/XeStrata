@@ -67,7 +67,6 @@ namespace strata::core {
 
 class RemoteExperts;
 class PlainCpu;
-class PlainInkling;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -117,8 +116,8 @@ struct PlainOptions {
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
-    /// --device cpu: the dense Qwen3.5 or Inkling-2-Mini forward on the CPU alone, no GPU opened; `cpu_threads` is
-    /// the thread count (0: physical cores, subject to the CPU quota; Inkling-2-Mini: logical CPUs / 8, at least 1)
+    /// --device cpu: the dense Qwen3.5 forward on the CPU alone, no GPU opened; `cpu_threads` is the thread count (0:
+    /// physical cores, subject to the CPU quota)
     bool cpu = false;
     int cpu_threads = 0;
     /// --gpu-layers N (the dense models: qwen35, plamo3): the first N blocks and the head on the GPU, the other blocks
@@ -371,10 +370,6 @@ public:
                    const strata::kernels::SamplerParams* sp, int T, int32_t* drafts, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
-    const float* inkling_tap_dev() const;
-    // Check a DSpark block against the target. Only matched rows enter the target state.
-    bool dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
-                     int32_t* out, float* logits, int& emitted, int& accepted, std::string& err);
 
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
@@ -1119,8 +1114,6 @@ private:
     std::unique_ptr<GgufModel> model_;
     // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
     std::unique_ptr<PlainCpu> cpu_;
-    /// inkling2_loop's CPU reference forward (--device cpu); the GPU path is not implemented in this stage.
-    std::unique_ptr<PlainInkling> inkling_;
     /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
     /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
     bool auto_gpu_layers(std::string& err);

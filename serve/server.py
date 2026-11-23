@@ -81,7 +81,7 @@ from serve import places  # noqa: E402
 from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
 from serve import notices  # noqa: E402
-from serve import envvars  # noqa: E402
+from serve import envvars, inkling_kind  # noqa: E402
 from serve import autotune  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve import skills as skills_api  # noqa: E402
@@ -4004,6 +4004,8 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
+    if inkling_kind.is_inkling(cfg):                  # Inkling-2-Mini's engine takes its own options
+        return inkling_kind.engine_args(cfg)
     args = list(cfg["args"])
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited
     # by hand) advertised images and then refused every picture ("this engine was started without --vision").  The
@@ -6269,6 +6271,8 @@ class Service:
                          recover=self.tool_call_recovery, declared_only=declared_only,
                          # #4622: a well-formed call of an undeclared name is a call too, opt-in as for a deferred tool
                          deferred=deferred or self.undeclared_tool_calls == "call"))
+        if getattr(self.template, "inkling", False):    # Inkling-2-Mini's channel tokens (serve/inkling_dialect.py)
+            parser = inkling_kind.Reader(parser)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short

@@ -182,9 +182,12 @@ FALLBACK_FAMILIES = {
                        "on disk",
               "tag": "edge0-", "vision": False},
     "inkling": {"title": "Inkling-2-Mini",
-                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; mainline GGUF layout; "
-                         "text only, no picture reader in the text engine",
+                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; text only",
                 "tag": "inkling-", "vision": False},
+    "inkling-qsa": {"title": "Inkling-2-Mini (QSA)",
+                    "about": "Inkling-2-Mini with a block-sparse QSA indexer: faster on long chats, though it may miss "
+                             "details far back (many exact facts at once are better without it); text only",
+                    "tag": "inkling-qsa-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",

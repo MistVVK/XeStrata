@@ -67,9 +67,13 @@ class FirstOffered(unittest.TestCase):
                 self.assertEqual(said, "")
 
     def test_a_closed_step_is_passed_over_for_the_next(self):
-        # 20 GB of RAM and a 16 GB card: SenseNova-Loop-9B (QSA), the 4th step, else Qwen3.5-2B, the 5th
-        self.assertEqual(setup.first_choice(FAMS, room(20, 16))[0], "sensenova-loop-qsa")
-        got, said = self.offered(closed(setup.SENSENOVA_QSA_REPO), 20, 16)
+        # 20 GB of RAM and a 16 GB card: Inkling-2-Mini (QSA), the 4th step, else SenseNova-Loop-9B (QSA), the 5th,
+        # else Qwen3.5-2B, the 6th
+        self.assertEqual(setup.first_choice(FAMS, room(20, 16))[0], "inkling-qsa")
+        got, said = self.offered(closed(setup._INKLING), 20, 16)
+        self.assertEqual(got, ("sensenova-loop-qsa", None))
+        self.assertIn(setup.FAMILIES["inkling-qsa"]["title"], said)
+        got, said = self.offered(closed(setup._INKLING, setup.SENSENOVA_QSA_REPO), 20, 16)
         self.assertEqual(got, ("qwen35-2b", None))
         self.assertIn(setup.FAMILIES["sensenova-loop-qsa"]["title"], said)
         self.assertIn(setup.SENSENOVA_QSA_REPO, said)
@@ -77,11 +81,11 @@ class FirstOffered(unittest.TestCase):
         self.assertIn("passed over", said)
 
     def test_each_closed_step_in_turn(self):
-        # 32 GB of RAM and a 12 GB card: Sync-S; Sync's and SenseNova's repositories closed -> Qwen3.5-2B
+        # 32 GB of RAM and a 12 GB card: Sync-S; Sync's, Inkling's and SenseNova's repositories closed -> Qwen3.5-2B
         r = room(32, 12)
         self.assertEqual(setup.first_choice(FAMS, r), ("sync", None))
-        self.assertEqual(setup.first_choice([f for f in FAMS if f != "sync"], r)[0], "sensenova-loop-qsa")
-        got, said = self.offered(closed(setup.SYNC_REPOS["Sync-S"], setup.SENSENOVA_QSA_REPO), 32, 12)
+        self.assertEqual(setup.first_choice([f for f in FAMS if f != "sync"], r)[0], "inkling-qsa")
+        got, said = self.offered(closed(setup.SYNC_REPOS["Sync-S"], setup._INKLING, setup.SENSENOVA_QSA_REPO), 32, 12)
         self.assertEqual(got[0], "qwen35-2b")
         self.assertIn(setup.SYNC_REPOS["Sync-S"], said)
         self.assertIn(setup.SENSENOVA_QSA_REPO, said)
@@ -91,10 +95,11 @@ class FirstOffered(unittest.TestCase):
         for ram, vram in ((20, 16), (32, None)):      # the last step after a closed one; on the CPU, the only one
             with self.subTest(ram=ram, vram=vram):
                 with self.assertRaises(SystemExit) as stop:
-                    self.offered(closed(setup.SENSENOVA_QSA_REPO, last), ram, vram)
+                    self.offered(closed(setup._INKLING, setup.SENSENOVA_QSA_REPO, last), ram, vram)
                 self.assertEqual(stop.exception.code, 1)
         out = io.StringIO()
-        with closed(setup.SENSENOVA_QSA_REPO, last), contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+        with closed(setup._INKLING, setup.SENSENOVA_QSA_REPO, last), contextlib.redirect_stdout(out), \
+                self.assertRaises(SystemExit):
             setup.first_offered(FAMS, room(20, 16))
         said = out.getvalue()
         self.assertIn(setup.SENSENOVA_QSA_REPO, said)
@@ -108,7 +113,7 @@ class FirstOffered(unittest.TestCase):
         for err in (urllib.error.URLError("no DNS"), TimeoutError(), missing):
             with self.subTest(err=err):
                 got, said = self.offered(closed(other=err), 20, 16)
-                self.assertEqual(got, ("sensenova-loop-qsa", None))
+                self.assertEqual(got, ("inkling-qsa", None))
                 self.assertEqual(said, "")
 
     def test_the_probe_is_a_head_without_a_login(self):
