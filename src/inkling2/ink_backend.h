@@ -32,6 +32,8 @@ struct BackendOpts {
     // The QSA indexer (QSAW v1, sycl/ink_sy_qsa.h): loaded where a path is given; a slot uses it where its request
     // says so (serve's qsa= key, set_slot_qsa), else `qsa_default`.  The tokens a query keeps: `qsa_budget` in all,
     // the first `qsa_sink` and the last `qsa_local` of them always (multiples of the indexer's 4-token block).
+    // PROVISIONAL (2026-11-23): 2048 / 256 / 16 are the fork's engine's defaults (inkling2_engine.cu's
+    // QsaIndexerWeights) and its README's recall table's budget; the MODEL check's measurements decide them.
     std::string qsa_path;
     bool qsa_default = false;
     int qsa_budget = 2048;

@@ -1731,8 +1731,7 @@ class StrataEngine:
             keys += " script_table=" + str(sgt["table"]).encode().hex()
             keys += f" script_allow={sgt['allow']}" if sgt.get("allow") else ""
             keys += f" script_pending={sgt['pending']}" if sgt.get("pending") else ""
-        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias")) + \
-            inkling_kind.qsa_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -11580,7 +11579,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection", "script_guard", "xestrata_qsa")
+               "experimental_speed_projection", "script_guard")
 
 
 def script_guard_name(value) -> str:
@@ -11624,9 +11623,6 @@ def clean_shared_defaults(d) -> dict:
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
-        elif key == "xestrata_qsa":                            # Inkling-2-Mini's QSA indexer (serve/inkling_kind.py)
-            if not isinstance(value, bool):
-                raise ValueError("xestrata_qsa: true or false")
         elif key == "script_guard":
             value = script_guard.parse(value)
         else:

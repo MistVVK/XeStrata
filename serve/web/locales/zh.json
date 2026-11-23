@@ -315,8 +315,6 @@
   "drawer.segLimit": "段的大小",
   "drawer.share": "也用于其他应用",
   "drawer.shareNote": "omp 等 API 客户端未自行设置的项目会使用这些设置",
-  "settings.qsa": "长对话的稀疏注意力（QSA）",
-  "settings.qsaNote": "长对话更快；可能遗漏很久之前的细节（需要一次准确找出许多事实时最好关闭）。从下一条消息起生效",
   "drawer.short": "设置",
   "drawer.showThinking": "显示思考过程",
   "drawer.showThinkingNote": "生成时保持展开",

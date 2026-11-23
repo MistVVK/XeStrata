@@ -227,8 +227,6 @@
   "drawer.segmentsOff": "Turn off going on past the context?\n\nA chat that fills the context will then stop with an error instead of going on in a new segment. Chats already in segments stay as they are.",
   "drawer.share": "Use for other apps too",
   "drawer.shareNote": "omp and other API clients get these settings for anything they do not set themselves",
-  "settings.qsa": "Sparse attention for long chats (QSA)",
-  "settings.qsaNote": "faster with a long chat; it may miss details far back (many exact facts at once are better with it off). Takes effect from the next message",
   "drawer.short": "Settings",
   "drawer.showThinking": "Show thinking",
   "drawer.showThinkingNote": "expanded while it streams",

@@ -2377,7 +2377,6 @@ async function generateReply(opts = {}) {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (qsaLoaded()) body.xestrata_qsa = qsaChoice(settings);
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   if (settings.skills !== false && userSkillsOn()) body.xestrata_skills = true;   // the skills the user added (load_skill)
   if (health.translation) body.xestrata_translate = true;   // translations go to the translation model (its tool)
@@ -3062,8 +3061,6 @@ function loadDrawer(s = settings) {
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
-  $("s-qsa").setAttribute("aria-checked", String(qsaChoice(s)));
-  $("qsa-row").hidden = !qsaLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-skills").setAttribute("aria-checked", String(s.skills !== false));
   $("s-textgpu").value = s.textGpu || "";
@@ -3099,7 +3096,6 @@ function sharedDefaults(s) {
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
-  if (qsaLoaded()) d.xestrata_qsa = qsaChoice(s);
   if (s.script) d.script_guard = scriptGuard(s);      // only a choice of the user's, as the values above
   return d;
 }
@@ -3112,15 +3108,6 @@ async function saveShared(on, s) {
     throw new Error(msg);
   }
   sharedOn = !!(await r.json()).shared;
-}
-// the engine has the QSA indexer (Inkling-2-Mini's, INFO qsa=1 off by default, 2 on): the user's switch, else that default
-function qsaLoaded() {
-  const q = lastMetrics && lastMetrics.engine ? String(lastMetrics.engine.qsa ?? "0") : "0";
-  return q === "1" || q === "2";
-}
-function qsaChoice(s) {
-  if (typeof s.qsa === "boolean") return s.qsa;
-  return !!(lastMetrics && lastMetrics.engine && String(lastMetrics.engine.qsa) === "2");
 }
 // the engine was started with the experimental-speed-projection control vector (INFO cvec=...)
 function projectionLoaded() {
@@ -3188,7 +3175,7 @@ for (const [id, key] of SAMPLING_SLIDERS) {
   el._reset = b;
   el.closest(".st-field").querySelector(".st-label").append(b);
 }
-for (const id of ["s-math", "s-show", "s-esp", "s-qsa", "s-mcp", "s-skills", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-skills", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
 // going on past the context is what keeps a long chat going: switching it off asks first
@@ -3207,7 +3194,6 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
-              qsa: qsaLoaded() ? checked("s-qsa") : prev.qsa,
               skills: checked("s-skills"), textGpu: $("s-textgpu").value, imageGpu: $("s-imagegpu").value,
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "queue", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),

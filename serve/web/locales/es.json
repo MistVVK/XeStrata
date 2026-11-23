@@ -315,8 +315,6 @@
   "drawer.segLimit": "Tamaño del segmento",
   "drawer.share": "Usar también para otras apps",
   "drawer.shareNote": "omp y otros clientes de la API reciben estos ajustes para todo lo que no definan ellos mismos",
-  "settings.qsa": "Atención dispersa para chats largos (QSA)",
-  "settings.qsaNote": "más rápido con un chat largo; puede perder detalles muy anteriores (para muchos datos exactos a la vez, mejor desactivado). Se aplica desde el próximo mensaje",
   "drawer.short": "Ajustes",
   "drawer.showThinking": "Mostrar el razonamiento",
   "drawer.showThinkingNote": "desplegado mientras se escribe",

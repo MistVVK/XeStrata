@@ -5,9 +5,8 @@
 v0.2.19, without its own program): xestrata-engine with a .strata v1.1 model takes its own short list of options
 (src/inkling2/ink_main.cpp), so the server's other options for the other engines are left out here.
 
-The config's keys it reads: "args" (setup's: --native, --max-context, --qsa-indexer, ...), "parallel" (1..64 slots,
---slots), "drafting" ("off" turns DSpark off) and "qsa" ("on" or "off": whether a request that does not say uses
-the QSA indexer; a request says with the web app's switch, the xestrata_qsa field)."""
+The config's keys it reads: "args" (setup's: --native, --max-context, and for Inkling-2-Mini (QSA) --qsa-indexer and
+--qsa on), "parallel" (1..64 slots, --slots) and "drafting" ("off" turns DSpark off)."""
 from __future__ import annotations
 
 import json
@@ -34,8 +33,8 @@ def is_inkling(cfg: dict | None) -> bool:
 
 
 def engine_args(cfg: dict, announce: bool = True) -> list[str]:
-    """The engine's arguments: the config's that the Inkling engine takes, then the slots, the drafter and the QSA
-    default from the config's keys.  An option it does not take is left out and said (once, at the start)."""
+    """The engine's arguments: the config's that the Inkling engine takes, then the slots and the drafter from the
+    config's keys.  An option it does not take is left out and said (once, at the start)."""
     args, dropped = [], []
     src = list(cfg.get("args") or [])
     i = 0
@@ -55,8 +54,6 @@ def engine_args(cfg: dict, announce: bool = True) -> list[str]:
         args += ["--slots", str(par)]
     if cfg.get("drafting") == "off" and "--draft" not in args:
         args += ["--draft", "off"]
-    if cfg.get("qsa") in ("on", "off") and "--qsa" not in args and "--qsa-indexer" in args:
-        args += ["--qsa", cfg["qsa"]]
     if dropped and announce:
         print(f"[xestrata] Inkling-2-Mini's engine does not take {' '.join(dropped)}: left out", flush=True)
     return args
@@ -70,13 +67,6 @@ def end_ids(tokenizer) -> set[int]:
         if len(got) == 1:
             ids.add(int(got[0]))
     return ids
-
-
-def qsa_key(sampling: dict) -> str:
-    """The GEN key for a request's own choice of the QSA indexer (the web app's switch: "xestrata_qsa": true/false);
-    nothing when the request does not say (the engine's --qsa applies)."""
-    v = sampling.get("xestrata_qsa")
-    return f" qsa={int(v)}" if isinstance(v, bool) else ""
 
 
 class Reader:
