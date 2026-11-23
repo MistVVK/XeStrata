@@ -184,6 +184,12 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_ROOM_MIN_CAP = 1024
+FIT_MIN_ROOM = 1024          # 台帳 0828 (#5924): fit_max_tokens never shortens below room for an answer
+
+
+def fit_floor(ctx: int) -> int:
+    """The least room fit_max_tokens shortens to: FIT_MIN_ROOM, at most a quarter of a small context."""
+    return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
 # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 ANSWER_RESERVE_MIN = 512
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
@@ -263,11 +269,13 @@ class ContextOverflow(ValueError):
     too long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does
     for Anthropic's own error (#4838)."""
 
-    def __init__(self, text, *, prompt, context, max_new=None):
+    def __init__(self, text, *, prompt, context, max_new=None, min_room=None):
         super().__init__(text)
-        self.prompt, self.context, self.max_new = prompt, context, max_new
+        self.prompt, self.context, self.max_new, self.min_room = prompt, context, max_new, min_room
 
     def anthropic_text(self) -> str:
+        if self.min_room:              # 台帳 0828: room left, but less than an answer needs: the client should compact
+            return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; {self}"
         room = self.context - CTX_SLACK
         if self.max_new is None or self.prompt > room - 1:   # the prompt alone leaves no room
             return f"prompt is too long: {self.prompt} tokens > {room - 1} maximum; {self}"
@@ -5851,6 +5859,15 @@ class Service:
                                       f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
+            floor = fit_floor(ctx)
+            if self.fit_max_tokens and room < floor:
+                # 台帳 0828: a clamp to a few hundred tokens left a thinking model no room to answer or call a tool.
+                self.forget_prompt(encoded_ids)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
+                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
+                                      prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
