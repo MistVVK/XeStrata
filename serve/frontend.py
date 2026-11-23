@@ -1186,6 +1186,24 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     at = text.find(PARAM_END)
     while at >= 0:
         if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            # 台帳 carryover 859f0da47（#5756）: 値の中にある `<parameter=X>...</parameter>` の
+            # 同じ行の閉じは、値自身の閉じが省かれた時に値の終わりになる。
+            if hold and _nested_close(text, at):
+                skip_to = at + len(PARAM_END)
+                nafter = text[skip_to:].lstrip()
+                if nafter.startswith((FUNC_END, CALL_END)):
+                    verdict = _close_verdict(nafter, final)
+                    if verdict == "end":
+                        return skip_to
+                    if verdict == "hold":
+                        return -2
+                elif nafter.startswith(PARAM_START):
+                    gt = nafter.find(">")
+                    if gt < 0:
+                        return skip_to if final else -2
+                    return skip_to
+                elif not nafter and not final:
+                    return -2
             after = text[at + len(PARAM_END):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
@@ -1203,6 +1221,22 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                 return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
+
+
+def _nested_close(text: str, at: int) -> bool:
+    """`text[at]` が値の中の `<parameter=X>` の閉じか（台帳 carryover 859f0da47）。値自身の閉じは
+    改行の後にあるので、opener と同じ行にある閉じは入れ子の組の物とみなす。"""
+    opens = [m.start() for m in re.finditer(re.escape(PARAM_START), text[:at])]
+    if len(opens) <= text.count(PARAM_END, 0, at):
+        return False
+    return "\n" not in text[opens[-1]:at]
+
+
+def _close_len(text: str, at: int) -> int:
+    """How much `param_end`'s result consumes (台帳 carryover 859f0da47): 0 when the found close was a nested
+    pair's and the value's own closer was left out."""
+    return 0 if at >= len(PARAM_END) and text.startswith(PARAM_END, at - len(PARAM_END)) \
+        and _nested_close(text, at - len(PARAM_END)) else len(PARAM_END)
 
 
 def call_end(text: str, final: bool = False, hold: bool = True) -> int:
@@ -1228,7 +1262,7 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
             end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold)
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + _close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
@@ -1448,7 +1482,7 @@ def function_end(text: str) -> int:
             end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False)  # the old rule
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + _close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             return pos + len(FUNC_END)
         else:
@@ -1764,7 +1798,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         # 台帳 0863: two writes of a non-string parameter are the same parameter; a later write wins.
         end = param_end(rest, final=True, name=pname.strip(), split_repeats=_nonstring_type(declared, root))
         value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        rest = rest[end + _close_len(rest, end):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
@@ -2369,7 +2403,7 @@ class OutputParser:
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(PARAM_END)
+                    self.sp += end + _close_len(rest, end)
                     self.ss = "between"
                     continue
                 # an undecided </parameter> (-2) is held from its start, like a tag still arriving; so is a
@@ -2403,7 +2437,7 @@ class OutputParser:
                         self.sheld[self.sraw_pname] = v
                 elif v is not _SKIP:
                     args(json.dumps(v, ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                self.sp += end + _close_len(rest, end)
                 self.ss = "between"
             else:
                 return out
