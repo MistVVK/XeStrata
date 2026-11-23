@@ -132,7 +132,7 @@
   },
   "BATCH_DECODE_SHARE": {
    "reads": [
-    "src/program/generate.cpp:12547"
+    "src/program/generate.cpp:12564"
    ]
   },
   "BATCH_GROUPS_NV_SERIAL": {
@@ -201,7 +201,7 @@
   },
   "CACHE_MESSAGE_BOUNDARY": {
    "reads": [
-    "src/program/generate.cpp:12830"
+    "src/program/generate.cpp:12847"
    ]
   },
   "CANON": {
@@ -317,7 +317,7 @@
   },
   "DECODE_TIMING": {
    "reads": [
-    "src/program/generate.cpp:13039"
+    "src/program/generate.cpp:13056"
    ]
   },
   "DEC_BATCH": {
@@ -349,7 +349,7 @@
   },
   "DF2_BLOCK_LOG": {
    "reads": [
-    "src/program/generate.cpp:14066",
+    "src/program/generate.cpp:14162",
     "src/program/plain_generate.cpp:2432"
    ]
   },
@@ -464,7 +464,7 @@
   },
   "DUMP_FIRST_LOGITS": {
    "reads": [
-    "src/program/generate.cpp:13820"
+    "src/program/generate.cpp:13916"
    ]
   },
   "EMB_REUSE_ACCOUNT": {
@@ -541,12 +541,12 @@
   },
   "FOLLOW": {
    "reads": [
-    "src/program/generate.cpp:12985"
+    "src/program/generate.cpp:13002"
    ]
   },
   "FOLLOW_LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:13006"
+    "src/program/generate.cpp:13023"
    ]
   },
   "FORCE_AVX2": {
@@ -1066,13 +1066,13 @@
   },
   "LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12403",
-    "src/program/generate.cpp:12435"
+    "src/program/generate.cpp:12420",
+    "src/program/generate.cpp:12452"
    ]
   },
   "LOGPOS_EXTRA": {
    "reads": [
-    "src/program/generate.cpp:12439"
+    "src/program/generate.cpp:12456"
    ]
   },
   "LOGPOS_TOPK": {
@@ -1093,8 +1093,8 @@
   },
   "LOOKUP_CHAIN_FIXED": {
    "reads": [
-    "src/program/generate.cpp:13023",
-    "src/program/generate.cpp:15230"
+    "src/program/generate.cpp:13040",
+    "src/program/generate.cpp:15326"
    ]
   },
   "LOOP_GUARD": {
@@ -1382,7 +1382,7 @@
   },
   "PENALTY_PROMPT": {
    "reads": [
-    "src/program/generate.cpp:12809",
+    "src/program/generate.cpp:12826",
     "src/program/plain_generate.cpp:1653"
    ]
   },
@@ -1421,6 +1421,16 @@
    "reads": [
     "src/core/plain_model.cpp:5784",
     "src/program/generate.cpp:201"
+   ]
+  },
+  "PIPELINE_LAZY_CHAIN": {
+   "reads": [
+    "src/program/generate.cpp:12275"
+   ]
+  },
+  "PIPELINE_LOOKUP_RUN": {
+   "reads": [
+    "src/program/generate.cpp:12282"
    ]
   },
   "PIPELINE_THETA": {
@@ -1515,9 +1525,14 @@
     "src/program/plain_generate.cpp:3121"
    ]
   },
+  "POOL_DEP": {
+   "reads": [
+    "src/kernels/cpu/pool.cpp:476"
+   ]
+  },
   "POOL_ITEMS": {
    "reads": [
-    "src/kernels/cpu/pool.cpp:753"
+    "src/kernels/cpu/pool.cpp:803"
    ]
   },
   "POOL_SPIN_US": {
@@ -1787,7 +1802,7 @@
   "RAM_ADAPT": {
    "reads": [
     "src/core/plain_model.cpp:5497",
-    "src/program/generate.cpp:13765"
+    "src/program/generate.cpp:13861"
    ]
   },
   "RAM_RESERVE_MIB": {
@@ -1918,7 +1933,7 @@
   },
   "SERVE_STOP_BOUND": {
    "reads": [
-    "src/program/generate.cpp:13017"
+    "src/program/generate.cpp:13034"
    ]
   },
   "SESSION_BUFFERED": {
@@ -1976,7 +1991,7 @@
   },
   "SPEC_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:14394"
+    "src/program/generate.cpp:14490"
    ]
   },
   "SPEC_FIXED": {
@@ -1996,7 +2011,7 @@
   },
   "SPEC_WATCH": {
    "reads": [
-    "src/program/generate.cpp:15156"
+    "src/program/generate.cpp:15252"
    ]
   },
   "SPLIT_CPU_GBPS": {
@@ -2079,7 +2094,7 @@
   },
   "SPLIT_TIMING": {
    "reads": [
-    "src/program/generate.cpp:14367"
+    "src/program/generate.cpp:14463"
    ]
   },
   "SSD_KEEPALIVE": {
@@ -2125,13 +2140,13 @@
   },
   "STATE_HASH": {
    "reads": [
-    "src/program/generate.cpp:14128"
+    "src/program/generate.cpp:14224"
    ]
   },
   "STATE_HASH_GDN": {
    "reads": [
     "src/prefill/prefill.cpp:4647",
-    "src/program/generate.cpp:14159"
+    "src/program/generate.cpp:14255"
    ]
   },
   "SUB_GROUP_32": {
@@ -2186,7 +2201,7 @@
   },
   "TRACE_ADAPT": {
    "reads": [
-    "src/program/generate.cpp:15012"
+    "src/program/generate.cpp:15108"
    ]
   },
   "TRAIN_CONTROL_MS": {
