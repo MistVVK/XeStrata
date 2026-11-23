@@ -1778,7 +1778,8 @@ def _properties(schema) -> dict:
     return props if isinstance(props, dict) else {}
 
 
-def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None) -> ToolCall:
+def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None,
+                    recover: bool = False) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
@@ -1806,7 +1807,14 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         v = _argument_value(value, declared, root, notes)
         if v is not _SKIP:
             args[pname] = v
+    if recover and unwrap_arguments(args, props):
+        args = args["arguments"]
     return ToolCall(name=name, arguments=args)
+
+
+def unwrap_arguments(args: dict, props: dict) -> bool:
+    """台帳 carryover c447a2850（#5804）: 単一の <parameter=arguments> に JSON 全体が入った場合に展开する。"""
+    return list(args) == ["arguments"] and isinstance(args["arguments"], dict) and "arguments" not in props
 
 
 # ------------------------------------------------------------------------------------------------ harmony
@@ -2007,6 +2015,7 @@ class OutputParser:
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
+        self.rbare = False           # 台帳 carryover c447a2850: reasoning の裸の call
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276: the end of a misspelt opener still arriving (see _opener)
@@ -2125,6 +2134,11 @@ class OutputParser:
                     return p, True
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
+
+    def _bare_in_reasoning(self):
+        """reasoning の中の宣言済み工具の裸の <function=NAME> を (位置, 決定済み) で返す。"""
+        b, decided = self._bare_opener()
+        return (b, decided) if b >= 0 else None
 
     @property
     def line(self) -> str:
@@ -2370,7 +2384,8 @@ class OutputParser:
                     pname = self.spname = stripped[11:b]
                     self.sraw_pname = pname
                     self.sp += b + 1
-                    held = _nonstring_type(self.sprops.get(pname), self.sroot)
+                    held = _nonstring_type(self.sprops.get(pname), self.sroot) or \
+                        (self.recover and pname.strip() == "arguments")
                     if not held:
                         args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                         self.sfirst = False
@@ -2431,7 +2446,8 @@ class OutputParser:
                 if value.endswith("\n"):
                     value = value[:-1]
                 v = _argument_value(value, declared, self.sroot)
-                if self.sheld is not None and _nonstring_type(declared, self.sroot):
+                if self.sheld is not None and (_nonstring_type(declared, self.sroot)
+                                               or (self.recover and self.sraw_pname.strip() == "arguments")):
                     if v is not _SKIP:
                         self.sheld.pop(self.sraw_pname, None)
                         self.sheld[self.sraw_pname] = v
@@ -2453,13 +2469,16 @@ class OutputParser:
         elif self.ss == "raw":
             declared = self.sprops.get(self.spname)
             v = _argument_value(self.buf[self.sp:].strip("\n"), declared, self.sroot)
-            if _nonstring_type(declared, self.sroot):
+            if _nonstring_type(declared, self.sroot) or (self.recover and self.sraw_pname.strip() == "arguments"):
                 if v is not _SKIP:
                     self.sheld.pop(self.sraw_pname, None)
                     self.sheld[self.sraw_pname] = v
             elif v is not _SKIP:
                 tail += json.dumps(v, ensure_ascii=False)
-        for k, v in self.sheld.items():
+        held = self.sheld
+        if self.recover and self.sfirst and unwrap_arguments(held, self.sprops):
+            held = held["arguments"]
+        for k, v in held.items():
             tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
             self.sfirst = False
         self.sheld = {}
@@ -2559,7 +2578,8 @@ class OutputParser:
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
-                body = self.buf[len(CALL_START):]
+                lead = 0 if self.rbare else len(CALL_START)
+                body = self.buf[lead:]
                 end, think = call_end(body, hold=False), body.find(THINK_END)
                 drop = len(CALL_END)
                 # #4427: as in the answer, a following call opener confirms an omitted closer
@@ -2567,33 +2587,35 @@ class OutputParser:
                 if f >= 0 and (end < 0 or f < end) and re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>",
                                                                 body[f:].lstrip()):
                     end, drop = f, 0
+                if self.rbare:
+                    end, drop = f, 0
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         name = self.aliases.get(name, name)
                         if self._callable(name):
-                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes)
+                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes, recover=self.recover)
                             call.name = name
                     except ValueError:
                         pass
-                    raw = self.buf[:len(CALL_START) + end + drop]
+                    raw = self.buf[:lead + end + drop]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
                         out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + drop:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
-                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
+                    out.append(Event("reasoning", self._track(self.buf[:lead + think])))
                     self.buf = body[think:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding back
                     out += self._release(False)
                     out.append(Event("reasoning", self._track(self.buf)))
                     self.buf = ""
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 else:
                     return out
             elif self.state == "reasoning":
@@ -2606,17 +2628,32 @@ class OutputParser:
                         self.buf = stripped
                     if not self.buf:
                         return out
+                    bare = self._bare_in_reasoning() if self.recover and self.schemas else None
                     if self.buf.startswith(CALL_START):
                         self.state = "rcall"
+                    elif bare is not None and bare[0] == 0:
+                        if not bare[1]:
+                            return out
+                        self.state, self.rbare = "rcall", True
                     elif self.buf.startswith(THINK_END):
                         out += self._release(True)
-                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
+                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf) \
+                            or (bare is None and self.recover and self.schemas and FUNC_START.startswith(self.buf)):
                         return out
                     else:
                         out += self._release(False)
                     continue
                 i = self.buf.find(THINK_END)
                 tool = self.buf.find(CALL_START) if self.schemas else -1
+                bare = self._bare_in_reasoning() if self.recover and self.schemas else None
+                if bare is not None and (i < 0 or bare[0] < i) and (tool < 0 or bare[0] < tool):
+                    if bare[0]:
+                        out.append(Event("reasoning", self._track(self.buf[:bare[0]])))
+                        self.buf = self.buf[bare[0]:]
+                    if not bare[1]:
+                        return out
+                    self.state, self.rbare = "rcall", True
+                    continue
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
                         out.append(Event("reasoning", self._track(self.buf[:tool])))
@@ -2628,7 +2665,9 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    tags = ((THINK_END, CALL_START, FUNC_START) if self.recover else (THINK_END, CALL_START)) \
+                        if self.schemas else (THINK_END,)
+                    keep = self._hold(self.buf, tags)
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -2862,16 +2901,16 @@ class OutputParser:
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others
-            body = self.buf[len(CALL_START):]
+            body = self.buf[0 if self.rbare else len(CALL_START):]
             f = function_end(body)
             name = body.lstrip()[len(FUNC_START):].split(">", 1)[0].strip() if f >= 0 else ""
             name = self.aliases.get(name, name)
             if f >= 0 and not body[f:].strip() and self._callable(name):
                 try:
-                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes)
+                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes, recover=self.recover)
                     call.name = name
                     self.pending.append([self.buf, call])
-                    self.buf, self.state = "", "reasoning"
+                    self.buf, self.state, self.rbare = "", "reasoning", False
                 except ValueError:
                     pass
         if self.pending:
@@ -2898,7 +2937,7 @@ class OutputParser:
                     value = rest[1:] if rest.startswith("\n") else rest
                     declared = self.sprops.get(self.spname)
                     v = _argument_value(value, declared, self.sroot)
-                    if _nonstring_type(declared, self.sroot):
+                    if _nonstring_type(declared, self.sroot) or (self.recover and self.sraw_pname.strip() == "arguments"):
                         if v is not _SKIP:
                             self.sheld.pop(self.sraw_pname, None)
                             self.sheld[self.sraw_pname] = v
@@ -2913,7 +2952,7 @@ class OutputParser:
                 self.ss = "done"
                 call = self.scall
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
-                    call = parse_tool_call(fixed, self.schemas.get(call.name), self.notes)
+                    call = parse_tool_call(fixed, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
                 except ValueError:
                     pass
@@ -2926,7 +2965,7 @@ class OutputParser:
                 out += self._close_scan()
                 call = self.scall
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
-                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes)
+                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
                 except ValueError:
                     pass
@@ -2961,7 +3000,7 @@ class OutputParser:
         try:
             if raw_name != raw_name.strip() and name not in self.schemas:
                 raise ValueError("whitespace tool name is not declared")
-            call = parse_tool_call(body, self.schemas.get(name), self.notes)
+            call = parse_tool_call(body, self.schemas.get(name), self.notes, recover=self.recover)
             call.name = name
         except ValueError:
             if not self.recover:
