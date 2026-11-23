@@ -241,7 +241,19 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
     PromptBufs& P = pb_;
     const int64_t N = spec_.n_embd;
     const kc::NativeFmt& f = kc::expert_layout().fmt[(size_t) ml];
+    // the tokens the CPU's rows read, each quantized once; on the pool, 32 tokens a piece (upstream 431a26db1)
     std::vector<char> quantized((size_t) P.T, 0);
+    std::vector<int32_t> toks;
+    for (int32_t e : experts)
+        for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r)
+            if (!quantized[(size_t) P.h_src[r]]) { quantized[(size_t) P.h_src[r]] = 1; toks.push_back(P.h_src[r]); }
+    // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
+    std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
+    if (root_->piping_) turn.lock();
+    pool_->run_items((int) toks.size(), 32, 64, [&](int i) {
+        const int32_t tok = toks[(size_t) i];
+        kc::native_quant_act(f, P.h_hn + (size_t) tok * N, P.h_nact + (size_t) tok * kc::kNativeActBytes);
+    });
     std::vector<kc::ExpertJobMulti> jobs;
     jobs.reserve(experts.size());
     int64_t q = 0;
@@ -252,10 +264,6 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r) {
             const int32_t tok = P.h_src[r];
             uint8_t* act = P.h_nact + (size_t) tok * kc::kNativeActBytes;
-            if (!quantized[(size_t) tok]) {
-                kc::native_quant_act(f, P.h_hn + (size_t) tok * N, act);
-                quantized[(size_t) tok] = 1;
-            }
             j.nact[j.nt] = act;
             j.out[j.nt] = P.h_cpu + q * N;
             P.h_cpu_row[q] = P.h_entry[r];
@@ -265,9 +273,6 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         }
         if (j.nt > 0) jobs.push_back(j);
     }
-    // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
-    std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
-    if (root_->piping_) turn.lock();
     for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
         pool_->run_split_multi_native(f, jobs.data() + i,
                                       (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));
@@ -533,6 +538,31 @@ bool PlainModel::prompt_split_reserve() {
     return prefill::mmq::split_reserve(k::kIqMmqSplitRows, n_out, cs_);
 }
 
+namespace {
+// The routed path's small tables (the routing ids back, the rows' sources, entries and bounds, each group's blob table
+// and bounds up) as kernels that read or write the pinned host buffers in place, not as copies (upstream 5480e2bad,
+// #6053: a 224-byte record's host copy queued behind the streamed experts' copies, so a group's products waited for
+// the experts in flight; Qwen3.8-Flash-Next's prompt path does the same with HostVec, upstream 1b3bb8f8).  The bytes
+// are the same.  Measured 2026-11-23 (3 alternating rounds, the same answers): RTX 4070, Ornith-1.5 GSQ-RCO-3bit, a
+// 3,562-token prompt 1,580 -> 1,530 ms (-3.2%, streamed experts); Qwen3.6 UD-Q4_K_XL there and every cell on the B70
+// (all experts in VRAM) and the RX 9060 XT within 10 ms.  XESTRATA_PLAIN_MAPPED_TABLES=0: the copies.
+inline bool mapped_tables() {
+    static const bool on = [] { const char* v = strata::env_get("PLAIN_MAPPED_TABLES"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    return on;
+}
+// up to 8 host-to-device copies of 4-byte words: one kernel, or copies with XESTRATA_PLAIN_MAPPED_TABLES=0
+bool tables_up(std::initializer_list<k::MappedCopy> cs, strata::gpu::Stream s) {
+    if (mapped_tables()) {
+        std::vector<k::MappedCopy> v(cs);
+        k::copy_from_mapped_multi(v.data(), (int) v.size(), s);
+        return true;
+    }
+    for (const k::MappedCopy& c : cs)
+        if (!strata::gpu::copy_async(c.dst, c.src, (size_t) c.words * 4, s)) return false;
+    return true;
+}
+}  // namespace
+
 bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large_share, int64_t max_cpu, int32_t* routes,
                                 const std::function<void(int)>& mark, PromptRouted& st, std::string& err) {
     PromptBufs& P = pb_;
@@ -542,8 +572,9 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large
     PromptGemm& pg = prompt_gemm();
     // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
     // CPU's share)
+    if (mapped_tables()) k::copy_i32_from_mapped(P.h_ids, P.ids, T * K, cs);   // a kernel writes them into the pinned buffer
     if ((cpu_share && !strata::gpu::copy_async(P.h_hn, P.hn, (size_t) (T * N) * 4, cs)) ||
-        !strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs) || !strata::gpu::stream_sync(cs)) {
+        (!mapped_tables() && !strata::gpu::copy_async(P.h_ids, P.ids, (size_t) (T * K) * 4, cs)) || !strata::gpu::stream_sync(cs)) {
         err = std::string("plain prompt: the routes: ") + strata::gpu::last_error();
         return false;
     }
@@ -642,10 +673,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large
     int64_t nb = 0;
     for (int32_t e : experts) P.h_bounds[nb++] = start[(size_t) e];
     P.h_bounds[nb] = (int32_t) gpu_rows;
-    if (!strata::gpu::copy_async(P.src, P.h_src, (size_t) (T * K) * 4, cs) ||
-        !(use_mmq ? strata::gpu::copy_async(P.entry, P.h_entry, (size_t) (T * K) * 4, cs)
-                  : strata::gpu::copy_async(P.slot, P.h_slot, (size_t) (T * K) * 4, cs)) ||
-        !strata::gpu::copy_async(P.bounds, P.h_bounds, (size_t) (nb + 1) * 4, cs)) {
+    if (!tables_up({{P.src, P.h_src, T * K}, {use_mmq ? P.entry : P.slot, use_mmq ? P.h_entry : P.h_slot, T * K},
+                    {P.bounds, P.h_bounds, nb + 1}}, cs)) {
         err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
         return false;
     }
@@ -750,9 +779,9 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large
         const int32_t r0 = P.h_bounds[g0], nr = P.h_bounds[g1] - r0;
         int32_t* hrb = P.h_rbounds + g0 + gi;
         for (int q = 0; q <= G; ++q) hrb[q] = P.h_bounds[g0 + (size_t) q] - r0;
-        if (!strata::gpu::copy_async(static_cast<void*>(P.wtab + g0), static_cast<const void*>(P.h_wtab + g0),
-                                     (size_t) G * sizeof(void*), cs) ||
-            !strata::gpu::copy_async(P.rbounds + g0 + gi, hrb, (size_t) (G + 1) * 4, cs)) {
+        static_assert(sizeof(void*) == 8, "a blob pointer is two words");
+        if (!tables_up({{static_cast<void*>(P.wtab + g0), static_cast<const void*>(P.h_wtab + g0), 2 * (int64_t) G},
+                        {P.rbounds + g0 + gi, hrb, (int64_t) G + 1}}, cs)) {
             err = std::string("plain prompt: the groups: ") + strata::gpu::last_error();
             return false;
         }

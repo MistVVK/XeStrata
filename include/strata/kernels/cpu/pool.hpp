@@ -160,6 +160,11 @@ public:
     int size() const { return n_ + (host_works_ ? 1 : 0); }
     /// Run independent pieces on the same pool, the caller included.
     void run(int n, const std::function<void(int)>& fn);
+    /// `n` independent items, `fn(i)` each: in pieces of `chunk` items on the pool (run) when there are at least
+    /// `min_items` of them and the pool has workers, else in line on the caller.  Each item writes only its own
+    /// output, so the bits are the same either way (upstream 431a26db1's run_range: the CPU prompt share's activations
+    /// quantized by the pool, host grouping 81 -> 7 ms on an RTX 5090).  XESTRATA_POOL_ITEMS=0: always in line.
+    void run_items(int n, int chunk, int min_items, const std::function<void(int)>& fn);
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
