@@ -389,6 +389,8 @@ struct Stager {
             }
             if (!strata::gpu::event_create(&dma_done[i])) return false;
         }
+        std::fprintf(stderr, "prefill: stager: pinned %d of %d buffers, %d threads, ring %d\n",
+                     (int) std::count(pinned.begin(), pinned.end(), (char) 1), kRing, nthreads, kRing);
         device = strata::core::current_device();
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
