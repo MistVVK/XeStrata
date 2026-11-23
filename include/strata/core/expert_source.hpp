@@ -903,6 +903,14 @@ public:
     }
     /// The page cache's room (see the gate) over the experts' bytes; 0 when unknown.
     double cache_room_ratio() const;
+    /// Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (integrated_gpu: its "VRAM" is the RAM) and
+    /// holds every expert in its cache reads nothing from the files again, and the pages the start read from them are
+    /// a second copy of the cache's bytes.  Gives them back, expert by expert: madvise(MADV_DONTNEED) on the blob's
+    /// whole pages in this source's mappings, then posix_fadvise(DONTNEED) on the same file range (clean pages, no
+    /// root needed; a page shared with a neighbouring blob stays).  `keep(layer, expert)` true keeps that expert's
+    /// pages (the experts of the slots the prompt path borrows: their refill reads them again).  The mappings stay; a
+    /// later read faults the bytes in from the file.  Returns the bytes released (0: nothing, or not Linux).
+    uint64_t drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep);
 
 private:
     /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null

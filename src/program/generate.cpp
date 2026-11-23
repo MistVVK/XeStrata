@@ -7851,6 +7851,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (drive.d.remote_count > 0 && o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, *drive.d.remote[0], "serve");
+        // Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (the processor's own graphics, from the device's
+        // report) with every expert in its cache: the pages the start read from the model file are a second copy of the
+        // cache's bytes in the same RAM.  They are given back; the experts of the slots the prompt path borrows keep theirs
+        // (their refill reads them).  The cache holds the same bytes either way, so no output bit changes.
+        // XESTRATA_UMA_DROP_PAGES=0 keeps the pages.
+        if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && strata::core::device_info(0).integrated &&
+            strata::env_auto("UMA_DROP_PAGES") != 0) {
+            const int32_t keep_from = borrow != nullptr && lend_first >= 0 ? lend_first : INT32_MAX;
+            const auto t0 = Clock::now();
+            const uint64_t freed = src.drop_cached_pages([&](int64_t l, int64_t e) {
+                const int32_t sl = xcache.slot_of(l, e);
+                return sl != strata::core::kNotResident && sl >= keep_from;
+            });
+            if (freed > 0)
+                std::fprintf(stderr, "xestrata serve: this GPU shares the system RAM and holds every expert: the model file's "
+                                     "cached pages of %.2f GiB of experts are given back (%.1f ms; the experts the prompt path "
+                                     "borrows keep theirs; XESTRATA_UMA_DROP_PAGES=0 keeps them)\n",
+                             (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
         mem_mark("the head and the prompt path");
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last

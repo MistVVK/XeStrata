@@ -2439,6 +2439,25 @@ bool PlainModel::open_experts(std::string& err) {
     if (!prompt_dev_.at.empty())
         std::fprintf(stderr, "xestrata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
                      (long long) prompt_dev_T_);
+    // upstream 3220dbc0e0, a5104df5bf (as generate.cpp's): the processor's own graphics (its memory is the system RAM)
+    // with every expert in its tier: the model file's cached pages are a second copy of the tier's bytes in the same
+    // RAM, and are given back; the experts of the slots the prompt path lends keep theirs (their refill reads them).
+    // No output bit changes.  XESTRATA_UMA_DROP_PAGES=0 keeps the pages.
+    if (auto* file = dynamic_cast<FileExpertSource*>(src_own_.get());
+        file != nullptr && tier_whole_ && first() && last() && integrated_gpu(Runtime::get().device()) &&
+        strata::env_auto("UMA_DROP_PAGES") != 0) {
+        const int64_t keep_from = lend_from_ >= 0 ? lend_from_ : INT64_MAX;
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t freed = file->drop_cached_pages([&](int64_t l, int64_t e) {
+            const int32_t sl = res_[(size_t) (l * E + e)];
+            return sl < 0 || sl >= keep_from;   // not in the tier (read from the file), or lent
+        });
+        if (freed > 0)
+            std::fprintf(stderr, "xestrata plain: this GPU shares the system RAM and holds every expert: the model file's "
+                                 "cached pages of %.2f GiB of experts are given back (%.1f ms; XESTRATA_UMA_DROP_PAGES=0 "
+                                 "keeps them)\n", (double) freed / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     free_b_ = free_b;
     return true;
 }

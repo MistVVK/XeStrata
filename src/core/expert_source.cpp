@@ -1833,6 +1833,47 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+uint64_t FileExpertSource::drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep) {
+#if defined(__linux__)
+    if (!direct_.empty()) return 0;   // unbuffered reads: no page cache to give back
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    uint64_t released = 0;
+    // the whole pages of [p, p + n): a page that also holds a neighbouring blob stays (that neighbour may be kept)
+    auto drop = [&](const uint8_t* p, uint64_t n, int fd, uint64_t off) {
+        if (p == nullptr) return;
+        const uint64_t a = ((uint64_t) (uintptr_t) p + page - 1) & ~(page - 1);
+        const uint64_t b = ((uint64_t) (uintptr_t) p + n) & ~(page - 1);
+        if (b <= a) return;
+        if (madvise((void*) (uintptr_t) a, (size_t) (b - a), MADV_DONTNEED) != 0) return;
+        if (fd >= 0) (void) posix_fadvise(fd, (off_t) (off + (a - (uint64_t) (uintptr_t) p)), (off_t) (b - a), POSIX_FADV_DONTNEED);
+        released += b - a;
+    };
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (keep && keep(l, e)) continue;
+            if (!role_ptr_.empty()) {   // the GGUF in place: the three role slices
+                for (int r = 0; r < 3; ++r) {
+                    const size_t i = (size_t) (3 * l + r);
+                    if (i >= role_ptr_.size() || role_ptr_[i] == nullptr) continue;
+                    const uint64_t per = role_bytes_[i];
+                    const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * per);
+                    const size_t f = (size_t) role_file_[i];
+                    if (f >= maps_.size() || maps_[f].base == nullptr) continue;
+                    drop(p, per, maps_[f].fd, (uint64_t) (p - maps_[f].base));
+                }
+            } else if (const uint8_t* b = mapped_blob(l, e)) {   // experts.bin
+                const uint64_t n = layout.mixed() ? layout.blob_bytes(l, e) : layer_blob_bytes_[(size_t) l];
+                drop(b, n, fd_, (uint64_t) (b - base_));
+            }
+        }
+    return released;
+#else
+    (void) keep;
+    return 0;
+#endif
+}
+
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
