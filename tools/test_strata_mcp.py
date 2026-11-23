@@ -639,3 +639,19 @@ class ProcIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EngineComponent(FakeRoot):
+    """台帳 0619: component: の engine はパスが無くてもインストール済みなら missing にしない。"""
+
+    def test_a_component_engine_is_not_a_missing_file(self):
+        cfg = self.root / "xestrata-two.json"
+        cfg.write_text(json.dumps({"exe": "component:strata-engine", "args": [], "port": 8095}), encoding="utf-8")
+        desc = self.strata.describe_config(cfg)
+        self.assertEqual(desc["missing_files"], ["component:strata-engine"])
+        self.assertFalse(desc["ready"])
+        (self.root / "bin").mkdir()
+        (self.root / "bin" / "strata-engine").write_text("", encoding="utf-8")
+        desc = self.strata.describe_config(cfg)
+        self.assertEqual(desc["missing_files"], [])
+        self.assertTrue(desc["ready"])
