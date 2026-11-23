@@ -4234,6 +4234,26 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """台帳 0803（upstream 55ccf8556e）: 同じ 503 が responses でも Retry-After を出す。"""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
+
 class ThinkingEngine(MockEngine):
     """Thinks THOUGHT, then answers; a prompt that already ends its thinking (the budget's wrap-up) gets the answer
     at once, the way the model continues after </think>.  Records every prompt it is given."""

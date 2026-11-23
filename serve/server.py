@@ -10819,7 +10819,9 @@ def make_handler(svc: Service):
                 return self._json(429, responses_error_body(str(e), "rate_limit_exceeded", code="rate_limit_exceeded"),
                                   headers={"Retry-After": 1})
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)         # 台帳 0803: as chat and messages; only GpuBusy carries one
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
