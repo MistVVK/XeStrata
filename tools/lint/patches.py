@@ -21,7 +21,7 @@ PROJECTS = {
     "intel-llvm": ("ea269d5f7189ab7ade0ada0706d973c5f5ee5f65", ROOT / ".tools/intel-llvm/src"),  # v7.2.1, untagged
     "oneDNN": ("v3.14.2", ROOT / ".tools/src/oneDNN"),
     "comfy-kitchen": ("v0.2.41", ROOT / ".tools/src/comfy-kitchen"),
-    "aotriton": ("0.14.2b", ROOT / ".tools/src/aotriton"),
+    "aotriton": ("0.15b", ROOT / ".tools/src/aotriton"),
 }
 
 
