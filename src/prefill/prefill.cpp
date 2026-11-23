@@ -3725,11 +3725,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto t0 = std::chrono::steady_clock::now();
                                 if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
                                 std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
-                                for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
-                                for (int64_t t = 0; t < T; ++t) {
-                                    if (!need[(size_t) t]) continue;
-                                    strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
+                                std::vector<int32_t> toks;
+                                for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) {
+                                    const int32_t t = m.src_host[(size_t) p];
+                                    if (!need[(size_t) t]) { need[(size_t) t] = 1; toks.push_back(t); }
                                 }
+                                // upstream 431a26db1: each token's activation quantized on the pool, 32 tokens a piece
+                                pool->run_items((int) toks.size(), 32, 64, [&](int i) {
+                                    const int64_t t = toks[(size_t) i];
+                                    strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
+                                });
                                 for (auto& j : m.cpu_jobs)
                                     for (int r = 0; r < j.nt; ++r) {
                                         const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;

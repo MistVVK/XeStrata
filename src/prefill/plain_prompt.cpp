@@ -241,7 +241,19 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
     PromptBufs& P = pb_;
     const int64_t N = spec_.n_embd;
     const kc::NativeFmt& f = kc::expert_layout().fmt[(size_t) ml];
+    // the tokens the CPU's rows read, each quantized once; on the pool, 32 tokens a piece (upstream 431a26db1)
     std::vector<char> quantized((size_t) P.T, 0);
+    std::vector<int32_t> toks;
+    for (int32_t e : experts)
+        for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r)
+            if (!quantized[(size_t) P.h_src[r]]) { quantized[(size_t) P.h_src[r]] = 1; toks.push_back(P.h_src[r]); }
+    // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
+    std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
+    if (root_->piping_) turn.lock();
+    pool_->run_items((int) toks.size(), 32, 64, [&](int i) {
+        const int32_t tok = toks[(size_t) i];
+        kc::native_quant_act(f, P.h_hn + (size_t) tok * N, P.h_nact + (size_t) tok * kc::kNativeActBytes);
+    });
     std::vector<kc::ExpertJobMulti> jobs;
     jobs.reserve(experts.size());
     int64_t q = 0;
@@ -252,10 +264,6 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         for (int32_t r = start[(size_t) e]; r < start[(size_t) e] + count[(size_t) e]; ++r) {
             const int32_t tok = P.h_src[r];
             uint8_t* act = P.h_nact + (size_t) tok * kc::kNativeActBytes;
-            if (!quantized[(size_t) tok]) {
-                kc::native_quant_act(f, P.h_hn + (size_t) tok * N, act);
-                quantized[(size_t) tok] = 1;
-            }
             j.nact[j.nt] = act;
             j.out[j.nt] = P.h_cpu + q * N;
             P.h_cpu_row[q] = P.h_entry[r];
@@ -265,9 +273,6 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         }
         if (j.nt > 0) jobs.push_back(j);
     }
-    // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
-    std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
-    if (root_->piping_) turn.lock();
     for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
         pool_->run_split_multi_native(f, jobs.data() + i,
                                       (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));

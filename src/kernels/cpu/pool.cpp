@@ -749,6 +749,19 @@ void ExpertPool::run(int n, const std::function<void(int)>& fn) {
     fn_ = nullptr;
 }
 
+void ExpertPool::run_items(int n, int chunk, int min_items, const std::function<void(int)>& fn) {
+    static const bool on = [] { const char* v = strata::env_get("POOL_ITEMS"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    if (n <= 0) return;
+    chunk = std::max(chunk, 1);
+    if (!on || n_ == 0 || n < min_items || n <= chunk) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    run((n + chunk - 1) / chunk, [&](int p) {
+        for (int i = p * chunk, e = std::min(n, i + chunk); i < e; ++i) fn(i);
+    });
+}
+
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
