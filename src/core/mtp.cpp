@@ -1360,7 +1360,8 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         put(t, p + t);
     }
     put(2 * max_t_ - 1, p + a);                                      // output 0's cell
-    for (int j = 1; j < n_out; ++j) put(max_t_ + j - 1, p + a + j);  // every step's cell, staged at once
+    // every step's cell, staged at once: the ones launched now and the ones chain_extend may add
+    for (int j = 1; j < max_t_ - 1; ++j) put(max_t_ + j - 1, p + a + j);
     for (int j = 0; j < 16; ++j) h_force_[j] = j < n_force ? force[j] : -1;
     h_row_[0] = a;
     h_row_[1] = 0;
@@ -1382,6 +1383,28 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     chain_n_ = n_out;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool MtpDrafter::chain_extend(int n_out, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_n_ < 1 || n_out <= chain_n_) return true;
+    if (n_out > max_t_ - 1 || chain_early_ != chain_n_) { err = "mtp: chain arguments out of range"; return false; }
+    for (int j = chain_n_; j < n_out; ++j)
+        if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    if (!chain_live_) steps_seen_ = chain_n_;   // an ended chain's outputs are all in chain_tok_ (chain_poll)
+    bool ok = true;
+    for (int j = chain_n_; ok && j < n_out; ++j)
+        ok = strata::gpu::graph_launch(step_exec_[j], cs_) && strata::gpu::event_record(ev_step_[j], cs_);
+    if (!ok || !strata::gpu::event_record(ev_chain_, cs_)) {
+        err = std::string("mtp chain: ") + strata::gpu::last_error();
+        return false;
+    }
+    chain_early_ = n_out;
+    chain_live_ = true;
+    chain_n_ = n_out;
+    ms_draft += ms_since(t0);
     return true;
 }
 
