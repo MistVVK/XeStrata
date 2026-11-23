@@ -320,7 +320,7 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 | UD-Q3_K_XL | 89.5 GB | 56.2 GB | 約 80 GB |
 | UD-IQ4_XS | 93.7 GB | 60.4 GB | 約 84 GB |
 
-密な部分と、RAM の予算の扱いは、下の UD-Q4_K_XL と同じです（`--resident-budget-gib N`、setup は RAM から 24 GB を引いた値を選びます）。
+密な部分と、RAM の予算の扱いは、下の UD-Q4_K_XL と同じです（`--resident-budget-gib N`、setup は RAM から 17 GB を引いた値を選びます）。
 RAM がそれより少ないと、入らないエキスパートを答えている間に SSD から読みます。
 setup は、すべてのエキスパートが RAM に入るうちでいちばん大きい版を勧めます（UD-Q4_K_XL は除きます）。
 setup は画像を尋ね（既定はオン）、画像のエンコーダーは元のモデルのものです。
@@ -346,8 +346,9 @@ IQ3_XXS の 32K の decode は、B70 で +3.5%、RTX 4070 で同等（prefill +1
 エンジンは、エキスパートを GGUF のファイルからそのまま読みます。
 GPU が持つもの以外のうち、よく使うものから順に、RAM の予算の分だけを RAM に置きます（`--resident-budget-gib N`）。
 予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置きます（エンジンは `the prompt path's lend region: N of its M slots keep their experts in RAM too` と出します。upstream f2e142f4、#1683）。前は予算があるといつも外していたので、どの prompt も借りた枠のエキスパートをファイルから読み直していました。
-setup が選ぶ N は、RAM から 24 GB を引いた値で、KV キャッシュを RAM に置くときはさらにその分を引きます。
-文脈 128K の RAM 64 GB の PC では 36 GiB です。
+setup が選ぶ N は、RAM から 17 GB を引いた値で、KV キャッシュを RAM に置くときはさらにその分を引きます（upstream 8780e9fdc3。以前は 24 GB）。
+文脈 128K の RAM 64 GB の PC では 43 GiB です。
+メモリを共有する GPU（APU）では、GPU のキャッシュも RAM を使うので 24 GB を引いたままです。
 残りは、答えている間に SSD から読みます。
 画像も選べますが、このファイルで画像を試していないと警告します（upstream #967。upstream では使えたという報告があります）。
 

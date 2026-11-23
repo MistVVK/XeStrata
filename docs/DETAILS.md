@@ -349,7 +349,7 @@ The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and 
 | UD-Q3_K_XL | 89.5 GB | 56.2 GB | about 80 GB |
 | UD-IQ4_XS | 93.7 GB | 60.4 GB | about 84 GB |
 
-The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
+The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 17 GB).
 With less RAM the experts that do not fit are read from the SSD while it answers.
 setup recommends the largest size whose experts all fit the RAM (UD-Q4_K_XL aside).
 setup asks about images (on by default); the image encoder is the original model's.
@@ -375,8 +375,9 @@ IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
-setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
-36 GiB on a 64 GB PC with a 128K context.
+setup chooses the RAM less 17 GB for N, less the KV cache too when that lives in RAM (upstream 8780e9fdc3; 24 GB before):
+43 GiB on a 64 GB PC with a 128K context.
+On a GPU that shares the RAM (an APU) it keeps 24 GB aside, as the GPU's cache is RAM too.
 The rest come from the SSD while it answers.
 Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 
