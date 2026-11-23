@@ -49,6 +49,7 @@
   "about.openaiUrl": "URL base de OpenAI",
   "about.anthropicUrl": "URL base de Anthropic",
   "about.modelName": "Nombre del modelo",
+  "about.monitorLink": "Monitor de solicitudes de API (últimas 100 solicitudes y respuestas)",
   "about.cfgTemperature": "Temperatura por defecto para solicitudes que no envían ninguna (0 = voraz; sin ella, la de la ficha del modelo: 1,0 con razonamiento, 0,7 sin él)",
   "about.cfgTopP": "top_p por defecto para solicitudes que no envían ninguno",
   "about.cfgTopK": "top_k por defecto para solicitudes que no envían ninguno (1-64)",

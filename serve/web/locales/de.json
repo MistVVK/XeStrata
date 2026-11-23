@@ -49,6 +49,7 @@
   "about.openaiUrl": "OpenAI-Basis-URL",
   "about.anthropicUrl": "Anthropic-Basis-URL",
   "about.modelName": "Modellname",
+  "about.monitorLink": "API-Anfragenmonitor (die letzten 100 Anfragen und Antworten)",
   "about.cfgTemperature": "Standard-Temperatur für Anfragen, die keine senden (0 = gierig; ohne sie die der Modellkarte: 1,0 mit Denken, 0,7 ohne)",
   "about.cfgTopP": "Standard-top_p für Anfragen, die keins senden",
   "about.cfgTopK": "Standard-top_k für Anfragen, die keins senden (1–64)",

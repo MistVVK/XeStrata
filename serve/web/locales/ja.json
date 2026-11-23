@@ -49,6 +49,7 @@
   "about.openaiUrl": "OpenAI のベース URL",
   "about.anthropicUrl": "Anthropic のベース URL",
   "about.modelName": "モデル名",
+  "about.monitorLink": "API 要求モニター（直近 100 件の要求と答え）",
   "about.cfgTemperature": "温度を送らない要求の既定の温度（0 = 貪欲。空ならモデルカードのもの: 思考あり 1.0、なし 0.7）",
   "about.cfgTopP": "top_p を送らない要求の既定の top_p",
   "about.cfgTopK": "top_k を送らない要求の既定の top_k（1〜64）",

@@ -49,6 +49,7 @@
   "about.openaiUrl": "Базовый URL OpenAI",
   "about.anthropicUrl": "Базовый URL Anthropic",
   "about.modelName": "Имя модели",
+  "about.monitorLink": "Монитор запросов API (последние 100 запросов и ответов)",
   "about.cfgTemperature": "Температура по умолчанию для запросов без неё (0 = жадно; без неё — из карточки модели: 1,0 с размышлением, 0,7 без)",
   "about.cfgTopP": "top_p по умолчанию для запросов без него",
   "about.cfgTopK": "top_k по умолчанию для запросов без него (1–64)",

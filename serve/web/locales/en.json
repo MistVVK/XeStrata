@@ -76,6 +76,7 @@
   "about.kvAll": "{kv}, all in VRAM",
   "about.kvStreamed": "{kv}, streamed: {n} positions per layer in VRAM, the rest in RAM",
   "about.modelName": "Model name",
+  "about.monitorLink": "API request monitor (last 100 requests and answers)",
   "about.on": "on",
   "about.openaiUrl": "OpenAI base URL",
   "about.pc": "This PC",

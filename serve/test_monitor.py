@@ -57,6 +57,22 @@ class MonitorOff(unittest.TestCase):
             httpd.server_close()
 
 
+class MonitorLinks(unittest.TestCase):
+    """The chat page's Settings and /api-monitor point at each other."""
+
+    def test_chat_settings_link_to_api_monitor(self):
+        web = Path(__file__).parent / "web"
+        html = (web / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<a href="/api-monitor" data-i18n="about.monitorLink">', html)
+        for code in ("en", "ja", "de", "es", "fr", "ko", "pt", "ru", "zh"):
+            catalog = json.loads((web / "locales" / f"{code}.json").read_text(encoding="utf-8"))
+            self.assertIn("about.monitorLink", catalog, code)
+
+    def test_api_monitor_link_to_chat(self):
+        html = (Path(__file__).parent / "web" / "monitor.html").read_text(encoding="utf-8")
+        self.assertIn('<a href="/" class="back"', html)
+
+
 class Monitor(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()

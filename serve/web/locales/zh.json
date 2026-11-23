@@ -49,6 +49,7 @@
   "about.openaiUrl": "OpenAI 基础 URL",
   "about.anthropicUrl": "Anthropic 基础 URL",
   "about.modelName": "模型名称",
+  "about.monitorLink": "API 请求监视器（最近 100 个请求和回答）",
   "about.cfgTemperature": "未发送温度的请求的默认温度（0 = 贪心；留空则用模型卡的值：思考时 1.0，否则 0.7）",
   "about.cfgTopP": "未发送 top_p 的请求的默认 top_p",
   "about.cfgTopK": "未发送 top_k 的请求的默认 top_k（1–64）",

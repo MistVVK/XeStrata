@@ -49,6 +49,7 @@
   "about.openaiUrl": "OpenAI 기본 URL",
   "about.anthropicUrl": "Anthropic 기본 URL",
   "about.modelName": "모델 이름",
+  "about.monitorLink": "API 요청 모니터 (최근 요청 100개와 답)",
   "about.cfgTemperature": "temperature를 보내지 않는 요청의 기본 temperature(0 = 탐욕적. 비우면 모델 카드의 값: 생각할 때 1.0, 아닐 때 0.7)",
   "about.cfgTopP": "top_p를 보내지 않는 요청의 기본 top_p",
   "about.cfgTopK": "top_k를 보내지 않는 요청의 기본 top_k(1~64)",
