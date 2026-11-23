@@ -7520,7 +7520,17 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                 "system_fingerprint": fingerprint,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # 台帳 0832（upstream f7734779bd、#2391）: role-only chunk は最初の data の直前に出す。
+    # prompt を読む前だと TTFR が 0 と計測されるため。keep-alive の comment は従来どおり先。
+    opened = False
+
+    def first():
+        nonlocal opened
+        if opened:
+            return ()
+        opened = True
+        return (chunk({"role": "assistant", "content": ""}),)
+
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -7530,8 +7540,11 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
+            if pp is not None:
+                yield from first()
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
+            yield from first()
             c = chunk({})
             c["strata_mcp"] = x
             yield c
@@ -7540,12 +7553,15 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
                 # llama.cpp's reasoning_content and vLLM's reasoning: the same text, for a client that reads either
+                yield from first()
                 yield chunk({"reasoning_content": ev.text, "reasoning": ev.text})
             elif ev.kind == "content" and ev.text:
+                yield from first()
                 yield chunk({"content": ev.text})
             elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
                 pass                                # a custom tool's input is sent whole, with its tool_call
             elif ev.kind == "tool_call" and call.name in customs:
+                yield from first()
                 given = call.arguments
                 text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
                     and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
@@ -7553,21 +7569,25 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                                              "custom": {"name": call.name, "input": text}}]})
                 calls += 1
             elif ev.kind == "tool_start":
+                yield from first()
                 streamed[call.id] = calls
                 calls += 1
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
             elif ev.kind == "tool_call":
+                yield from first()
                 args = json.dumps(call.arguments, ensure_ascii=False)
                 yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": args}}]})
                 calls += 1
         else:
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            yield from first()                     # 空の答えも role で始める
             whole = calls and streamed.keys() <= finished
             fin = cast(dict, x)                     # the run's last item: the DONE figures
             ended = fin["finish"]
