@@ -56,6 +56,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -184,6 +185,12 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_ROOM_MIN_CAP = 1024
+FIT_MIN_ROOM = 1024          # 台帳 0828 (#5924): fit_max_tokens never shortens below room for an answer
+
+
+def fit_floor(ctx: int) -> int:
+    """The least room fit_max_tokens shortens to: FIT_MIN_ROOM, at most a quarter of a small context."""
+    return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
 # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 ANSWER_RESERVE_MIN = 512
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
@@ -263,11 +270,13 @@ class ContextOverflow(ValueError):
     too long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does
     for Anthropic's own error (#4838)."""
 
-    def __init__(self, text, *, prompt, context, max_new=None):
+    def __init__(self, text, *, prompt, context, max_new=None, min_room=None):
         super().__init__(text)
-        self.prompt, self.context, self.max_new = prompt, context, max_new
+        self.prompt, self.context, self.max_new, self.min_room = prompt, context, max_new, min_room
 
     def anthropic_text(self) -> str:
+        if self.min_room:              # 台帳 0828: room left, but less than an answer needs: the client should compact
+            return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; {self}"
         room = self.context - CTX_SLACK
         if self.max_new is None or self.prompt > room - 1:   # the prompt alone leaves no room
             return f"prompt is too long: {self.prompt} tokens > {room - 1} maximum; {self}"
@@ -384,6 +393,10 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class EngineClosing(RuntimeError):
+    """台帳 0589/0673（upstream 3cf22f5ef1/b1cdaa3899）: 停止中に届いた要求。受け付けず 503 server_draining。"""
+
+
 class EngineStarting(RuntimeError):
     """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
     not a 400 about the prompt."""
@@ -392,6 +405,10 @@ class EngineStarting(RuntimeError):
 class ClientGone(Exception):
     """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
     waiting for its turn): nothing is left to answer."""
+
+
+class ServerStopping(RuntimeError):
+    """台帳 0806（upstream ab0f20be0f）: 停止時の drain が要求を取り消した。再試行できる 503 を返す。"""
 
 
 class ModelBusy(RuntimeError):
@@ -543,6 +560,40 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+HOOK_REASON_MAX = 300   # 台帳 0740/0821: before_load の拒否理由として API に出す長さの上限
+
+
+def hook_text(output) -> str:
+    """before_load の出力をテキストにする。UTF-8 で読めなければ機械の文字コードで読む。"""
+    if not isinstance(output, bytes):
+        return output or ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return output.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX, stderr=None) -> str:
+    """コマンドが書いた最後の非空行を API 向けに整える。stderr を優先し、制御文字を空白に、
+    空白を 1 つに、長さを limit に制限する（#5987）。"""
+    for text in (stderr, output):
+        for line in reversed(hook_text(text).splitlines()):
+            s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+            if s:
+                return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+    return ""
+
+
+def hook_echo(output, stream=None) -> None:
+    """コマンドの出力をサーバーの出力へそのまま流す（#5987 で読む前の動作を保つ）。"""
+    if not output:
+        return
+    lines = hook_text(output).splitlines()
+    if lines:
+        print("\n".join(lines), file=stream or sys.stdout, flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -932,6 +983,11 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # 台帳 0706（upstream f56ef6fe91）: 拒否された park を理由ごとに数える
+    SKIP = re.compile(r"conversation cache: (?:skip parking \((.*)\)|allocation failed; skip parking)")
+    REASONS = (("gave no memory back", "ram_no_progress"), ("physical RAM admission", "ram_floor"),
+               ("RAM floor after capture", "ram_after_capture"), ("exceeds available budget", "budget"),
+               ("below the", "short"), ("stage CUDA", "estimate"))
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -941,13 +997,22 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None,
+                      "refused": {}, "refused_total": 0, "last_refused": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
         time: a second one moved `pos` between the size check and the seek and raised ValueError (negative seek)."""
         with self.lock:
-            return self._poll(path, start)
+            st = self._poll(path, start)
+            st["refused"] = dict(st["refused"])         # the caller's view does not move with later polls
+            return st
+
+    def _refused(self, reason: str) -> None:
+        st = self.state
+        st["refused"][reason] = st["refused"].get(reason, 0) + 1
+        st["refused_total"] += 1
+        st["last_refused"] = reason
 
     def _poll(self, path, start) -> dict:
         if not path or start is None:
@@ -981,10 +1046,18 @@ class ConvCacheLog:
                 if m.group(1) != "skipped":
                     st["parks" if m.group(1) == "parked" else "restores"] += 1
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
+                else:
+                    self._refused("put")
                 continue
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.SKIP.search(line)
+            if m:
+                text = m.group(1)
+                self._refused("alloc" if text is None else
+                              next((r for k, r in self.REASONS if k in text), "estimate" if text else "other"))
         return dict(self.state)
 
 
@@ -4548,6 +4621,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.fit_max_tokens = fit_max_tokens
+        self.draining = False                            # 台帳 0589: the stop closed admission
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP ("answer_room": false: off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends in it
@@ -4969,13 +5043,18 @@ class Service:
         if self.before_load:
             cmd = self.before_load
             print(f"[xestrata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
+            why, reason = None, ""
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, capture_output=True)
+                hook_echo(r.stdout)
+                hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
+                    reason = hook_reason(r.stdout, stderr=r.stderr)
+            except subprocess.TimeoutExpired as e:
+                hook_echo(e.output)
+                hook_echo(e.stderr, sys.stderr)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
@@ -4987,8 +5066,8 @@ class Service:
                 if self.before_load_strict and not self.before_load_ignore_failure:
                     print(f"[xestrata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
+                    raise GpuBusy(reason or f"the before_load command failed ({why}): the GPU was not given back, "
+                                            "so the model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
                     print(f"[xestrata] the before_load command failed ({why}); loading anyway"
@@ -5534,8 +5613,19 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
+        # 台帳 0706: 拒否された park を /metrics と Prometheus の両方に理由ごとに出す
+        cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        rows += [
+            ("strata:conversation_cache_parked", "gauge", "Conversations parked now", cc["parked"]),
+            ("strata:conversation_cache_parks_total", "counter", "Conversations parked", cc["parks"]),
+            ("strata:conversation_cache_restores_total", "counter", "Parked conversations restored", cc["restores"]),
+            ("strata:conversation_cache_evictions_total", "counter", "Parked conversations evicted", cc["evictions"]),
+        ]
+        refused = "strata:conversation_cache_refused_total"
+        return ("".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
+                        for name, kind, help_, value in rows) +
+                f"# HELP {refused} Conversations the cache did not park, by reason\n# TYPE {refused} counter\n" +
+                "".join(f'{refused}{{reason="{r}"}} {n}\n' for r, n in sorted(cc["refused"].items())))
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -5812,10 +5902,16 @@ class Service:
             ids = out
         return messages, ids, encoded_ids, encoded
 
+    def begin_drain(self):
+        """Close admission at the start of a stop (台帳 0589): new requests get 503 server_draining."""
+        self.draining = True
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if getattr(self, "draining", False):
+            raise EngineClosing("the server is stopping; retry against another instance")
         self.embeddings.path = None
         self.embeddings.keys = None
         messages, ids, encoded_ids, encoded = self.prompt_ids(messages, tools, kwargs, force, cancel)
@@ -5840,6 +5936,15 @@ class Service:
                                       f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
+            floor = fit_floor(ctx)
+            if self.fit_max_tokens and room < floor:
+                # 台帳 0828: a clamp to a few hundred tokens left a thinking model no room to answer or call a tool.
+                self.forget_prompt(encoded_ids)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
+                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
+                                      prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
@@ -6058,7 +6163,9 @@ class Service:
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        defaults = {**model_card_sampling(self.model_arch, thinking,
+                                          greedy=asks_greedy(sampling, self.shared, self.sampling_defaults)),
+                    **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -7490,7 +7597,17 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                 "system_fingerprint": fingerprint,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # 台帳 0832（upstream f7734779bd、#2391）: role-only chunk は最初の data の直前に出す。
+    # prompt を読む前だと TTFR が 0 と計測されるため。keep-alive の comment は従来どおり先。
+    opened = False
+
+    def first():
+        nonlocal opened
+        if opened:
+            return ()
+        opened = True
+        return (chunk({"role": "assistant", "content": ""}),)
+
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -7500,8 +7617,11 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
+            if pp is not None:
+                yield from first()
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
+            yield from first()
             c = chunk({})
             c["strata_mcp"] = x
             yield c
@@ -7510,12 +7630,15 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
                 # llama.cpp's reasoning_content and vLLM's reasoning: the same text, for a client that reads either
+                yield from first()
                 yield chunk({"reasoning_content": ev.text, "reasoning": ev.text})
             elif ev.kind == "content" and ev.text:
+                yield from first()
                 yield chunk({"content": ev.text})
             elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
                 pass                                # a custom tool's input is sent whole, with its tool_call
             elif ev.kind == "tool_call" and call.name in customs:
+                yield from first()
                 given = call.arguments
                 text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
                     and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
@@ -7523,21 +7646,25 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                                              "custom": {"name": call.name, "input": text}}]})
                 calls += 1
             elif ev.kind == "tool_start":
+                yield from first()
                 streamed[call.id] = calls
                 calls += 1
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
             elif ev.kind == "tool_call":
+                yield from first()
                 args = json.dumps(call.arguments, ensure_ascii=False)
                 yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": args}}]})
                 calls += 1
         else:
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            yield from first()                     # 空の答えも role で始める
             whole = calls and streamed.keys() <= finished
             fin = cast(dict, x)                     # the run's last item: the DONE figures
             ended = fin["finish"]
@@ -8033,11 +8160,11 @@ def anthropic_structured(events, validator):
 # ------------------------------------------------------------------------------------------------ HTTP
 # Anthropic's error types by HTTP status (its "errors" page); a 5xx without its own is an api_error
 ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
-                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
-                         529: "overloaded_error"}
+                         404: "not_found_error", 409: "conflict_error", 413: "request_too_large",
+                         429: "rate_limit_error", 500: "api_error", 529: "overloaded_error"}
 
 
-def api_error_body(path: str, status: int, obj):
+def api_error_body(path: str, status: int, obj, request_id: str | None = None):
     """An error body in the shape of the API its path belongs to: Anthropic's routes (/v1/messages...) answer
     {"type": "error", "error": {"type", "message"}}, the other /v1/ routes OpenAI's {"error": {"message", "type",
     "param", "code"}} (param and code null when the error has none).  Anything else is left as it is."""
@@ -8046,10 +8173,17 @@ def api_error_body(path: str, status: int, obj):
         return obj
     message = str(err.get("message") or "")
     if path.startswith("/v1/messages"):
-        if obj.get("type") == "error":
+        if obj.get("type") == "error" and request_id is None:
             return obj
-        kind = ANTHROPIC_ERROR_TYPES.get(status, "api_error" if status >= 500 else "invalid_request_error")
-        return {"type": "error", "error": {"type": kind, "message": message}}
+        # 台帳 0804（upstream 25d88c4a5b）: 502/503 は overload と読ませないため既存の type を保つ
+        kind = ANTHROPIC_ERROR_TYPES.get(status)
+        if kind is None:
+            kind = err.get("type") or "api_error" if status >= 500 else "invalid_request_error"
+        error = {**err, "type": kind, "message": message}
+        body = {"type": "error", **obj, "error": error}
+        if request_id:
+            body["request_id"] = request_id
+        return body
     kind = err.get("type") or ("server_error" if status >= 500 else "invalid_request_error")
     return {**obj, "error": {**err, "message": message, "type": kind, "param": err.get("param"),
                              "code": err.get("code")}}
@@ -8406,7 +8540,11 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
-            obj = api_error_body(self.path.split("?")[0].rstrip("/"), code, obj)
+            request_id = "req_" + (self.record["id"] if self.record is not None else uuid.uuid4().hex[:12])
+            path = self.path.split("?")[0].rstrip("/")
+            obj = api_error_body(path, code, obj, request_id)
+            if code >= 400 and path.startswith("/v1/messages"):
+                headers = {**(headers or {}), "request-id": request_id}
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -9115,6 +9253,9 @@ def make_handler(svc: Service):
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except (EngineStarting, EngineDied, EngineStuck) as e:
+                    # 台帳 0793（upstream 085860e4f4）: 起動できない engine の /load も理由付きの 503
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
                 if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
@@ -9224,6 +9365,9 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
                                                "type": "invalid_request_error"}})
+            except EngineClosing as e:                      # 台帳 0589: a request that arrived during the stop
+                self._json(503, {"error": {"type": "server_error", "code": "server_draining", "message": str(e)}},
+                           headers={"Retry-After": 1})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[xestrata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -10064,7 +10208,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
+            defaults = {**model_card_sampling(svc.model_arch, True,
+                                              greedy=asks_greedy(svc.shared, svc.sampling_defaults)),
+                        **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -10801,7 +10947,9 @@ def make_handler(svc: Service):
                 return self._json(429, responses_error_body(str(e), "rate_limit_exceeded", code="rate_limit_exceeded"),
                                   headers={"Retry-After": 1})
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)         # 台帳 0803: as chat and messages; only GpuBusy carries one
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -10854,6 +11002,11 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
+                elif cancel.is_set() or (done or {}).get("finish") == "cancel":
+                    # 台帳 0806: 最後の event が無い要求を collect() が途中の delta として読むのを防ぐ
+                    if getattr(svc, "draining", False):
+                        raise ServerStopping("this instance is draining; retry against the next instance")
+                    raise ClientGone()
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:
@@ -10861,6 +11014,9 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except ServerStopping as e:
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_draining"),
+                                      retry_after=1)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -10894,6 +11050,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
+            except ServerStopping as e:                      # mid-stream: response.failed, then the stream ends
+                self._responses_failed(asm, str(e), "server_error", send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
@@ -11145,7 +11303,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
-                                getattr(svc.template, "call_form", "qwen"))
+                                getattr(svc.template, "call_form", "qwen"), callable_tools)
             messages, validator = anthropic_prepare_format(req, messages, tools)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
@@ -12114,10 +12272,28 @@ def card_family(cfg: dict) -> str | None:
     return None
 
 
-def model_card_sampling(arch, thinking) -> dict:
-    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+# 台帳 0791（upstream d7ce708baf、issue #69）: greedy の要求にカードのペナルティを送らない
+CARD_PENALTIES = ("presence_penalty", "frequency_penalty", "repetition_penalty")
+
+
+def model_card_sampling(arch, thinking, greedy: bool = False) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family).
+    `greedy`: drop the card's penalties, which make the engine sample (and stop the greedy-only MTP drafts)."""
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
-    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    card = dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    if greedy:
+        for k in CARD_PENALTIES:
+            card.pop(k, None)
+    return card
+
+
+def asks_greedy(*layers) -> bool:
+    """The first layer that sets a temperature (request, shared settings, config) says 0: greedy was asked for."""
+    for layer in layers:
+        t = (layer or {}).get("temperature")
+        if t is not None:
+            return isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0
+    return False
 
 
 def undeclared_tool_calls_setting(cfg: dict) -> str:
@@ -12710,6 +12886,7 @@ def _main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[xestrata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        svc.begin_drain()                   # 台帳 0589: refuse new requests while the engine is closing
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):

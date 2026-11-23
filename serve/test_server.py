@@ -4234,6 +4234,83 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """台帳 0803（upstream 55ccf8556e）: 同じ 503 が responses でも Retry-After を出す。"""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
+
+    def _strict_hook(self, code: str):
+        self.svc.before_load = [sys.executable, "-c", code]
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        return self._raw_chat()
+
+    def test_before_load_refusal_carries_the_commands_own_reason(self):
+        """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        status, headers, body = self._strict_hook(
+            "import sys; print('checking'); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr); "
+            "sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_refusal_without_output_keeps_the_generic_sentence(self):
+        status, _, body = self._strict_hook("import sys; sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertIn("the before_load command failed (it exited with code 75)", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_reason_is_made_safe(self):
+        status, _, body = self._strict_hook(
+            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + '\\n  \\n'); sys.exit(1)")
+        msg = body["error"]["message"]
+        self.assertEqual(status, 503)
+        self.assertLessEqual(len(msg), 300)
+        self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "\u200b" for c in msg), repr(msg[:60]))
+        from serve.server import hook_reason
+        self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
+        self.assertEqual(hook_reason(""), "")
+        self.assertEqual(hook_reason(None), "")
+        self.assertEqual(hook_reason("x" * 300), "x" * 300)
+        self.assertEqual(len(hook_reason("y" * 301)), 300)
+
+    def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
+        status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_before_load_stderr_line_wins_over_stdout(self):
+        # 台帳 0821: stdout と stderr を分けて読み、stderr の最後の非空行を理由にする
+        from serve.server import hook_reason, hook_text
+        self.assertEqual(hook_reason(b"progress\nlater progress\n", stderr=b"no room for 76G of RAM\n"),
+                         "no room for 76G of RAM")
+        self.assertEqual(hook_reason(b"progress\n", stderr=b"  \n"), "progress")
+        self.assertEqual(hook_text(b"\xff\xfe"), "\ufffd\ufffd")   # never raises on a bad byte
+        status, _, body = self._strict_hook(
+            "import sys; print('done checking', flush=True); "
+            "print('no room for 76G of RAM', file=sys.stderr, flush=True); sys.exit(1)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room for 76G of RAM")
+
+
 class ThinkingEngine(MockEngine):
     """Thinks THOUGHT, then answers; a prompt that already ends its thinking (the budget's wrap-up) gets the answer
     at once, the way the model continues after </think>.  Records every prompt it is given."""

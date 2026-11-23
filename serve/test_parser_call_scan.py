@@ -56,7 +56,9 @@ class CallScanTests(unittest.TestCase):
                 self.assertEqual(walk.call_count, before)
                 for char in "</parameter></function></tool_call>":
                     parser.feed(char)
-                self.assertEqual(walk.call_count, before + 1)
+                # 台帳 0869: 閉じの可能性のある文字を足したときに加えて、lookahead の確認が 1 回入ることがある
+                self.assertGreaterEqual(walk.call_count - before, 1)
+                self.assertLessEqual(walk.call_count - before, 2)
                 parser.finish()      # #4701: a closed call waits for what might follow it; the turn's end settles it
                 self.assertEqual(parser._call_end_checked, 0)
 

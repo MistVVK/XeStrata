@@ -32,7 +32,7 @@ import uuid
 from typing import Any
 from urllib.parse import unquote
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
+from serve.frontend import cut_arguments, declared_parameters, Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
 from serve.structured import jsonschema_modules
 from serve import search as search_api
 
@@ -120,7 +120,7 @@ def _reasoning_text(item, param) -> str:
     return ""
 
 
-def _arguments(raw, param) -> dict:
+def _arguments(raw, param, declared=None) -> dict:
     """A function_call's arguments (a JSON string) -> the mapping the template renders.  Arguments that are not a JSON
     object (a call the output ended inside) are kept as text rather than refusing the whole conversation."""
     if isinstance(raw, dict):
@@ -132,6 +132,10 @@ def _arguments(raw, param) -> dict:
     try:
         value = json.loads(raw)
     except ValueError:
+        if declared is None or "arguments" not in declared:
+            cut = cut_arguments(raw)
+            if cut is not None:
+                return cut
         return {"arguments": raw}
     return value if isinstance(value, dict) else {"arguments": value}
 
@@ -202,7 +206,8 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
             if item.get("namespace"):
                 name = f"{item['namespace']}.{name}"
             if kind == "function_call":
-                args = _arguments(item.get("arguments"), param + ".arguments")
+                args = _arguments(item.get("arguments"), param + ".arguments",
+                                      declared_parameters(req.get("tools"), name))
             else:
                 args = {"input": item.get("input") if isinstance(item.get("input"), str) else ""}
             target = open_turn if open_turn is not None and not thinking else turn()
@@ -920,7 +925,7 @@ class Assembler:
             out += self.close("completed")
         return out
 
-    def _release(self, text: str) -> list[dict]:
+    def _release(self, text: str, status=None) -> list[dict]:
         """A held structured answer (or the words written beside a tool call) as one message item."""
         if not text.strip():
             return []
@@ -929,7 +934,7 @@ class Assembler:
         self.item["content"][0]["text"] = text
         out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
                               content_index=0, delta=text, logprobs=[]))
-        return out + self.close()
+        return out + self.close(status)
 
     def _call_started(self) -> list[dict]:
         """The first tool call of a JSON-format turn: this turn is not the final answer, so what the model wrote
@@ -1057,6 +1062,10 @@ class Assembler:
             self.json_text = []
             if self.called:
                 out += self._release(text)           # beside a tool call: as written (#782)
+            elif length:
+                # 台帳 0805（upstream 3af02433a8）: max_output_tokens で切れた structured
+                # 答えは 502 にせず、ここまでの本文を incomplete として返す
+                out += self._release(text, "incomplete")
             else:
                 out += self._release(validate(text, done.get("finish")))
         n = done.get("completion_tokens", 0)

@@ -649,6 +649,16 @@ class Strata:
         except (OSError, ValueError):
             return {}
 
+    def engine_here(self, reference: str) -> bool:
+        """台帳 0619（upstream b55ae23e8e）: "component:..." 実行ファイルはパスではないので、
+        インストール済みの engine を root と PATH から探す。XeStrata には upstream の
+        strata_control.engine_component が無いため、現地の配置に合わせて照合した。"""
+        name = str(reference).split(":", 1)[1] if str(reference).startswith("component:") else str(reference)
+        if not name or "/" in name or "\\" in name:
+            return False
+        return any(candidate.is_file() for candidate in (self.root / name, self.root / "bin" / name)) \
+            or shutil.which(name) is not None
+
     def describe_config(self, path: Path) -> dict:
         cfg = self.read_config(path)
         args = cfg.get("args")
@@ -658,7 +668,8 @@ class Strata:
             return a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None
         tag = path.stem[len(CONFIG):]
         missing = [p for p in [cfg.get("exe"), *[x for x in a if isinstance(x, str) and x.endswith(".gguf")]]
-                   if not p or not Path(p).exists()]
+                   if not p or not (self.engine_here(p) if str(p).startswith("component:")
+                                    else Path(p).exists())]
         script = self.root / f"run-{tag}.sh"
         vis = cfg.get("vision")
         return {"model": tag, "config": path.name, "model_name": cfg.get("model_name"),
