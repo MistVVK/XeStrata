@@ -602,8 +602,6 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
-                                   src/core/plain_inkling.cpp
-                                   src/core/plain_dspark.cpp
                                    src/core/auto_pick.cpp
                                    src/inkling2/ink_main.cpp src/inkling2/sycl/ink_sycl_backend.cpp
                                    src/inkling2/inkling2_loop.cpp src/artifact/strata_reader.cpp

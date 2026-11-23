@@ -2,12 +2,12 @@
  "names": {
   "ADAPT_CUT": {
    "reads": [
-    "src/program/generate.cpp:1220"
+    "src/program/generate.cpp:1221"
    ]
   },
   "ADAPT_JOB_CPU": {
    "reads": [
-    "src/program/generate.cpp:1163"
+    "src/program/generate.cpp:1164"
    ]
   },
   "ADAPT_LAG": {
@@ -17,30 +17,30 @@
   },
   "ADAPT_NOWAIT": {
    "reads": [
-    "src/program/generate.cpp:1131"
+    "src/program/generate.cpp:1132"
    ]
   },
   "ADMIT_SHORT_FIRST": {
    "reads": [
-    "serve/server.py:329"
+    "serve/server.py:330"
    ]
   },
   "ALLOWED_HOSTS": {
    "reads": [
-    "serve/server.py:12497"
+    "serve/server.py:12512"
    ]
   },
   "ALLOW_UNPINNED": {
    "reads": [
-    "setup.py:434",
+    "setup.py:440",
     "tools/mtp_fetch.py:323"
    ]
   },
   "API_KEY": {
    "reads": [
-    "serve/server.py:12175",
-    "serve/server.py:12474",
-    "setup.py:8647"
+    "serve/server.py:12190",
+    "serve/server.py:12489",
+    "setup.py:8625"
    ]
   },
   "ARENA_HOST_USM": {
@@ -50,7 +50,7 @@
   },
   "ARENA_LOW_RAM": {
    "reads": [
-    "src/program/generate.cpp:5351"
+    "src/program/generate.cpp:5354"
    ]
   },
   "ARENA_MMAP": {
@@ -70,7 +70,7 @@
   },
   "ARENA_RELEASE": {
    "reads": [
-    "src/program/generate.cpp:7333"
+    "src/program/generate.cpp:7336"
    ]
   },
   "ARENA_THP": {
@@ -115,47 +115,47 @@
   },
   "AUX_CPUS": {
    "reads": [
-    "src/program/generate.cpp:5484",
-    "src/program/plain_generate.cpp:3110"
+    "src/program/generate.cpp:5487",
+    "src/program/plain_generate.cpp:3101"
    ]
   },
   "AUX_STAGER": {
    "reads": [
-    "src/prefill/prefill.cpp:397"
+    "src/prefill/prefill.cpp:399"
    ]
   },
   "BATCH_ATTN_ROWS": {
    "reads": [
     "src/core/verify.cpp:1295",
-    "src/core/verify.cpp:2143"
+    "src/core/verify.cpp:2144"
    ]
   },
   "BATCH_DECODE_SHARE": {
    "reads": [
-    "src/program/generate.cpp:12490"
+    "src/program/generate.cpp:12493"
    ]
   },
   "BATCH_GROUPS_NV_SERIAL": {
    "reads": [
-    "src/program/generate.cpp:5196"
+    "src/program/generate.cpp:5199"
    ]
   },
   "BATCH_MTP": {
    "reads": [
-    "serve/server.py:4044",
-    "src/program/generate.cpp:4884",
-    "src/program/plain_generate.cpp:2683"
+    "serve/server.py:4048",
+    "src/program/generate.cpp:4887",
+    "src/program/plain_generate.cpp:2687"
    ]
   },
   "BATCH_MTP_SERIAL": {
    "reads": [
-    "src/program/generate.cpp:4870",
+    "src/program/generate.cpp:4873",
     "src/program/plain_generate.cpp:779"
    ]
   },
   "BATCH_TRACE": {
    "reads": [
-    "serve/server.py:891"
+    "serve/server.py:892"
    ]
   },
   "BF16_GEMM_BLOCK": {
@@ -175,17 +175,17 @@
   },
   "BIG_CHUNK": {
    "reads": [
-    "src/program/generate.cpp:7504"
+    "src/program/generate.cpp:7507"
    ]
   },
   "BIH3_F16_ROWS": {
    "reads": [
-    "src/prefill/prefill.cpp:1355"
+    "src/prefill/prefill.cpp:1357"
    ]
   },
   "BIH3_PROMPT_F16": {
    "reads": [
-    "src/prefill/prefill.cpp:1350"
+    "src/prefill/prefill.cpp:1352"
    ]
   },
   "BLAS": {
@@ -196,12 +196,12 @@
   },
   "BLOCKING_CONSOLE": {
    "reads": [
-    "serve/server.py:12143"
+    "serve/server.py:12158"
    ]
   },
   "CACHE_MESSAGE_BOUNDARY": {
    "reads": [
-    "src/program/generate.cpp:12773"
+    "src/program/generate.cpp:12776"
    ]
   },
   "CANON": {
@@ -219,24 +219,24 @@
   "CKPT_ASYNC": {
    "reads": [
     "src/core/conversation_state.cpp:222",
-    "src/program/generate.cpp:3324"
+    "src/program/generate.cpp:3327"
    ]
   },
   "CKPT_GATHER": {
    "reads": [
     "src/core/conversation_state.cpp:348",
-    "src/program/generate.cpp:3324"
+    "src/program/generate.cpp:3327"
    ]
   },
   "CKPT_REREAD": {
    "reads": [
-    "src/program/generate.cpp:12123",
-    "src/program/generate.cpp:12188"
+    "src/program/generate.cpp:12126",
+    "src/program/generate.cpp:12191"
    ]
   },
   "CKPT_STAGE": {
    "reads": [
-    "src/program/generate.cpp:4460"
+    "src/program/generate.cpp:4463"
    ]
   },
   "CKPT_VRAM_SLOTS": {
@@ -247,7 +247,7 @@
   "COLD_OVERLAP": {
    "reads": [
     "src/core/expert_source.cpp:3300",
-    "src/program/generate.cpp:5435"
+    "src/program/generate.cpp:5438"
    ]
   },
   "COMMIT_BATCH": {
@@ -257,7 +257,7 @@
   },
   "COMMIT_SYNC": {
    "reads": [
-    "src/core/verify.cpp:3003"
+    "src/core/verify.cpp:3005"
    ]
   },
   "CONTROL_REPEAT": {
@@ -267,12 +267,12 @@
   },
   "COPY_ENGINE": {
    "reads": [
-    "src/core/device.cpp:684"
+    "src/core/device.cpp:696"
    ]
   },
   "COPY_PRIO": {
    "reads": [
-    "src/core/moe_window.cpp:405"
+    "src/core/moe_window.cpp:406"
    ]
   },
   "CPU_PROFILE": {
@@ -292,7 +292,7 @@
   },
   "CVEC_FUSE": {
    "reads": [
-    "src/prefill/prefill.cpp:4402"
+    "src/prefill/prefill.cpp:4404"
    ]
   },
   "DBG_GDN": {
@@ -303,21 +303,21 @@
   },
   "DBG_NAN": {
    "reads": [
-    "src/core/verify.cpp:2004",
-    "src/prefill/prefill.cpp:4369",
-    "src/prefill/prefill.cpp:4535"
+    "src/core/verify.cpp:2005",
+    "src/prefill/prefill.cpp:4371",
+    "src/prefill/prefill.cpp:4537"
    ]
   },
   "DEBUG": {
    "reads": [
     "serve/mcp.py:137",
-    "serve/server.py:6664",
-    "serve/server.py:6836"
+    "serve/server.py:6670",
+    "serve/server.py:6842"
    ]
   },
   "DECODE_TIMING": {
    "reads": [
-    "src/program/generate.cpp:12982"
+    "src/program/generate.cpp:12985"
    ]
   },
   "DEC_BATCH": {
@@ -334,7 +334,7 @@
   },
   "DENSE_HOST": {
    "reads": [
-    "src/program/generate.cpp:5919"
+    "src/program/generate.cpp:5922"
    ]
   },
   "DETECT_REPEAT": {
@@ -349,7 +349,7 @@
   },
   "DF2_BLOCK_LOG": {
    "reads": [
-    "src/program/generate.cpp:14009",
+    "src/program/generate.cpp:14012",
     "src/program/plain_generate.cpp:2418"
    ]
   },
@@ -411,7 +411,7 @@
   },
   "DL_CONNECTIONS": {
    "reads": [
-    "setup.py:3907",
+    "setup.py:3885",
     "tools/mtp_fetch.py:254"
    ]
   },
@@ -424,7 +424,7 @@
    "reads": [
     "src/core/draft_head.cpp:245",
     "src/core/mtp.cpp:488",
-    "src/core/plain_model.cpp:4791"
+    "src/core/plain_model.cpp:4693"
    ]
   },
   "DRAFT_INT2_K": {
@@ -449,7 +449,7 @@
   },
   "DRAFT_TIMING": {
    "reads": [
-    "src/prefill/prefill.cpp:2259"
+    "src/prefill/prefill.cpp:2261"
    ]
   },
   "DROP_CACHE_ON_EXIT": {
@@ -459,7 +459,7 @@
   },
   "DUMP_FIRST_LOGITS": {
    "reads": [
-    "src/program/generate.cpp:13763"
+    "src/program/generate.cpp:13766"
    ]
   },
   "EMB_REUSE_ACCOUNT": {
@@ -469,12 +469,12 @@
   },
   "ENGINE_NICE": {
    "reads": [
-    "serve/server.py:1047"
+    "serve/server.py:1048"
    ]
   },
   "EVENT_MARK": {
    "reads": [
-    "src/core/device.cpp:638"
+    "src/core/device.cpp:650"
    ]
   },
   "EXACT": {
@@ -510,8 +510,8 @@
   },
   "FETCH_THREADS": {
    "reads": [
-    "src/core/plain_model.cpp:2162",
-    "src/program/generate.cpp:5420"
+    "src/core/plain_model.cpp:2139",
+    "src/program/generate.cpp:5423"
    ]
   },
   "FFMPEG": {
@@ -526,22 +526,22 @@
   },
   "FILE_TIER_IDLE": {
    "reads": [
-    "src/program/generate.cpp:6453"
+    "src/program/generate.cpp:6456"
    ]
   },
   "FILL_AHEAD": {
    "reads": [
-    "src/program/generate.cpp:6215"
+    "src/program/generate.cpp:6218"
    ]
   },
   "FOLLOW": {
    "reads": [
-    "src/program/generate.cpp:12928"
+    "src/program/generate.cpp:12931"
    ]
   },
   "FOLLOW_LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12949"
+    "src/program/generate.cpp:12952"
    ]
   },
   "FORCE_AVX2": {
@@ -552,7 +552,7 @@
   },
   "FORCE_FAULT": {
    "reads": [
-    "src/core/verify.cpp:2944"
+    "src/core/verify.cpp:2946"
    ]
   },
   "FREE_MISSES": {
@@ -613,26 +613,26 @@
     "serve/images.py:2744",
     "serve/images.py:6292",
     "serve/lora_train.py:396",
-    "serve/server.py:12267",
-    "serve/server.py:12418",
-    "serve/server.py:12423",
-    "serve/server.py:12426",
-    "serve/server.py:12570",
-    "serve/server.py:3627",
-    "serve/server.py:4259",
-    "src/core/device.cpp:201",
-    "src/core/device.cpp:213",
+    "serve/server.py:12282",
+    "serve/server.py:12433",
+    "serve/server.py:12438",
+    "serve/server.py:12441",
+    "serve/server.py:12585",
+    "serve/server.py:3629",
+    "serve/server.py:4263",
+    "src/core/device.cpp:202",
+    "src/core/device.cpp:214",
     "src/program/plain_generate.cpp:181"
    ]
   },
   "GPU_WAIT_LIMIT_S": {
    "reads": [
-    "src/core/device.cpp:501"
+    "src/core/device.cpp:502"
    ]
   },
   "GRAMMAR": {
    "reads": [
-    "serve/server.py:4798"
+    "serve/server.py:4802"
    ]
   },
   "GROUPED_BENCH": {
@@ -652,17 +652,17 @@
   },
   "HANDOFF_PIPE": {
    "reads": [
-    "src/prefill/prefill.cpp:625"
+    "src/prefill/prefill.cpp:627"
    ]
   },
   "HANDOFF_PIPE_WORKER": {
    "reads": [
-    "src/prefill/prefill.cpp:637"
+    "src/prefill/prefill.cpp:639"
    ]
   },
   "HC_HOST": {
    "reads": [
-    "src/program/generate.cpp:5884"
+    "src/program/generate.cpp:5887"
    ]
   },
   "HC_Q8": {
@@ -694,7 +694,7 @@
   },
   "HTTP_BACKLOG": {
    "reads": [
-    "serve/server.py:11243"
+    "serve/server.py:11249"
    ]
   },
   "HUNYUANIMAGE3_HOST_ENDS": {
@@ -719,7 +719,7 @@
   },
   "IDX_FP16_CHECK": {
    "reads": [
-    "src/prefill/prefill.cpp:3259"
+    "src/prefill/prefill.cpp:3261"
    ]
   },
   "IMAGE_ATTN_I8": {
@@ -739,22 +739,32 @@
   },
   "IMAGE_URL_PRIVATE": {
    "reads": [
-    "serve/server.py:2860"
+    "serve/server.py:2862"
    ]
   },
-  "INKLING_HOSTSTATE": {
+  "INKLING_CPU_THREADS": {
    "reads": [
-    "src/core/plain_dspark.cpp:310"
+    "src/inkling2/sycl/ink_sy_hybrid.h:495"
    ]
   },
-  "INKLING_PLACEMENT": {
+  "INKLING_DEBUG": {
    "reads": [
-    "src/core/plain_inkling.cpp:1120"
+    "src/inkling2/sycl/ink_sy_runner.h:422"
    ]
   },
-  "INKLING_RESIDUAL": {
+  "INKLING_HYBRID_STATS": {
    "reads": [
-    "src/core/plain_inkling.cpp:1123"
+    "src/inkling2/sycl/ink_sy_hybrid.h:435"
+   ]
+  },
+  "INKLING_MOE_GEMM_ROWS": {
+   "reads": [
+    "src/inkling2/sycl/ink_sy_xmx.h:30"
+   ]
+  },
+  "INKLING_NO_HYBRID": {
+   "reads": [
+    "src/inkling2/sycl/ink_sy_hybrid.h:458"
    ]
   },
   "IO_PF_AHEAD": {
@@ -784,23 +794,23 @@
   },
   "IO_PF_THREADS": {
    "reads": [
-    "src/program/generate.cpp:5432"
+    "src/program/generate.cpp:5435"
    ]
   },
   "IO_PREFETCH": {
    "reads": [
-    "src/program/generate.cpp:5429",
-    "src/program/generate.cpp:6458"
+    "src/program/generate.cpp:5432",
+    "src/program/generate.cpp:6461"
    ]
   },
   "IO_PREFETCH_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:6498"
+    "src/program/generate.cpp:6501"
    ]
   },
   "IO_STATS": {
    "reads": [
-    "src/program/generate.cpp:5450"
+    "src/program/generate.cpp:5453"
    ]
   },
   "IO_THREADS": {
@@ -851,7 +861,7 @@
   },
   "KEEP_EMPTY_TURNS": {
    "reads": [
-    "serve/frontend.py:118"
+    "serve/frontend.py:126"
    ]
   },
   "KEEP_IO_PRIORITY": {
@@ -879,7 +889,7 @@
   },
   "KVA_GDN_NORM": {
    "reads": [
-    "src/prefill/prefill.cpp:3101"
+    "src/prefill/prefill.cpp:3103"
    ]
   },
   "KVA_MODE": {
@@ -909,12 +919,12 @@
   },
   "KV_GROW": {
    "reads": [
-    "src/program/generate.cpp:4349"
+    "src/program/generate.cpp:4352"
    ]
   },
   "KV_GROW_FLOOR": {
    "reads": [
-    "src/program/generate.cpp:7122"
+    "src/program/generate.cpp:7125"
    ]
   },
   "KV_GROW_HOLD": {
@@ -924,13 +934,13 @@
   },
   "KV_GROW_INIT": {
    "reads": [
-    "src/core/plain_model.cpp:1725",
-    "src/program/generate.cpp:4364"
+    "src/core/plain_model.cpp:1702",
+    "src/program/generate.cpp:4367"
    ]
   },
   "KV_GROW_STEP": {
    "reads": [
-    "src/program/generate.cpp:7119"
+    "src/program/generate.cpp:7122"
    ]
   },
   "KV_MAIN_OFF": {
@@ -940,7 +950,7 @@
   },
   "KV_RESIDENT": {
    "reads": [
-    "src/program/plain_generate.cpp:2820"
+    "src/program/plain_generate.cpp:2824"
    ]
   },
   "KV_RING_OFF": {
@@ -950,19 +960,19 @@
   },
   "KV_ROT": {
    "reads": [
-    "src/program/generate.cpp:2952",
-    "src/program/generate.cpp:8433",
-    "src/program/generate.cpp:8540"
+    "src/program/generate.cpp:2955",
+    "src/program/generate.cpp:8436",
+    "src/program/generate.cpp:8543"
    ]
   },
   "KV_STAGE_OWN": {
    "reads": [
-    "src/prefill/prefill.cpp:887"
+    "src/prefill/prefill.cpp:889"
    ]
   },
   "KV_TCQ_DEFER": {
    "reads": [
-    "src/core/plain_model.cpp:1589"
+    "src/core/plain_model.cpp:1566"
    ]
   },
   "KV_WIDE_HOST": {
@@ -972,9 +982,9 @@
   },
   "LATENT_A": {
    "reads": [
-    "src/core/moe_window.cpp:160",
-    "src/prefill/prefill.cpp:1928",
-    "src/program/generate.cpp:2092"
+    "src/core/moe_window.cpp:161",
+    "src/prefill/prefill.cpp:1930",
+    "src/program/generate.cpp:2093"
    ]
   },
   "LATENT_A_ENTRIES": {
@@ -989,13 +999,13 @@
   },
   "LATENT_A_MODE8": {
    "reads": [
-    "src/core/moe_window.cpp:302"
+    "src/core/moe_window.cpp:303"
    ]
   },
   "LATENT_DENSE": {
    "reads": [
-    "src/core/moe_window.cpp:133",
-    "src/program/generate.cpp:2069"
+    "src/core/moe_window.cpp:134",
+    "src/program/generate.cpp:2070"
    ]
   },
   "LATENT_DENSE_FMT": {
@@ -1005,33 +1015,33 @@
   },
   "LATENT_FUSED": {
    "reads": [
-    "src/prefill/prefill.cpp:1229"
+    "src/prefill/prefill.cpp:1231"
    ]
   },
   "LATENT_STREAM": {
    "reads": [
-    "src/program/generate.cpp:5627",
-    "src/program/generate.cpp:5846"
+    "src/program/generate.cpp:5630",
+    "src/program/generate.cpp:5849"
    ]
   },
   "LATENT_U_GPU": {
    "reads": [
-    "src/core/moe_window.cpp:178",
-    "src/program/generate.cpp:6427"
+    "src/core/moe_window.cpp:179",
+    "src/program/generate.cpp:6430"
    ]
   },
   "LATENT_U_MMU": {
    "reads": [
-    "src/core/moe_window.cpp:181",
-    "src/core/moe_window.cpp:303"
+    "src/core/moe_window.cpp:182",
+    "src/core/moe_window.cpp:304"
    ]
   },
   "LAYER_SPLIT": {
    "reads": [
-    "serve/server.py:12297",
-    "serve/server.py:3948",
-    "serve/server.py:4205",
-    "serve/server.py:4327"
+    "serve/server.py:12312",
+    "serve/server.py:3952",
+    "serve/server.py:4209",
+    "serve/server.py:4331"
    ]
   },
   "LFUSE_GATE": {
@@ -1051,45 +1061,45 @@
   },
   "LM_PREFETCH": {
    "reads": [
-    "src/prefill/prefill.cpp:5026"
+    "src/prefill/prefill.cpp:5028"
    ]
   },
   "LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12346",
-    "src/program/generate.cpp:12378"
+    "src/program/generate.cpp:12349",
+    "src/program/generate.cpp:12381"
    ]
   },
   "LOGPOS_EXTRA": {
    "reads": [
-    "src/program/generate.cpp:12382"
+    "src/program/generate.cpp:12385"
    ]
   },
   "LOGPOS_TOPK": {
    "reads": [
-    "src/core/verify.cpp:2963"
+    "src/core/verify.cpp:2965"
    ]
   },
   "LOOKAHEAD": {
    "reads": [
-    "src/program/generate.cpp:6457",
-    "src/program/generate.cpp:6479"
+    "src/program/generate.cpp:6460",
+    "src/program/generate.cpp:6482"
    ]
   },
   "LOOKAHEAD_K": {
    "reads": [
-    "src/program/generate.cpp:6490"
+    "src/program/generate.cpp:6493"
    ]
   },
   "LOOKUP_CHAIN_FIXED": {
    "reads": [
-    "src/program/generate.cpp:12966",
-    "src/program/generate.cpp:15172"
+    "src/program/generate.cpp:12969",
+    "src/program/generate.cpp:15175"
    ]
   },
   "LOOP_GUARD": {
    "reads": [
-    "serve/server.py:11776"
+    "serve/server.py:11785"
    ]
   },
   "MANIFEST": {
@@ -1099,18 +1109,18 @@
   },
   "MAX_ALLOC_MIB": {
    "reads": [
-    "src/core/device.cpp:1013"
+    "src/core/device.cpp:1137"
    ]
   },
   "MAX_BODY_MIB": {
    "reads": [
-    "serve/server.py:8066"
+    "serve/server.py:8072"
    ]
   },
   "MEMORY_LIMIT_MIB": {
    "reads": [
-    "src/program/generate.cpp:2734",
-    "src/program/plain_generate.cpp:3117"
+    "src/program/generate.cpp:2737",
+    "src/program/plain_generate.cpp:3108"
    ]
   },
   "MMA": {
@@ -1120,18 +1130,18 @@
   },
   "MMQ_GROUP_CAP": {
    "reads": [
-    "src/prefill/prefill.cpp:1172",
-    "src/prefill/prefill.cpp:2020"
+    "src/prefill/prefill.cpp:1174",
+    "src/prefill/prefill.cpp:2022"
    ]
   },
   "MMQ_GROUP_SORT": {
    "reads": [
-    "src/prefill/prefill.cpp:3565"
+    "src/prefill/prefill.cpp:3567"
    ]
   },
   "MMQ_TAB": {
    "reads": [
-    "src/prefill/prefill.cpp:1189"
+    "src/prefill/prefill.cpp:1191"
    ]
   },
   "MMVF_ROWS": {
@@ -1152,12 +1162,12 @@
   },
   "MTP_BATCH": {
    "reads": [
-    "src/prefill/prefill.cpp:2188"
+    "src/prefill/prefill.cpp:2190"
    ]
   },
   "MTP_BATCH_RING": {
    "reads": [
-    "src/prefill/prefill.cpp:2196"
+    "src/prefill/prefill.cpp:2198"
    ]
   },
   "MTP_CATCHUP_ALL": {
@@ -1167,7 +1177,7 @@
   },
   "MTP_EXPERTS_HOST": {
    "reads": [
-    "src/program/generate.cpp:5828"
+    "src/program/generate.cpp:5831"
    ]
   },
   "MTP_FULL_HEAD": {
@@ -1197,7 +1207,7 @@
   },
   "MTP_VOCAB_EN": {
    "reads": [
-    "src/program/generate.cpp:5901"
+    "src/program/generate.cpp:5904"
    ]
   },
   "NAME": {
@@ -1207,12 +1217,12 @@
   },
   "NAN_GUARD": {
    "reads": [
-    "src/core/verify.cpp:2869"
+    "src/core/verify.cpp:2871"
    ]
   },
   "NAN_INJECT": {
    "reads": [
-    "src/core/verify.cpp:2880"
+    "src/core/verify.cpp:2882"
    ]
   },
   "NO_ARENA_THP": {
@@ -1246,7 +1256,7 @@
    "reads": [
     "src/kernels/cpu/native_expert.cpp:413",
     "src/kernels/cpu/native_expert.cpp:493",
-    "src/program/generate.cpp:3369"
+    "src/program/generate.cpp:3372"
    ]
   },
   "NO_IQ4NL": {
@@ -1327,14 +1337,14 @@
   },
   "PARALLEL_SOLO": {
    "reads": [
-    "serve/server.py:2043"
+    "serve/server.py:2045"
    ]
   },
   "PARK_ASYNC": {
    "reads": [
     "src/core/conversation_snapshot.cpp:236",
-    "src/program/generate.cpp:1349",
-    "src/program/generate.cpp:3325"
+    "src/program/generate.cpp:1350",
+    "src/program/generate.cpp:3328"
    ]
   },
   "PARK_TRACE": {
@@ -1361,7 +1371,7 @@
   },
   "PENALTY_PROMPT": {
    "reads": [
-    "src/program/generate.cpp:12752",
+    "src/program/generate.cpp:12755",
     "src/program/plain_generate.cpp:1639"
    ]
   },
@@ -1372,8 +1382,8 @@
   },
   "PF_DQ_FUSED": {
    "reads": [
-    "src/prefill/prefill.cpp:4148",
-    "src/prefill/prefill.cpp:5268"
+    "src/prefill/prefill.cpp:4150",
+    "src/prefill/prefill.cpp:5270"
    ]
   },
   "PIN_PARTS": {
@@ -1383,34 +1393,34 @@
   },
   "PIN_RESERVE_MIB": {
    "reads": [
-    "src/core/gpu.cpp:394"
+    "src/core/gpu.cpp:406"
    ]
   },
   "PIPED_MTP": {
    "reads": [
-    "src/program/generate.cpp:4892"
+    "src/program/generate.cpp:4895"
    ]
   },
   "PIPELINE_ADAPT_ASYNC": {
    "reads": [
-    "src/program/generate.cpp:7560"
+    "src/program/generate.cpp:7563"
    ]
   },
   "PIPELINE_DEBUG": {
    "reads": [
-    "src/core/plain_model.cpp:5763",
-    "src/program/generate.cpp:200"
+    "src/core/plain_model.cpp:5665",
+    "src/program/generate.cpp:201"
    ]
   },
   "PIPELINE_THETA": {
    "reads": [
-    "src/core/plain_model.cpp:5764"
+    "src/core/plain_model.cpp:5666"
    ]
   },
   "PIPE_ADAPT_EVERY": {
    "reads": [
-    "src/program/generate.cpp:10612",
-    "src/program/generate.cpp:7579"
+    "src/program/generate.cpp:10615",
+    "src/program/generate.cpp:7582"
    ]
   },
   "PLAIN_CPU_SHARE": {
@@ -1421,7 +1431,7 @@
   },
   "PLAIN_DECODE_PCIE": {
    "reads": [
-    "src/core/plain_model.cpp:2584"
+    "src/core/plain_model.cpp:2561"
    ]
   },
   "PLAIN_DENSE_MMQ": {
@@ -1432,8 +1442,8 @@
   },
   "PLAIN_MMQ": {
    "reads": [
-    "src/core/plain_model.cpp:1815",
-    "src/core/plain_model.cpp:1832"
+    "src/core/plain_model.cpp:1792",
+    "src/core/plain_model.cpp:1809"
    ]
   },
   "PLAIN_PROMPT_ATTN": {
@@ -1443,34 +1453,34 @@
   },
   "PLAIN_RING": {
    "reads": [
-    "src/core/plain_model.cpp:1486"
+    "src/core/plain_model.cpp:1463"
    ]
   },
   "PLE_AUTO_MMAP": {
    "reads": [
-    "src/program/generate.cpp:4597"
+    "src/program/generate.cpp:4600"
    ]
   },
   "PLE_AUTO_RAM": {
    "reads": [
-    "src/program/generate.cpp:4551"
+    "src/program/generate.cpp:4554"
    ]
   },
   "PLE_BATCH": {
    "reads": [
     "src/core/verify.cpp:920",
-    "src/prefill/prefill.cpp:2650",
-    "src/prefill/prefill.cpp:4971"
+    "src/prefill/prefill.cpp:2652",
+    "src/prefill/prefill.cpp:4973"
    ]
   },
   "PLE_COMPACT": {
    "reads": [
-    "src/prefill/prefill.cpp:1840"
+    "src/prefill/prefill.cpp:1842"
    ]
   },
   "PLE_COPY_STREAM": {
    "reads": [
-    "src/prefill/prefill.cpp:1841"
+    "src/prefill/prefill.cpp:1843"
    ]
   },
   "PLE_GGUF": {
@@ -1480,13 +1490,13 @@
   },
   "PLE_PROBE": {
    "reads": [
-    "src/program/generate.cpp:4591"
+    "src/program/generate.cpp:4594"
    ]
   },
   "POOL_CORES": {
    "reads": [
-    "src/program/generate.cpp:3124",
-    "src/program/plain_generate.cpp:3100"
+    "src/program/generate.cpp:3127",
+    "src/program/plain_generate.cpp:3091"
    ]
   },
   "POOL_SPIN_US": {
@@ -1532,35 +1542,35 @@
   "PREFILL_CPU_SHARE": {
    "reads": [
     "src/prefill/prefill.cpp:179",
-    "src/program/generate.cpp:2240"
+    "src/program/generate.cpp:2241"
    ]
   },
   "PREFILL_CPU_SHARE_BATCH": {
    "reads": [
-    "src/program/generate.cpp:2226"
+    "src/program/generate.cpp:2227"
    ]
   },
   "PREFILL_DUMP_R": {
    "reads": [
-    "src/prefill/prefill.cpp:4482",
-    "src/prefill/prefill.cpp:5491"
+    "src/prefill/prefill.cpp:4484",
+    "src/prefill/prefill.cpp:5493"
    ]
   },
   "PREFILL_DUMP_R_ALL": {
    "reads": [
-    "src/prefill/prefill.cpp:4495",
-    "src/prefill/prefill.cpp:4739"
+    "src/prefill/prefill.cpp:4497",
+    "src/prefill/prefill.cpp:4741"
    ]
   },
   "PREFILL_FUSED": {
    "reads": [
     "src/prefill/plain_prompt.cpp:605",
-    "src/prefill/prefill.cpp:3535"
+    "src/prefill/prefill.cpp:3537"
    ]
   },
   "PREFILL_GROUP_GATHER": {
    "reads": [
-    "src/prefill/prefill.cpp:4000"
+    "src/prefill/prefill.cpp:4002"
    ]
   },
   "PREFILL_HC_IN_REGION": {
@@ -1570,23 +1580,23 @@
   },
   "PREFILL_HELPER_ROWS": {
    "reads": [
-    "src/program/generate.cpp:1438",
-    "src/program/generate.cpp:1454"
+    "src/program/generate.cpp:1439",
+    "src/program/generate.cpp:1455"
    ]
   },
   "PREFILL_HELPER_SOURCE": {
    "reads": [
-    "src/program/generate.cpp:7719"
+    "src/program/generate.cpp:7722"
    ]
   },
   "PREFILL_ISSUER": {
    "reads": [
-    "src/prefill/prefill.cpp:2918"
+    "src/prefill/prefill.cpp:2920"
    ]
   },
   "PREFILL_LAYER_MAJOR": {
    "reads": [
-    "src/prefill/prefill.cpp:4654"
+    "src/prefill/prefill.cpp:4656"
    ]
   },
   "PREFILL_LEND_PCT": {
@@ -1596,27 +1606,27 @@
   },
   "PREFILL_LM_EVEN": {
    "reads": [
-    "src/prefill/prefill.cpp:4660"
+    "src/prefill/prefill.cpp:4662"
    ]
   },
   "PREFILL_LM_MARGIN_MIB": {
    "reads": [
-    "src/prefill/prefill.cpp:4681"
+    "src/prefill/prefill.cpp:4683"
    ]
   },
   "PREFILL_LM_R": {
    "reads": [
-    "src/prefill/prefill.cpp:4672"
+    "src/prefill/prefill.cpp:4674"
    ]
   },
   "PREFILL_LM_TOKENS": {
    "reads": [
-    "src/prefill/prefill.cpp:4665"
+    "src/prefill/prefill.cpp:4667"
    ]
   },
   "PREFILL_MMQ": {
    "reads": [
-    "src/prefill/prefill.cpp:1204"
+    "src/prefill/prefill.cpp:1206"
    ]
   },
   "PREFILL_RING": {
@@ -1631,17 +1641,17 @@
   },
   "PREFILL_STAGED_3K": {
    "reads": [
-    "include/strata/core/expert_tier.hpp:331"
+    "include/strata/core/expert_tier.hpp:330"
    ]
   },
   "PREFILL_TIMING": {
    "reads": [
-    "src/prefill/prefill.cpp:2427"
+    "src/prefill/prefill.cpp:2429"
    ]
   },
   "PREFILL_WARM": {
    "reads": [
-    "src/prefill/prefill.cpp:1819"
+    "src/prefill/prefill.cpp:1821"
    ]
   },
   "PREFILL_XS_IN_DM": {
@@ -1709,13 +1719,13 @@
   },
   "QSA_DUMP": {
    "reads": [
-    "src/prefill/prefill.cpp:3305"
+    "src/prefill/prefill.cpp:3307"
    ]
   },
   "QSA_DUMP_LAST": {
    "reads": [
-    "src/prefill/prefill.cpp:3306",
-    "src/prefill/prefill.cpp:3307"
+    "src/prefill/prefill.cpp:3308",
+    "src/prefill/prefill.cpp:3309"
    ]
   },
   "QSA_MIN_CHUNK": {
@@ -1750,8 +1760,8 @@
   },
   "RAM_ADAPT": {
    "reads": [
-    "src/core/plain_model.cpp:5476",
-    "src/program/generate.cpp:13708"
+    "src/core/plain_model.cpp:5378",
+    "src/program/generate.cpp:13711"
    ]
   },
   "RAM_RESERVE_MIB": {
@@ -1777,19 +1787,19 @@
   },
   "REPLICA_START": {
    "reads": [
-    "serve/server.py:11860"
+    "serve/server.py:11875"
    ]
   },
   "REQUEST_LINES": {
    "reads": [
-    "serve/server.py:1128"
+    "serve/server.py:1129"
    ]
   },
   "RESIDENT_PIN": {
    "reads": [
-    "src/core/plain_model.cpp:2729",
+    "src/core/plain_model.cpp:2706",
     "src/image/qi_stream.cpp:353",
-    "src/program/generate.cpp:7635"
+    "src/program/generate.cpp:7638"
    ]
   },
   "ROPE_TABLE": {
@@ -1799,7 +1809,7 @@
   },
   "ROUTER_PUBLISH": {
    "reads": [
-    "src/core/moe_window.cpp:497"
+    "src/core/moe_window.cpp:499"
    ]
   },
   "ROUTE_DUMP": {
@@ -1809,7 +1819,7 @@
   },
   "ROUTE_PRIOR": {
    "reads": [
-    "src/program/generate.cpp:6167"
+    "src/program/generate.cpp:6170"
    ]
   },
   "ROUTE_PRIOR_COUNT": {
@@ -1840,8 +1850,8 @@
   "ROUTE_TAIL_SKIP": {
    "reads": [
     "src/core/expert_source.cpp:3096",
-    "src/program/generate.cpp:3655",
-    "src/program/generate.cpp:9004"
+    "src/program/generate.cpp:3658",
+    "src/program/generate.cpp:9007"
    ]
   },
   "SCRIPT_GUARD": {
@@ -1871,18 +1881,18 @@
   },
   "SEL_OVERLAP": {
    "reads": [
-    "src/prefill/prefill.cpp:3237"
+    "src/prefill/prefill.cpp:3239"
    ]
   },
   "SENSENOVA_QSA_DENSE": {
    "reads": [
-    "src/core/plain_model.cpp:1265",
-    "src/core/plain_model.cpp:756"
+    "src/core/plain_model.cpp:1242",
+    "src/core/plain_model.cpp:733"
    ]
   },
   "SERVE_STOP_BOUND": {
    "reads": [
-    "src/program/generate.cpp:12960"
+    "src/program/generate.cpp:12963"
    ]
   },
   "SESSION_BUFFERED": {
@@ -1913,17 +1923,17 @@
   },
   "SNAPSHOT_FULL_CAPTURE": {
    "reads": [
-    "src/program/generate.cpp:12076"
+    "src/program/generate.cpp:12079"
    ]
   },
   "SNAPSHOT_VERIFY": {
    "reads": [
-    "src/program/generate.cpp:12055"
+    "src/program/generate.cpp:12058"
    ]
   },
   "SOURCE": {
    "reads": [
-    "setup.py:497",
+    "setup.py:503",
     "tools/mtp_fetch.py:50"
    ]
   },
@@ -1939,7 +1949,7 @@
   },
   "SPEC_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:14336"
+    "src/program/generate.cpp:14339"
    ]
   },
   "SPEC_GUMBEL": {
@@ -1949,7 +1959,7 @@
   },
   "SPEC_WATCH": {
    "reads": [
-    "src/program/generate.cpp:15098"
+    "src/program/generate.cpp:15101"
    ]
   },
   "SPLIT_CPU_GBPS": {
@@ -1960,88 +1970,88 @@
   },
   "SPLIT_GAIN_PCT": {
    "reads": [
-    "src/core/plain_model.cpp:1029",
-    "src/program/generate.cpp:3977"
+    "src/core/plain_model.cpp:1006",
+    "src/program/generate.cpp:3980"
    ]
   },
   "SPLIT_HEADROOM": {
    "reads": [
-    "src/program/generate.cpp:3896"
+    "src/program/generate.cpp:3899"
    ]
   },
   "SPLIT_HEADROOM_TOL": {
    "reads": [
-    "src/program/generate.cpp:3898"
+    "src/program/generate.cpp:3901"
    ]
   },
   "SPLIT_HELPER_GAIN_PCT": {
    "reads": [
-    "src/core/plain_model.cpp:1070",
-    "src/program/generate.cpp:4047"
+    "src/core/plain_model.cpp:1047",
+    "src/program/generate.cpp:4050"
    ]
   },
   "SPLIT_LINK_ABS": {
    "reads": [
-    "src/program/generate.cpp:3614"
+    "src/program/generate.cpp:3617"
    ]
   },
   "SPLIT_MASS_EXP": {
    "reads": [
-    "src/core/plain_model.cpp:992",
-    "src/program/generate.cpp:3628"
+    "src/core/plain_model.cpp:969",
+    "src/program/generate.cpp:3631"
    ]
   },
   "SPLIT_MTP_BATCH": {
    "reads": [
-    "src/program/generate.cpp:8873"
+    "src/program/generate.cpp:8876"
    ]
   },
   "SPLIT_NEAR_TIE_PCT": {
    "reads": [
-    "src/program/generate.cpp:3941"
+    "src/program/generate.cpp:3944"
    ]
   },
   "SPLIT_ROLE": {
    "reads": [
-    "src/core/plain_model.cpp:1027",
-    "src/core/plain_model.cpp:892",
-    "src/program/generate.cpp:3973"
+    "src/core/plain_model.cpp:1004",
+    "src/core/plain_model.cpp:869",
+    "src/program/generate.cpp:3976"
    ]
   },
   "SPLIT_ROLE_AUTO": {
    "reads": [
-    "src/core/plain_model.cpp:891"
+    "src/core/plain_model.cpp:868"
    ]
   },
   "SPLIT_ROWS": {
    "reads": [
-    "src/core/plain_model.cpp:969",
-    "src/program/generate.cpp:3623"
+    "src/core/plain_model.cpp:946",
+    "src/program/generate.cpp:3626"
    ]
   },
   "SPLIT_SPEED_SCALE": {
    "reads": [
-    "src/program/generate.cpp:3561"
+    "src/program/generate.cpp:3564"
    ]
   },
   "SPLIT_TIMING": {
    "reads": [
-    "src/program/generate.cpp:14309"
+    "src/program/generate.cpp:14312"
    ]
   },
   "SSD_KEEPALIVE": {
    "reads": [
-    "src/program/generate.cpp:4530"
+    "src/program/generate.cpp:4533"
    ]
   },
   "SSD_KEEPALIVE_WINDOW": {
    "reads": [
-    "src/program/generate.cpp:4531"
+    "src/program/generate.cpp:4534"
    ]
   },
   "STAGER_RING": {
    "reads": [
-    "src/prefill/prefill.cpp:1816",
+    "src/prefill/prefill.cpp:1818",
     "src/prefill/prefill.cpp:379"
    ]
   },
@@ -2052,12 +2062,12 @@
   },
   "STAGER_SSD": {
    "reads": [
-    "src/prefill/prefill.cpp:1806"
+    "src/prefill/prefill.cpp:1808"
    ]
   },
   "STAGER_THREADS": {
    "reads": [
-    "src/prefill/prefill.cpp:1792"
+    "src/prefill/prefill.cpp:1794"
    ]
   },
   "STALL_STACKS": {
@@ -2067,18 +2077,18 @@
   },
   "START_RETRIES": {
    "reads": [
-    "serve/server.py:756"
+    "serve/server.py:757"
    ]
   },
   "STATE_HASH": {
    "reads": [
-    "src/program/generate.cpp:14070"
+    "src/program/generate.cpp:14073"
    ]
   },
   "STATE_HASH_GDN": {
    "reads": [
-    "src/prefill/prefill.cpp:4613",
-    "src/program/generate.cpp:14101"
+    "src/prefill/prefill.cpp:4615",
+    "src/program/generate.cpp:14104"
    ]
   },
   "SUB_GROUP_32": {
@@ -2088,12 +2098,12 @@
   },
   "TAIL_SKIP_MAX_CACHED": {
    "reads": [
-    "src/program/generate.cpp:9012"
+    "src/program/generate.cpp:9015"
    ]
   },
   "TEST_CACHE_FAIL": {
    "reads": [
-    "src/program/generate.cpp:6106"
+    "src/program/generate.cpp:6109"
    ]
   },
   "TEST_PAGEABLE": {
@@ -2124,16 +2134,16 @@
   },
   "TRACE": {
    "reads": [
-    "src/core/device.cpp:821",
+    "src/core/device.cpp:833",
     "src/prefill/gemm.cpp:262",
-    "src/prefill/prefill.cpp:2684",
-    "src/program/generate.cpp:1232",
-    "src/program/generate.cpp:9600"
+    "src/prefill/prefill.cpp:2686",
+    "src/program/generate.cpp:1233",
+    "src/program/generate.cpp:9603"
    ]
   },
   "TRACE_ADAPT": {
    "reads": [
-    "src/program/generate.cpp:14954"
+    "src/program/generate.cpp:14957"
    ]
   },
   "TRAIN_CONTROL_MS": {
@@ -2176,17 +2186,17 @@
   },
   "UMA_HEADROOM_GIB": {
    "reads": [
-    "src/core/device.cpp:1174"
+    "src/core/device.cpp:1298"
    ]
   },
   "UNDECLARED_TOOL_CALLS": {
    "reads": [
-    "serve/server.py:12124"
+    "serve/server.py:12139"
    ]
   },
   "USAGE_SEED": {
    "reads": [
-    "include/strata/core/expert_tier.hpp:295"
+    "include/strata/core/expert_tier.hpp:294"
    ]
   },
   "VERIFY_DEBUG": {
@@ -2218,12 +2228,12 @@
   },
   "VERIFY_RESIDENT_GRAPH": {
    "reads": [
-    "src/core/moe_window.cpp:80"
+    "src/core/moe_window.cpp:81"
    ]
   },
   "VERIFY_SEGMENTED": {
    "reads": [
-    "src/core/moe_window.cpp:416"
+    "src/core/moe_window.cpp:417"
    ]
   },
   "VISION_CPU_I8": {
@@ -2233,8 +2243,8 @@
   },
   "VRAM_LIMIT_MIB": {
    "reads": [
-    "serve/server.py:3637",
-    "src/core/device.cpp:1009"
+    "serve/server.py:3639",
+    "src/core/device.cpp:1133"
    ]
   },
   "W8_FUSED": {
@@ -2255,17 +2265,17 @@
   "WIDE_WINDOW": {
    "reads": [
     "include/strata/core/window_rows.hpp:26",
-    "serve/server.py:4019"
+    "serve/server.py:4023"
    ]
   },
   "WINDOW_TIMES": {
    "reads": [
-    "src/core/moe_window.cpp:1020"
+    "src/core/moe_window.cpp:1039"
    ]
   },
   "WSL_PCIE_SPLIT": {
    "reads": [
-    "src/core/plain_model.cpp:2557"
+    "src/core/plain_model.cpp:2534"
    ]
   },
   "XESTRATA_APP_DIR": {
