@@ -6,12 +6,17 @@ A commit with few of its lines in XeStrata is a candidate for a change that was 
 another way); each is read before it is taken.
 
     python .claude/skills/upstream-sync/scripts/carryover.py TAG [--ref dev] [--since REV] [--paths P ...]
-        [--max 0.5] [--min-lines 3] [--ledger .upstream-<version>.md ...]
+        [--max 0.5] [--min-lines 3] [--ledger .upstream-<version>.md ...] [--map REV:PATH]
 
 Lines compared: stripped, comments and lines under 12 characters left out (XeStrata rewrites comments and names its
 own upstream issue numbers in them).  --since: only commits after REV (default: all of upstream's history up to TAG,
 so changes an earlier run missed are found too).  --ledger: commits whose hash a ledger already names are left out.
 A commit with fewer than --min-lines surviving lines is not judged: a one- or two-line fix is not found this way.
+
+upstream moved its top level in 0.2.16 (`src/` to `engine/src/`, `serve/` to `terminal/serve/` ...); XeStrata keeps the
+old layout.  Paths are compared as XeStrata's: in a commit or tag of the new layout (one with `engine/CMakeLists.txt`)
+a path is mapped back through the MOVES of upstream's move script (--map, default v0.2.16's), and a file is read at
+the tag under the tag's own layout.  --paths are XeStrata's paths; upstream's are looked at under both layouts.
 """
 import argparse
 import re
@@ -19,6 +24,7 @@ import subprocess
 import sys
 
 PATHS = ["setup.py", "chat.py", "update.sh", "serve", "tools"]
+MAP = "v0.2.16:tools/layout/move_0216.py"
 COMMENT = re.compile(r"^(#|//|/\*|\*|<!--)")
 
 
@@ -35,6 +41,28 @@ def key(line: str) -> str | None:
     return s if len(s) >= 12 else None
 
 
+def load_moves(spec: str) -> list:
+    """The (old, new) pairs of upstream's layout move: the block of the move script from `LANGS = ` to `REMOVE = `,
+    run with no builtins (it only builds lists)."""
+    src = git("show", spec)
+    ns: dict = {"__builtins__": {}}
+    exec(src[src.index("\nLANGS = "):src.index("\nREMOVE = ")], ns)
+    return ns["MOVES"]
+
+
+def remap(path: str, pairs: list) -> str:
+    """path through the longest matching prefix of (from, to) pairs; unchanged when none matches."""
+    best = max((p for p in pairs if path == p[0] or path.startswith(p[0] + "/")), key=lambda p: len(p[0]), default=None)
+    return best[1] + path[len(best[0]):] if best else path
+
+
+def new_layout(rev: str, cache: dict) -> bool:
+    if rev not in cache:
+        cache[rev] = subprocess.run(["git", "cat-file", "-e", f"{rev}:engine/CMakeLists.txt"],
+                                    capture_output=True).returncode == 0
+    return cache[rev]
+
+
 def lines_at(rev: str, path: str, cache: dict) -> set:
     if (rev, path) not in cache:
         try:
@@ -46,7 +74,7 @@ def lines_at(rev: str, path: str, cache: dict) -> set:
 
 
 def added(commit: str, paths: list) -> dict:
-    """path -> the keys of the lines `commit` added there."""
+    """upstream's path -> the keys of the lines `commit` added there."""
     out: dict = {}
     path = None
     for line in git("show", "--format=", "--unified=0", "--no-renames", commit, "--", *paths).splitlines():
@@ -66,13 +94,18 @@ def main() -> int:
     ap.add_argument("--max", type=float, default=0.5, help="list commits with at most this share in XeStrata")
     ap.add_argument("--min-lines", type=int, default=3)
     ap.add_argument("--ledger", nargs="*", default=[])
+    ap.add_argument("--map", default=MAP, help=f"upstream's layout move script (default {MAP})")
     a = ap.parse_args()
+    moves = load_moves(a.map)
+    back = [(new, old) for old, new in moves]
+    layout: dict = {}
+    specs = sorted(set(a.paths) | {remap(p, moves) for p in a.paths})
     known = set()
     for f in a.ledger:
         known |= set(re.findall(r"\b[0-9a-f]{8,9}\b", open(f, encoding="utf-8").read()))
     rng = f"{a.since}..{a.tag}" if a.since else a.tag
     commits = git("log", "--no-merges", "--reverse", "--format=%H %ad %s", "--date=short", rng, "--",
-                  *a.paths).splitlines()
+                  *specs).splitlines()
     cache: dict = {}
     found = 0
     for row in commits:
@@ -81,14 +114,17 @@ def main() -> int:
             continue
         have = alive = 0
         files = []
-        for path, keys in added(h, a.paths).items():
-            live = keys & lines_at(a.tag, path, cache)
+        for up, keys in added(h, specs).items():
+            path = remap(up, back) if new_layout(h, layout) else up
+            if not any(path == p or path.startswith(p + "/") for p in a.paths):
+                continue
+            live = keys & lines_at(a.tag, remap(path, moves) if new_layout(a.tag, layout) else path, cache)
             if not live:
                 continue
             ours = live & lines_at(a.ref, path, cache)
             alive += len(live)
             have += len(ours)
-            files.append(f"{path} {len(ours)}/{len(live)}")
+            files.append(f"{path}{'' if up == path else ' <- ' + up} {len(ours)}/{len(live)}")
         if alive < a.min_lines or have / alive > a.max:
             continue
         found += 1
