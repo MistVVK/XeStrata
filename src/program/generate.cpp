@@ -4677,6 +4677,8 @@ int main(int argc, char** argv) {
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
 #endif
+        // the memory guard credits the process's own mapped file pages back only when they are not locked (conversation_memory.hpp)
+        strata::core::set_locked_own_file_bytes(ple_table.locked() ? ple_table.table_bytes() : 0);
         if (pio.lock)
             std::fprintf(stderr, "xestrata generate: PLE table %s (%s) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -5383,6 +5385,7 @@ int main(int argc, char** argv) {
             // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
             const uint64_t table_b = ple_table.table_bytes();
             if (ple_table.unlock()) {
+                strata::core::set_locked_own_file_bytes(0);
                 strata::core::detail::HostMemory after;
                 std::string now;
                 if (strata::core::detail::host_available_memory(after)) {
@@ -8367,6 +8370,7 @@ int main(int argc, char** argv) {
                 strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
                 const auto before = cache_room;
                 if (ple_table.unlock()) {
+                    strata::core::set_locked_own_file_bytes(0);
                     cache_room = strata::core::available_host_bytes();
                     std::fprintf(stderr, "xestrata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the "
                                          "conversation cache, %.1f GiB without it (the table stays cached)\n",
