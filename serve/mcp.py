@@ -502,6 +502,7 @@ class McpServer:
                 if not t.alive():
                     self.status, self.error = "stopped", str(e)
                 raise
+        raise McpError("the call did not answer")  # unreachable: both attempts return or raise
 
     def close(self):
         with self.lock:
