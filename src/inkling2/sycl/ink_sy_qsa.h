@@ -127,6 +127,8 @@ struct InkSyQsa {
         const size_t nq = (size_t)h_idx * d_idx * n_embd, nk = (size_t)d_idx * n_embd;
         std::vector<uint16_t> hq(nq), hk(nk);
         std::vector<float> hqn((size_t)d_idx), hkn((size_t)d_idx), hwh((size_t)h_idx);
+        // NOLINTBEGIN(clang-analyzer-unix.Stream): each read below is size-checked, so one after EOF ends in fail();
+        // the analyzer also assumes EOF on a read that returned its full count, which is harmless here
         for (int f = 0; f < n_full; ++f) {
             if (std::fread(hq.data(), 2, nq, fp) != nq || std::fread(hk.data(), 2, nk, fp) != nk ||
                 std::fread(hqn.data(), 4, hqn.size(), fp) != hqn.size() ||
@@ -141,6 +143,7 @@ struct InkSyQsa {
             wait();
         }
         if (std::fgetc(fp) != EOF) return fail("longer than its header says");
+        // NOLINTEND(clang-analyzer-unix.Stream)
         std::fclose(fp);
 
         budget = budget_tokens; local = local_tokens; sink = sink_tokens;

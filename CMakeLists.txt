@@ -617,8 +617,8 @@ if(STRATA_ENABLE_XE)
   find_library(STRATA_ZSTD_LIB zstd REQUIRED)
   target_link_libraries(strata_engine PRIVATE ${STRATA_ZSTD_LIB})
   target_include_directories(strata_engine SYSTEM PRIVATE third_party/main/stb)
-  set_source_files_properties(src/quant/sk_codecs.cpp src/inkling2/inkling2_loop.cpp PROPERTIES COMPILE_OPTIONS
-                              "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/quant/sk_codecs.cpp src/inkling2/inkling2_loop.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
   set_source_files_properties(src/core/plain_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)

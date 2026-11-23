@@ -6266,11 +6266,12 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
-        parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
-                         recover=self.tool_call_recovery, declared_only=declared_only,
-                         # #4622: a well-formed call of an undeclared name is a call too, opt-in as for a deferred tool
-                         deferred=deferred or self.undeclared_tool_calls == "call"))
+        # the Inkling reader wraps the parser and forwards its attributes; it shares no type with these two readers
+        parser: Any = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
+                       reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                              recover=self.tool_call_recovery, declared_only=declared_only,
+                              # #4622: well-formed call of an undeclared name is a call too, opt-in as deferred tool
+                              deferred=deferred or self.undeclared_tool_calls == "call"))
         if getattr(self.template, "inkling", False):    # Inkling-2-Mini's channel tokens (serve/inkling_dialect.py)
             parser = inkling_kind.Reader(parser)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
