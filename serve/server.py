@@ -9145,6 +9145,9 @@ def make_handler(svc: Service):
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except (EngineStarting, EngineDied, EngineStuck) as e:
+                    # 台帳 0793（upstream 085860e4f4）: 起動できない engine の /load も理由付きの 503
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
                 if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
