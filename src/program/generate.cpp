@@ -578,6 +578,12 @@ struct Options {
     std::string draft_rule = "learn";   ///< --draft-rule df2|mtp|learn: a request without a draft= key (--draft auto)
     std::string draft_fallback = "none";   ///< --draft-fallback none|mtp: with --draft dflash2, load the MTP too
     int draft_mtp_spec = 0;   ///< --draft-mtp-spec N: the MTP's own window when DFlash2 is the primary (0 = --spec)
+    /// --serve, --draft-costs FILE (opt-in; the server passes it with "draft_costs": true): the draft policy's window
+    /// costs become a table built on this machine from its requests and then fixed, so the same request gives the same
+    /// windows on every start (strata/spec/draft_policy.hpp, DraftCosts).  A file built under another key (the devices,
+    /// the driver, the engine, the model, the settings: draft_costs_key) is built again.  --draft-costs-key TEXT: more
+    /// of the key from the server (the engine file's size).
+    std::string draft_costs, draft_costs_key;
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -749,6 +755,9 @@ void usage() {
                  "  --draft-rule df2|mtp|learn  a request without a draft= key under --draft auto (default learn)\n"
                  "  --draft-fallback none|mtp  with --draft dflash2, load the MTP layer too (default none)\n"
                  "  --draft-mtp-spec N   the MTP's own window when DFlash2 is the primary (0 = --spec)\n"
+                 "  --draft-costs FILE   --serve: the window costs a table built on this machine from its requests,\n"
+                 "                       then fixed (the same request, the same windows on every start); off: live\n"
+                 "  --draft-costs-key TEXT  more of what the table is valid for (the server's)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -2480,6 +2489,8 @@ int main(int argc, char** argv) {
     shared.spec_window_given = &o.spec_window_given;
     shared.spec_min_p = &o.spec_min_p;
     shared.window_hashes = &o.window_hashes;
+    shared.draft_costs = &o.draft_costs;
+    shared.draft_costs_key = &o.draft_costs_key;
     shared.mmap_experts = &o.mmap_experts;
     shared.vram_free_mib = &o.vram_free_mib;
     shared.vram_elastic = &o.vram_elastic;
@@ -9753,6 +9764,8 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's costs (swapped in per request)
         bool policy_is_df2 = df2_loaded;   // which drafter's costs `policy` holds
+        strata::spec::DraftCosts dcosts;   // --draft-costs: `policy`'s table, opened at the first request after the start
+        bool dc_tried = o.draft_costs.empty();
         strata::spec::DrafterPolicy drafter_policy;   // --draft auto: MTP or DFlash2 per request (kind x context depth)
         strata::spec::DrafterPolicy gumbel_policy(1.01, 24);    // XESTRATA_SPEC_GUMBEL=auto: off (First) or on (Second)
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
@@ -11534,6 +11547,17 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // --draft-costs: the drafters are settled once the start's measurement has run; with two drafters kept, the
+            // requests swap their policies, and one table cannot follow both
+            if (!dc_tried && !probe_running) {
+                dc_tried = true;
+                if (df2_loaded && use_mtp && mtp.loaded())
+                    std::fprintf(stderr, "xestrata serve: draft costs: off, two drafters are kept (each request picks one)\n");
+                else
+                    std::fprintf(stderr, "xestrata serve: %s\n", dcosts.open(policy, o.draft_costs, strata::spec::draft_costs_key(
+                                     argc, argv, strata::core::devices_key_text(), o.draft_costs_key)).c_str());
+            }
+            dcosts.request_start();
             // --draft auto: this request's drafter (the draft= key, else --draft-rule, else the learned policy)
             const bool req_off = req_draft == "off" || drafting_off;   // no drafter (the suffix lookup may propose)
             if (df2_loaded) {
@@ -14023,6 +14047,7 @@ int main(int argc, char** argv) {
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);
+            if (const std::string m = dcosts.request_end(); !m.empty()) std::fprintf(stderr, "xestrata serve: %s\n", m.c_str());
             if (gumbel_auto && req_kind_g != 0 && decode_ms > 0.0)   // XESTRATA_SPEC_GUMBEL=auto learn: the same speed
                 gumbel_policy.observe(req_kind_g, n, req_gumbel ? strata::spec::DrafterPolicy::Second
                                                                 : strata::spec::DrafterPolicy::First,

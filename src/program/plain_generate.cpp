@@ -50,6 +50,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_probe.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -1032,6 +1033,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     Clock::time_point probe_t0;
     strata::spec::DrafterPolicy drafter_policy;   // both drafters kept: MTP or DFlash2 per request
     std::string draft_rule = opt.draft_rule;      // a request without a draft= key (both kept: learn)
+    strata::spec::DraftCosts dcosts;              // --draft-costs: the MTP windows' table, opened at the first request
+    bool dc_tried = opt.draft_costs.empty();
     auto free_mib = [&]() -> long long {
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
@@ -1520,6 +1523,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             continue;
         }
+        // --draft-costs: the drafters are settled once the start's measurement has run (as generate.cpp's); with two
+        // drafters kept, one policy would price both drafters' windows
+        if (!dc_tried && !probe_running) {
+            dc_tried = true;
+            if (dr.loaded && model.drafts() > 0)
+                std::fprintf(stderr, "xestrata (%s): draft costs: off, two drafters are kept (each request picks one)\n", arch.c_str());
+            else
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(),
+                             dcosts.open(model.draft_policy(), opt.draft_costs, opt.draft_costs_key).c_str());
+        }
+        dcosts.request_start();
         // this request's drafter: none (draft=off, or the measurement kept none), DFlash2 (draft=, the rule the
         // measurement left, or the learned choice when both stay), else the MTP layer; spec=: its window
         const bool req_off = req_draft == "off" || drafting_off;
@@ -2434,6 +2448,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             drafter_policy.observe(req_kind, (int64_t) ids.size(), req_df2 ? strata::spec::DrafterPolicy::Df2
                                                                            : strata::spec::DrafterPolicy::Mtp,
                                    (int64_t) produced, decode_ms);
+        if (const std::string m = dcosts.request_end(); !m.empty()) std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), m.c_str());
         if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = it goes on in the batch windows | 0 = done>
             bool cont = produced == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                         (int64_t) live.size() == n;
@@ -2588,6 +2603,9 @@ static void plain_usage(const std::string& arch) {
                  "  --window-hashes PATH per verify window, a line with its index, position, size, a 64-bit hash of\n"
                  "                       its final normed rows and its argmaxes: two builds that do the same\n"
                  "                       arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
+                 "  --draft-costs FILE   --serve: the window costs a table built on this machine from its requests,\n"
+                 "                       then fixed (the same request, the same windows on every start); off: live\n"
+                 "  --draft-costs-key TEXT  more of what the table is valid for (the server's)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
                  "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  YaRN's knobs\n"
@@ -2727,6 +2745,8 @@ int plain_main(int argc, char** argv) {
     shared.spec_window_all = true;
     shared.spec_min_p = &opt.spec_min_p;
     shared.window_hashes = &opt.window_hashes;
+    shared.draft_costs = &opt.draft_costs;
+    shared.draft_costs_key = &opt.draft_costs_key;
     shared.mmap_experts = &opt.mmap_experts;
     shared.vram_free_mib = &opt.vram_free_mib;
     shared.vram_elastic = &opt.vram_elastic;
@@ -3252,6 +3272,8 @@ int plain_main(int argc, char** argv) {
         const uint64_t reserve = opt.reserve_mib >= 0 ? (uint64_t) opt.reserve_mib << 20 : (uint64_t) tb / 32;
         if (!dr.load(model, arch, err, reserve)) return start_failed(err);
     }
+    if (serve && !opt.draft_costs.empty())
+        opt.draft_costs_key = strata::spec::draft_costs_key(argc, argv, strata::core::devices_key_text(), opt.draft_costs_key);
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
                            folder, cvecs, dr);
