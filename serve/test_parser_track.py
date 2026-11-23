@@ -25,10 +25,16 @@ class ReferenceParser(OutputParser):
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
-                else:
-                    # 台帳 carryover db0c38425（#4923）: inline code は行をまたいで続かない。
-                    # 1 行の孤立した backtick で、その後の tool call が全部引用扱いになる事故を防ぐ。
+                elif not s:
                     self.ticks = 0
+                elif self.ticks % 2:
+                    self.ticks = (self.ticks + line.count("`")) % 2
+                else:
+                    # 台帳 carryover c447a2850/db0c38425（#4923）: 1 行の孤立した backtick で
+                    # その後の tool call が全部引用扱いにならないようにする。ただし行末の
+                    # backtick や markup の直前の物は行をまたぐ引用として残す。
+                    self.ticks = 1 if line.count("`") % 2 and \
+                        line[line.rfind("`") + 1:].strip()[:1] in ("", "<") else 0
                 if was_fenced or self.fence:                                       # #4703: indented code blocks
                     self._prev_blank = self._indented = False
                 elif not s:
