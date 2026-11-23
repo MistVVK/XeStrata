@@ -114,8 +114,13 @@ public:
     void finish(sycl::queue& queue);
     // Drains compute, transfer and every engine stream.
     void finish();
-    // finish() on every runtime made so far (it makes none), errors ignored: before the process ends on a signal.
+    // Drains every queue of every runtime made so far (it makes none) before the process ends, going on past a queue
+    // that fails or records a graph and saying which on stderr.
     static void finish_all() noexcept;
+    // The stop signal's drain (route_stop_signals): holds every other thread at its next engine wait or submission,
+    // then drains as finish_all until every queue is idle, for at most `limit`, and on Linux waits (at most 200 ms)
+    // for the process's GPU engine counters to stand still.  Whether all were drained.
+    static bool drain_for_stop(std::chrono::milliseconds limit) noexcept;
     // Exceptional teardown cannot unwind past memory still in use by the GPU.
     void free(void* pointer) noexcept;
     // Builds every kernel the binary carries for the device, on a thread of its own (the program: strata generate),
@@ -148,6 +153,7 @@ private:
     };
     Runtime(int ordinal, const sycl::device& device);
     void check_async();
+    static bool drain_pass(bool& failed, bool quiet) noexcept;
     sycl::async_handler handler();
     bool owns(const sycl::queue* queue);
     void watch();

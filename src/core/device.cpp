@@ -19,6 +19,7 @@
 #endif
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
@@ -540,6 +541,17 @@ std::vector<std::unique_ptr<Runtime>>& runtimes() {
     static std::vector<std::unique_ptr<Runtime>> all;
     return all;
 }
+
+// Set by the stop signal's thread (route_stop_signals, issue #62): any other thread that then comes to an engine wait
+// or submission (Runtime::wait and so a stream's or event's sync, copy_async, compute_after, free) stays there until
+// the process ends, so the queues the stop drains get no work after their drain.  Never set otherwise.
+std::atomic<bool> g_stopping{false};
+thread_local bool t_stopper = false;
+
+void hold_if_stopping() {
+    if (!g_stopping.load(std::memory_order_acquire) || t_stopper) return;
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+}
 }  // namespace
 
 int Runtime::count() { return (int) engine_devices().size(); }
@@ -884,6 +896,7 @@ void Runtime::watch() {
 }
 
 void Runtime::check_async() {
+    hold_if_stopping();
     std::lock_guard<std::mutex> lock(error_mutex_);
     if (error_) std::rethrow_exception(error_);
 }
@@ -943,21 +956,125 @@ void Runtime::wait_preload_all() {
     for (Runtime* r : made) r->wait_preload();
 }
 
-void Runtime::finish_all() noexcept {
+// One pass over every queue of every runtime made so far (it makes none): a barrier on each, waited for, a queue's
+// failure not keeping the others undrained.  A queue recording a graph is skipped: a barrier there would only be
+// recorded.  The waits bypass check_async, so an earlier asynchronous error does not fail every queue.  Says what it
+// could not drain; returns whether every queue is idle at the end (no queue recording, none with work submitted
+// after its barrier), and sets `failed` when a drain threw.
+bool Runtime::drain_pass(bool& failed, bool quiet) noexcept {
     std::vector<Runtime*> made;
     {
         std::lock_guard<std::mutex> lock(g_runtimes_mutex);
         for (auto& r : runtimes())
             if (r) made.push_back(r.get());
     }
+    bool idle = true;
     for (Runtime* r : made) {
-        try {
-            r->finish();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "Xe runtime: GPU %d not drained before the exit: %s\n", r->ordinal(), e.what());
+        // held for the pass: no stream is made or destroyed under it
+        std::lock_guard<std::mutex> lock(r->streams_mutex_);
+        std::vector<std::pair<sycl::queue*, const char*>> queues{{&r->compute_, "compute queue"},
+                                                                 {&r->transfer_, "transfer queue"}};
+        for (auto& q : r->streams_) queues.emplace_back(&q, "engine stream");
+        for (auto& [q, what] : queues) {
+            try {
+                if (q->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+                    idle = false;
+                    if (!quiet)
+                        std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: recording a graph\n",
+                                     r->ordinal_, what);
+                    continue;
+                }
+                q->ext_oneapi_submit_barrier().wait();
+                if (!q->ext_oneapi_empty()) {
+                    idle = false;
+                    if (!quiet)
+                        std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: work submitted after "
+                                     "its drain\n", r->ordinal_, what);
+                }
+            } catch (const std::exception& e) {
+                failed = true;
+                std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: %s\n", r->ordinal_, what,
+                             e.what());
+            }
         }
     }
+    return idle;
 }
+
+void Runtime::finish_all() noexcept {
+    bool failed = false;
+    (void) drain_pass(failed, false);
+}
+
+#if !defined(_WIN32)
+namespace {
+// The sum of this process's GPU engine counters in its DRM files' fdinfo: xe's drm-cycles-<engine> (the engine's
+// cycles in this process's contexts; not drm-total-cycles-, the GPU's clock) and i915's and amdgpu's
+// drm-engine-<engine> (busy nanoseconds; not drm-engine-capacity-).  0 where the process has none.
+uint64_t drm_engine_counters() {
+    uint64_t sum = 0;
+    DIR* dir = opendir("/proc/self/fdinfo");
+    if (dir == nullptr) return 0;
+    for (dirent* e; (e = readdir(dir)) != nullptr;) {
+        if (e->d_name[0] == '.') continue;
+        std::ifstream info(std::string("/proc/self/fdinfo/") + e->d_name);
+        for (std::string line; std::getline(info, line);) {
+            const bool cycles = line.rfind("drm-cycles-", 0) == 0;
+            const bool engine = line.rfind("drm-engine-", 0) == 0 && line.rfind("drm-engine-capacity-", 0) != 0;
+            if (!cycles && !engine) continue;
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) sum += std::strtoull(line.c_str() + colon + 1, nullptr, 10);
+        }
+    }
+    closedir(dir);
+    return sum;
+}
+}  // namespace
+#endif
+
+// The stop signal's drain: new waits and submissions are held (g_stopping), then passes over every queue until one
+// finds them all idle - a graph whose recording ends after a pass is launched and drained by the next - for at most
+// `limit`.  A failed drain ends the passes.  Whether every queue was drained.
+// Then, on Linux, until the process's engine counters (fdinfo) stand still over 5 ms, for at most 200 ms: on the B70
+// (xe, 2026-11-23) the compute engine went on counting this process's cycles for 5 to 10 ms after the drain's last
+// wait returned, and an exit inside that time faulted the engine at one address and reset it (5 of 9 stops after a
+// drain, 9 of 15 after other waits); with 20, 100 or 300 ms between the drain and the exit, none of 9.
+bool Runtime::drain_for_stop(std::chrono::milliseconds limit) noexcept {
+    t_stopper = true;
+    g_stopping.store(true, std::memory_order_release);
+    const auto end = std::chrono::steady_clock::now() + limit;
+    bool failed = false, drained = false;
+    for (;;) {
+        const bool last = std::chrono::steady_clock::now() >= end;
+        if (drain_pass(failed, !last)) { drained = !failed; break; }
+        if (failed || last) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#if !defined(_WIN32)
+    try {
+        uint64_t before = drm_engine_counters();
+        for (int i = 0; i < 40; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            const uint64_t now = drm_engine_counters();
+            if (now == before) break;
+            before = now;
+        }
+    } catch (const std::exception& e) {   // the files' reads (allocation): the exit goes on
+        std::fprintf(stderr, "Xe runtime: the GPU engines' counters not read before the exit: %s\n", e.what());
+    }
+#endif
+    return drained;
+}
+
+#if !defined(_WIN32)
+namespace {
+// write(2), not stdio: the thread that holds stderr's lock may be the one stuck in the driver
+void say_raw(const char* text) {
+    const ssize_t written = ::write(STDERR_FILENO, text, std::strlen(text));
+    (void) written;
+}
+}  // namespace
+#endif
 
 // SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
 // compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
@@ -966,7 +1083,12 @@ void Runtime::finish_all() noexcept {
 // The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when the
 // process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended as everyday
 // use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as well (the
-// runtime's own copies), and none once drained, 2026-10-15.
+// runtime's own copies), and none once drained, 2026-10-15.  Issue #62 (a B60 whose next engine hung after a stop
+// during GPU work): the drain holds the engine's other threads at their next wait or submission, so nothing is queued
+// behind it, passes again over a queue that was recording a graph, goes on past a queue that failed, and lets the
+// engines come to rest before the exit (drain_for_stop); what it could not drain, and a drain cut at 5 s, are said
+// on stderr.  Queues the runtime does not own (a timing's own queue,
+// made and waited for in one function) are not drained.
 void route_stop_signals() {
 #if defined(_WIN32)
     // Windows has no signal masks; Ctrl+C reaches a thread of its own already, and the server ends the engine with
@@ -982,9 +1104,11 @@ void route_stop_signals() {
         while (sigwait(&set, &sig) != 0) {}
         std::thread([sig] {
             std::this_thread::sleep_for(std::chrono::seconds(5));
+            say_raw("Xe runtime: the GPUs' queues not drained within 5 s of the stop signal; ending without them\n");
             _exit(128 + sig);
         }).detach();
-        Runtime::finish_all();
+        if (!Runtime::drain_for_stop(std::chrono::milliseconds(4500)))
+            std::fprintf(stderr, "Xe runtime: ending on the stop signal with GPU work not drained (above)\n");
         _exit(128 + sig);
     }).detach();
 #endif
