@@ -1614,6 +1614,10 @@ def param_value(text: str, schema, root=None, notes: list | None = None):
     types, strings = _schema_hints(schema, root)
     if types == {"string"} and (strings is None or text in strings):
         return text
+    # upstream 1aabfb1ce4 (#5979, issue #71): the model's Python spelling of a declared boolean is the boolean.
+    # anyOf/oneOf and nullable booleans are already unioned by _schema_hints; a schema allowing strings keeps text.
+    if types is not None and "boolean" in types and "string" not in types and text.strip().lower() in ("true", "false"):
+        return text.strip().lower() == "true"
     try:
         value = json.loads(text)
     except ValueError:
