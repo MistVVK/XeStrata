@@ -128,20 +128,25 @@ Set `XESTRATA_DF2_STATIC_TABLE` to a YD1S table for the target model to propose 
 table has no tokenizer identity: the same vocabulary size is not enough. Use a table made for this model's tokenizer.
 The target verifies these proposals too.
 
-In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
-top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
-low is neither read nor computed (`XESTRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their
+With the route tail skip on (`XESTRATA_ROUTE_TAIL_SKIP`, upstream b4e3407b), in the server's decode a missed expert
+(not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the top 10, the smallest weights) contributes
+zero to that token, and one that every token of a verify window routes that low is neither read nor computed.
+It is off by default (as upstream 9624759956): on the RX 9060 XT with SC117's IQ3_XXS and serve's expert cache (46%
+hits), rank 7 against off gave a teacher-forced KL of 0.0777 and 90.1% top-1 agreement (the same setting twice: 0.0190
+and 95.3%), for +12.4% decode. The other experts keep their
 weights (no renormalisation), so the answers differ slightly. Upstream zeroes it only when no other token of the window
 needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
-It does nothing when every expert is in VRAM (nothing is skipped) and with `--batch`; on a layer split each stage skips
-its own. With a helper cache (`--expert-cache-device1..3`) the helper GPU computes the experts it holds, and only those
+It does nothing when every expert is in VRAM (nothing is skipped), and `auto` leaves it off with `--batch`; on a layer
+split each stage skips its own. With a helper cache (`--expert-cache-device1..3`) the helper GPU computes the experts it holds, and only those
 on neither GPU are skipped.
-It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
-skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
+`XESTRATA_ROUTE_TAIL_SKIP=7` turns it on and 1-9 sets the rank. `auto` is the rule of the earlier default: rank 7, but
+not when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the skip costs more draft
+acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
 `XESTRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
-`XESTRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
+Unset or 0 leaves it off; when it is on the start prints one line. Setup takes `--route-tail-skip off|auto|1-9` and
+keeps it in the model's config.
 
-Measured (IQ3_XXS):
+Measured when 7 was the default (IQ3_XXS):
 
 | | B70 | RTX 4070 | RX 9060 XT |
 | --- | --- | --- | --- |
@@ -344,7 +349,7 @@ The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and 
 | UD-Q3_K_XL | 89.5 GB | 56.2 GB | about 80 GB |
 | UD-IQ4_XS | 93.7 GB | 60.4 GB | about 84 GB |
 
-The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
+The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 17 GB).
 With less RAM the experts that do not fit are read from the SSD while it answers.
 setup recommends the largest size whose experts all fit the RAM (UD-Q4_K_XL aside).
 setup asks about images (on by default); the image encoder is the original model's.
@@ -370,8 +375,9 @@ IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
-setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
-36 GiB on a 64 GB PC with a 128K context.
+setup chooses the RAM less 17 GB for N, less the KV cache too when that lives in RAM (upstream 8780e9fdc3; 24 GB before):
+43 GiB on a 64 GB PC with a 128K context.
+On a GPU that shares the RAM (an APU) it keeps 24 GB aside, as the GPU's cache is RAM too.
 The rest come from the SSD while it answers.
 Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 

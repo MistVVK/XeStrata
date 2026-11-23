@@ -1029,7 +1029,12 @@ SC117_SWIFT_FILES = {
     "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf":
         (26710079616, "5b91b79a4bbee162761c16b9a47a3434c3f8be0ad6bf34849318d9efcb4b6aa1"),
 }
-UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+# RAM beside the RAM budget of experts (resident_budget_gib): the OS, the engine, and the file cache the rest is read
+# through.  On a discrete GPU 17 (upstream 8780e9fdc3, owner 11-19: 24 -> 17, a 64 GB PC 40 -> 47 GiB; upstream's record
+# under a 64 GiB limit, UD-Q4_K_XL: decode 57.7 -> 84.2 tok/s, a 65K prompt read 97.7 -> 37.0 GB from the SSD; not
+# measured here); 24 where 17 was not measured: a unified-memory GPU, whose cache and the budget share the RAM
+UNSLOTH_RAM_LEFT_GB = 24
+UNSLOTH_BUDGET_LEFT_GB = 17
 UMA_DENSE_ROOM_GB = 8          # in the GPU's own pool: the dense weights' buffers beside the file's dense bytes
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
@@ -7123,12 +7128,13 @@ def files_gb(family: str, model: str) -> float:
     return sum(p[0] for p in pins if p) / 1e9
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
     """UD-Q4_K_XL, UD-IQ4_XS: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB,
-    ram_gb()) less 24 for the OS, the engine and the file cache the other experts are read through, less a KV cache
-    streamed to RAM; at most all of them, at least 8.  A 64 GB PC (~62 GiB): 38, 36 with a 128K context
-    (the 2026-10-03-ud-low-ram record)."""
-    gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
+    ram_gb()) less 17 (UNSLOTH_BUDGET_LEFT_GB) for the OS, the engine and the file cache the other experts are read
+    through, less a KV cache streamed to RAM; at most all of them, at least 8.  A 64 GB PC (~62 GiB): 45, 43 with a
+    128K context (24 before upstream 8780e9fdc3: 38 and 36, the 2026-10-03-ud-low-ram record).  A unified-memory GPU
+    (`uma`) keeps the 24: there the GPU's expert cache is RAM too, and 17 was measured on discrete cards only."""
+    gib = round(ram) - (UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB) - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
 
 
@@ -7149,16 +7155,17 @@ def uma_expert_cache(model, ram, budget_gib, kv_ram_gb=0.0):
     return slots if slots >= 256 else None
 
 
-def budget_choice(model, ram, asked) -> float:
+def budget_choice(model, ram, asked, uma=False) -> float:
     """UD-Q4_K_XL's or UD-IQ4_XS's RAM budget: --resident-budget-gib N as given, else the recommendation
     (resident_budget_gib).  More than the recommendation is kept, with what it risks (setup recommends, it never
     forces)."""
-    rec = resident_budget_gib(model, ram)
+    rec = resident_budget_gib(model, ram, uma=uma)
     if asked is None:
         return rec
     if asked > rec:
         warn(f"a {asked:g} GiB RAM budget is more than setup recommends for this PC ({rec} GiB: the RAM less "
-             f"{UNSLOTH_RAM_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
+             f"{UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB} GB for the OS, the engine and the file cache "
+             "that reads the other experts). Kept "
              "as you chose: the engine clamps it to the RAM it finds free at start (less 8 GiB), and the file cache "
              "gets less room - it may be slower, or run the PC out of RAM under load")
     return int(asked) if asked == int(asked) else asked
@@ -8472,7 +8479,7 @@ def run_gui(args: list) -> int:
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
-    --vram-reserve-mib)."""
+    --vram-reserve-mib, --ple-io, --route-tail-skip)."""
     cfg = repoint_engine(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     cfg = upgrade_config(cfg_path, cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
@@ -8488,6 +8495,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args += ["--vram-reserve-mib", str(reserve)]
         write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+    tail = keep.pop("route_tail_skip", None)           # the route tail skip: the config's route_tail_skip_default
+    if tail is not None:
+        cfg["route_tail_skip_default"] = route_tail_skip_value(tail)
+        write_config(cfg_path, cfg)
+        ok(f"saved for this model: the route tail skip {tail} (--route-tail-skip)")
     ple_io = keep.pop("ple_io", None)                  # #49: how the engine reads the n-gram table, in the args
     if ple_io is not None:
         args = cfg["args"]
@@ -8893,7 +8905,7 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "family", "log", "lib_dirs", "port",
-                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom", "route_tail_skip_default"})
+                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
@@ -9628,6 +9640,8 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     STATE.mkdir(parents=True, exist_ok=True)
     if getattr(a, "custom", None):                     # a model of the user's own files: what setup read of them
         cfg["custom"] = a.custom
+    if getattr(a, "route_tail_skip", None):            # else an earlier config's own choice is carried over
+        cfg["route_tail_skip_default"] = route_tail_skip_value(a.route_tail_skip)
     keep_old_names(cfg, cfg_path if cfg_path.is_file() else adopted)
     cal = saved_calibration(cfg) if tune else None
     if cal is not None:
@@ -9802,7 +9816,7 @@ OPTIONS = [
                      ["mmap", "On, the experts the GPU does not hold read through the OS file cache"]],
             default="auto", cli={"default": "auto"}),
     _option("resident-budget-gib", "GiB of the experts kept in RAM (the rest read from the SSD)",
-            "UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, ~38 on 64 GB; "
+            "UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 17 GB, ~45 on 64 GB; "
             "more is kept as you choose, with a note); the other models' files: the GiB of the experts the GPU does "
             "not hold kept in RAM, the rest read from the file",
             kind="number", place="advanced", min=1, max=1e6, when=["budget"], hint="setup's choice for this RAM",
@@ -10012,11 +10026,33 @@ OPTIONS = [
                      ["ram", "The whole table in RAM (faster new prompts, ~29 GB more RAM)"],
                      ["direct", "Read from the SSD as needed"]],
             default=""),
+    # the route tail skip (XESTRATA_ROUTE_TAIL_SKIP, the config's route_tail_skip_default): off by default (upstream
+    # 9624759956, owner 11-19; Q6 2026-11-23 on the RX 9060 XT: rank 7 moved the answers by KL 0.078 against a 0.019
+    # floor for +12% decode); the choice of upstream 98ebfb3e1c kept: auto (rank 7 where the engine's rule allows),
+    # off, 1-9
+    _option("route-tail-skip", "Skip rarely used parts of the model (faster answers that can change slightly)",
+            "the route tail skip: an expert not in VRAM that every token of a verify window routes at the rank or "
+            "lower is neither read nor computed: off (default), auto = rank 7 except where nearly every expert is in "
+            "VRAM or with --parallel, 1-9 = that rank (lower skips more: faster, the answers change more; only 7 is "
+            "measured)",
+            place="start",
+            choices=[["", "As set up (off the first time)"],
+                     ["off", "Off (recommended)"],
+                     ["auto", "Automatic: on where it helps (rank 7)"],
+                     ["7", "On: rank 7 (the measured one)"],
+                     *[[str(r), str(r)] for r in (1, 2, 3, 4, 5, 6, 8, 9)]],
+            about="Lower numbers skip more parts: faster, and the answers change more. Only 7 has been measured.",
+            default=""),
     _option("old-driver", "Start although the Intel GPU's driver is older than the one setup asks for",
             "start although the Level Zero driver predates the fix setup stops on (see its message)",
             kind="flag", place="start", default=False),
 ]
 OPTION = {o["name"]: o for o in OPTIONS}
+
+
+def route_tail_skip_value(choice: str) -> str:
+    """--route-tail-skip's choice as XESTRATA_ROUTE_TAIL_SKIP's value (the config's route_tail_skip_default)."""
+    return "0" if choice == "off" else choice
 
 
 def option_args(ap) -> None:
@@ -10323,7 +10359,7 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
     if scaling is not None:
         assert rope_scale is not None
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         args += ["--kv", kv]
     if low_ram:
         args += ["--resident-experts" if resident else "--mmap-experts"]
@@ -10345,9 +10381,8 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"),
                            "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
                            "experts_gb": MODELS[model]["arena_gb"], "draft_vocab": draft_vocab}
-    # R7 KL against off on B70 at 12 GiB: XS 0.008904, S 0.010352, M 0.011171; above the 0.0058 reference.
-    # Leave it off unless the user opts in, without changing other models' engine defaults.
-    cfg["route_tail_skip_default"] = 0
+    # the route tail skip stays off, as the engine's default (R7 KL against off on B70 at 12 GiB: XS 0.008904,
+    # S 0.010352, M 0.011171; above the 0.0058 reference); --route-tail-skip turns it on
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]
     replicas_config(a, cfg)
@@ -10821,7 +10856,8 @@ def main() -> int:
                                        a.yes)) - 1]
             return start(run_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         update_installed_engine()
         pick_cfg = have[0]
         if len(have) > 1:
@@ -10836,13 +10872,14 @@ def main() -> int:
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                                           keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
                                                 "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser,
-                                                "ple_io": a.ple_io})
+                                                "ple_io": a.ple_io, "route_tail_skip": a.route_tail_skip})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -10851,7 +10888,8 @@ def main() -> int:
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -10980,7 +11018,8 @@ def main() -> int:
             if "sync" in d.get("families", ()):
                 verdict = "fits" if size_fits("sync", m, room_of(ram, chosen)) else "does not fit"
             elif d.get("budget"):
-                fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
+                fits = (f"fits with {resident_budget_gib(m, ram, uma=bool(gpu.get('integrated')))} GiB of its experts "
+                        "in RAM, the rest read from the SSD")
                 verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
                     else "does not fit"
             elif low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
@@ -11072,7 +11111,8 @@ def main() -> int:
             fit += "   (installed)"
         if d.get("budget"):
             say(f"  {i}) {m} {d['about']}; download {files_gb(family, m):.1f} GB, keeps ~"
-                f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
+                f"{resident_budget_gib(m, ram, uma=bool(gpu.get('integrated')))} GB of its {d['arena_gb']:.0f} GB of "
+                f"experts in RAM{fit}")
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
@@ -11096,13 +11136,14 @@ def main() -> int:
                  "slower than the 2-3-bit models")
         if ram < MODELS[model]["ram_gb"]:
             confirm_risk(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB: "
-                         f"its RAM budget would be {resident_budget_gib(model, ram)} GiB, so nearly every expert is "
+                         f"its RAM budget would be {resident_budget_gib(model, ram, uma=bool(gpu.get('integrated')))} "
+                         "GiB, so nearly every expert is "
                          "read from the SSD while it answers (very slow), and it may run out of RAM",
                          bool(a.model), a.yes, f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC "
                          f"has {ram:.0f} GB", f"choose one of the 2-3-bit models, or --model {model} --yes to "
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
-        budget = budget_choice(model, ram, a.resident_budget_gib)
+        budget = budget_choice(model, ram, a.resident_budget_gib, uma=bool(gpu.get("integrated")))
         # upstream 86ffdbeb1: on a unified-memory GPU whose own pool holds the experts, the expert cache takes them all
         # and nothing is pinned.  The GPU's own pool is the BIOS carve-out (the OS does not see it), not `uma_gb`: the
         # GTT pool is the RAM itself.  The dense weights and the buffers take their part of the carve-out first, so the
@@ -11177,11 +11218,13 @@ def main() -> int:
                   else "as requested")
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
-    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21).
+    # Up to 8K the engine's 16-bit unless --kv names another (upstream #6354 made 8-bit the default there on small
+    # cards; here it is a choice only, as it changes the answers: OUT, 2026-11-23)
+    kv = (a.kv or "fp16") if ctx <= 8192 else (a.kv or "int8")
     if ctx > 8192 and not a.kv and not a.yes:
         kv = ask_option("kv", a.yes)
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
     if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
@@ -11494,7 +11537,7 @@ def main() -> int:
         args += ["--draft", "mtp"]
     if scaling is not None:     # the resolved configuration: the explicit flags, or yarn and the derived factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
@@ -11514,7 +11557,7 @@ def main() -> int:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, uma=bool(gpu.get("integrated")))
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
     elif ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
         ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "

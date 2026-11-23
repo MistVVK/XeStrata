@@ -3668,13 +3668,13 @@ int main(int argc, char** argv) {
                        ? copy_ms[(size_t) d] + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
         };
         const bool drafts = !o.mtp.empty();
-        // the CPU's share of the misses left by the route tail skip (STRATA_ROUTE_TAIL_SKIP, rank 7 by default without
-        // --batch, below): the entries at rank >= R of the Ka routed are neither read nor computed, taken as that share
+        // the CPU's share of the misses left by the route tail skip (STRATA_ROUTE_TAIL_SKIP, off by default; =auto is rank 7
+        // without --batch, below): the entries at rank >= R of the Ka routed are neither read nor computed, taken as that share
         // of the missed bytes (#53: one RTX 4070 Ti skipped about 36% of its misses, the ranks 7 to 9 being 30% of the
         // routes, and the misses leaning to the low ranks).  Every placement skips, a helper GPU's experts excepted.
         const int tail_r = [&] {
-            const char* v = strata::env_get("ROUTE_TAIL_SKIP");
-            return v != nullptr ? (int) std::strtol(v, nullptr, 10) : o.batch <= 0 ? 7 : 0;
+            if (strata::core::tail_skip_auto()) return o.batch <= 0 ? 7 : 0;
+            return strata::core::tail_skip_rank();
         }();
         const double tail_keep = tail_r > 0 && tail_r < Ka ? (double) tail_r / (double) Ka : 1.0;
         // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
@@ -9039,40 +9039,42 @@ int main(int argc, char** argv) {
         strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         bool pcie_move_decided = false;   // the arena's move into host USM: decided once, after a prompt is read
         std::vector<int64_t> routed_seen;   // the prompts' routings already given to the adaptive tier's counts
-        {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
-            // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
-            // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
-            // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
-            // skip would depend on another's tokens).  A layer split is fine: each stage skips by itself; so is a helper
-            // GPU, whose experts are computed there and only the misses it does not hold are skipped (#53).
-            const char* tse = strata::env_get("ROUTE_TAIL_SKIP");
+        {   // STRATA_ROUTE_TAIL_SKIP: OFF BY DEFAULT (upstream 9624759956, owner 11-19; XeStrata's Q6 measurement 2026-11-23,
+            // RX 9060 XT, SC117 IQ3_XXS, serve's expert cache: rank 7 against 0 teacher-forced KL 0.0777 and top-1 90.1%
+            // against a repeat floor of 0.0190 and 95.3%, decode +12.4%).  A missed expert that every token of a verify
+            // window routes at the rank or lower is neither copied nor computed (answers differ slightly).  =7 turns it
+            // on, 1-9 pick a rank, =auto is the rule of before: rank 7 unless every expert is in VRAM, 90% or more are
+            // cached, or --batch slots mix requests in a window (one request's skip would depend on another's tokens).
+            // A layer split is fine: each stage skips by itself; so is a helper GPU, whose experts are computed there and
+            // only the misses it does not hold are skipped (#53).
+            const bool tail_auto = strata::core::tail_skip_auto();
             const bool all_experts_resident = !host_res.empty() &&
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
             // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
             // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
-            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
+            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line of =auto; 101 = never.
             size_t cached_experts = 0;
             for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
             const char* mcs = strata::env_get("TAIL_SKIP_MAX_CACHED");
             const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
             const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
                                            (double) cached_experts >= max_cached * (double) host_res.size();
-            if (tse == nullptr && nearly_all_cached && o.batch <= 0)
-                std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
-                                     "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
-                                     "it saves; XESTRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
+            if (tail_auto && nearly_all_cached && o.batch <= 0)
+                std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP=auto leaves it off: %.1f%% of the experts are "
+                                     "in the GPU cache, so few are missed and skipping them costs more draft acceptance "
+                                     "than it saves; XESTRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
                              100.0 * (double) cached_experts / (double) host_res.size());
-            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0)
+            if (tail_auto && !all_experts_resident && !nearly_all_cached && o.batch <= 0)
                 strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert a token routes at rank "
-                                     "%d or lower contributes zero to it (answers differ slightly); "
-                                     "XESTRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
-                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-            // ranks below the default skip experts with larger weights: the answers drift further (rank 4 against 7,
+                                     "%d or lower contributes zero to it (answers differ slightly); it is off when "
+                                     "XESTRATA_ROUTE_TAIL_SKIP is not set or is 0\n", strata::core::tail_skip_rank(),
+                             tail_auto ? " (auto)" : "", strata::core::tail_skip_rank());
+            // ranks below 7 skip experts with larger weights: the answers drift further (rank 4 against 7,
             // IQ3_XXS, 2026-10-31: KL 0.0226 against 0.0066 on an RTX 4070, 0.0293 against 0.0072 on a B70 at 12 GiB)
             if (strata::core::tail_skip_rank() > 0 && strata::core::tail_skip_rank() < 7 && !all_experts_resident)
-                std::fprintf(stderr, "xestrata serve: info: XESTRATA_ROUTE_TAIL_SKIP=%d is below the default 7: the answers' "
+                std::fprintf(stderr, "xestrata serve: info: XESTRATA_ROUTE_TAIL_SKIP=%d is below 7: the answers' "
                                      "quality drops (at rank 4 they drift 3 to 4 times as far as at 7)\n",
                              strata::core::tail_skip_rank());
         }
@@ -9775,12 +9777,12 @@ int main(int argc, char** argv) {
                 M.budget("pool_workers", pool.workers());
                 M.budget("conversation_cache_mib", o.conversation_cache_mib);
                 M.budget("batch_slots", o.batch);
-                // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
-                // only where the configuration allows), not "off"
+                // upstream 9624759956: an unset XESTRATA_ROUTE_TAIL_SKIP is off; =auto skips only where the configuration allows
                 const int tail = strata::core::tail_skip_rank();
                 M.path("experts", "route_tail_skip", tail > 0,
-                       tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
-                                : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
+                       tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail) + (strata::core::tail_skip_auto() ? " (auto)" : "")
+                                : strata::core::tail_skip_auto() ? "XESTRATA_ROUTE_TAIL_SKIP=auto: off in this configuration"
+                                                                 : "XESTRATA_ROUTE_TAIL_SKIP is unset or 0: off (the default)");
                 M.write("ready");
             }
             std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
