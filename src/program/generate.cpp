@@ -3612,7 +3612,9 @@ int main(int argc, char** argv) {
             copy_ms[(size_t) i] = strata::core::probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = strata::env_get("SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
-        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        // XESTRATA_SPLIT_LINK_MIN=r (opt-in, upstream becf4a3d9a): the gap from which the scale applies, 4 unless set
+        static const double link_min = strata::program::split_rules::link_scale_min_resolve(strata::env_get("SPLIT_LINK_MIN"));
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps, link_min);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
             if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;

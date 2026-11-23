@@ -980,7 +980,9 @@ bool PlainModel::split_auto_role(std::string& err) {
         side_ms[(size_t) d] = link_gbps[(size_t) d] > 0.0 && copy_ms >= 0.0
                                   ? copy_ms + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
     }
-    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+    // XESTRATA_SPLIT_LINK_MIN=r (opt-in, upstream becf4a3d9a): the gap from which the scale applies, 4 unless set
+    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(
+        link_gbps, strata::program::split_rules::link_scale_min_resolve(strata::env_get("SPLIT_LINK_MIN")));
     std::vector<int> order((size_t) n);
     for (int d = 0; d < n; ++d) order[(size_t) d] = d;
     auto capacity = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
