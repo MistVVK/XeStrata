@@ -132,10 +132,12 @@ const char* last_error() { return g_error.c_str(); }
 
 std::string failure_report(const std::exception& e) {
     std::string r = e.what();
+    bool out_of_host_memory = false;
     if (const auto* se = dynamic_cast<const sycl::exception*>(&e)) {
+        const int32_t ur = sycl::detail::get_ur_error(*se);
+        out_of_host_memory = ur == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
         char buf[96];
-        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(),
-                      (int) sycl::detail::get_ur_error(*se));
+        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(), (int) ur);
         r += buf;
     }
     try {
@@ -152,6 +154,16 @@ std::string failure_report(const std::exception& e) {
         }
     } catch (const std::exception&) {
         r += "; the GPU: unknown";
+    }
+    if (out_of_host_memory) {
+        // Issue #77: a graph submission on a small first card reported UR 38 with tens of GiB of RAM free.  The
+        // driver's command buffers, the graph's events and the card's own space are sized from the same log's
+        // figures; the name of the UR result alone sends a user to the wrong place.  Say what to check, without
+        // claiming that RAM or the card was short here (no reproduction on this machine).
+        r += "; OUT_OF_HOST_MEMORY can be the RAM or the room a command graph needs for its buffers, events and "
+             "driver command space: check the RAM available and the sizes at start (expert cache, --prefill, "
+             "--max-context, --spec, --vram-reserve-mib); on a small card raise --vram-reserve-mib (and "
+             "--vram-reserve-later-mib on later cards), shrink the cache or context, or put a larger card first";
     }
     return r;
 }
