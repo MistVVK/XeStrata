@@ -1509,8 +1509,9 @@ _GLM53_IQ4 = _glm53_parts("UD-IQ4_XS", [
 # Inkling-2-Mini (Thinking Machines, Apache-2.0) as upstream inkling2's .strata v1.1 files (strata-engine's SQ-20,
 # SQ-15 and SQ-10: the trunk, the experts in SF4 / MX8 / S_K with their VRAM load order, and the DSpark drafter in one
 # file), which the engine's Inkling-2-Mini path reads (src/inkling2).  Beside each: the tokenizer.json and chat
-# template of the same commit (tools/strata_tokenizer.py --tokenizer-json makes the server's tokenizer/ of them), and
-# tamanekokoro's QSA indexer (MIT), which a request turns on or off (the model's "qsa" setting, serve's qsa= key).
+# template of the same commit (tools/strata_tokenizer.py --tokenizer-json makes the server's tokenizer/ of them).  The
+# family "inkling-qsa" is the same files with tamanekokoro's QSA indexer (MIT) beside them, on (the user's decision of
+# 2026-11-23 13:15: the indexer is chosen as a model of its own, as SenseNova-Loop's QSA files are).
 # Sizes and SHA-256 are the Hub's LFS pointers at the revisions pinned in HF_REVISIONS (2026-11-23); SQ-15 and the
 # indexer were also checked after download.
 _INKLING = "strata-engine/Inkling-2-Mini-Strata"
@@ -1523,11 +1524,26 @@ INKLING_FILES = {
 INKLING_SIDE = [   # the files beside every size: (repository, path, bytes, sha256)
     (_INKLING, "tokenizer.json", 26178678, "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6"),
     (_INKLING, "chat_template.jinja", 6868, "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"),
-    (_INKLING_QSA, "inkling2-qsa-indexer-v3.bin", 23601344,
-     "b1d68173617821a7ce4a110c3ce3a4335fdce331b8d217f1d17517302c2725f7"),
 ]
 INKLING_QSA_FILE = "inkling2-qsa-indexer-v3.bin"
+INKLING_QSA_SIDE = (_INKLING_QSA, INKLING_QSA_FILE, 23601344,
+                    "b1d68173617821a7ce4a110c3ce3a4335fdce331b8d217f1d17517302c2725f7")
 INKLING_SIZES = ("SQ-20", "SQ-15", "SQ-10")
+
+
+def inkling_models(qsa: bool) -> dict:
+    """Inkling-2-Mini's sizes: the .strata file, its tokenizer and template, and with `qsa` the indexer"""
+    side = INKLING_SIDE + [INKLING_QSA_SIDE] if qsa else INKLING_SIDE
+    out = {}
+    for m in INKLING_SIZES:
+        f = f"Inkling-2-Mini-{m}.strata"
+        out[m] = {"repo": _INKLING, "file": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1],
+                  "parts": [{"path": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1]},
+                            *({"repo": r, "path": p, "size": n, "sha256": h} for r, p, n, h in side)],
+                  "about": INKLING_ABOUT[m]}
+    return out
+
+
 INKLING_ABOUT = {"SQ-20": "NVFP4 and MXFP8 experts as published, the largest",
                  "SQ-15": "4- and 5-bit experts, the middle", "SQ-10": "2- and 3-bit experts, the smallest"}
 
@@ -1535,18 +1551,20 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     # Inkling-2-Mini: the text model, on the engine's .strata path (src/inkling2): 1..64 slots and DSpark drafts
     "inkling": {"title": "Inkling-2-Mini", "by": "Thinking Machines (Apache-2.0), .strata files by strata-engine",
                 "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; text only",
-                "tag": "inkling-", "name": "inkling-2-mini", "max_context": 32768, "plain": True, "strata": True,
+                "tag": "inkling-", "name": "inkling-2-mini", "max_context": 32768, "plain": True,
+                "file_format": ".strata",
                 "kv_bytes": 8192, "vision": False, "mmproj": None,
-                "models": {m: {"repo": _INKLING, "file": f"Inkling-2-Mini-{m}.strata",
-                               "size": INKLING_FILES[f"Inkling-2-Mini-{m}.strata"][0],
-                               "sha256": INKLING_FILES[f"Inkling-2-Mini-{m}.strata"][1],
-                               "parts": [{"path": f"Inkling-2-Mini-{m}.strata",
-                                          "size": INKLING_FILES[f"Inkling-2-Mini-{m}.strata"][0],
-                                          "sha256": INKLING_FILES[f"Inkling-2-Mini-{m}.strata"][1]},
-                                         *({"repo": r, "path": f, "size": n, "sha256": h}
-                                           for r, f, n, h in INKLING_SIDE)],
-                               "about": INKLING_ABOUT[m]} for m in INKLING_SIZES},
+                "models": inkling_models(False),
                 "license": "Apache-2.0"},
+    # the same files with the QSA indexer on: the full-attention layers read the 4-token blocks it picks (the user's
+    # decisions of 2026-11-23 13:15 and 13:17: a model of its own, the one the first install offers)
+    "inkling-qsa": {"title": "Inkling-2-Mini (QSA)", "by": "Thinking Machines (Apache-2.0), .strata files by "
+                    "strata-engine; QSA indexer by tamanekokoro (MIT)",
+                    "about": "Inkling-2-Mini with a block-sparse QSA indexer: faster on long chats, though it may miss "
+                             "details far back (many exact facts at once are better without it); text only",
+                    "tag": "inkling-qsa-", "files_tag": "inkling-", "name": "inkling-2-mini-qsa",
+                    "max_context": 32768, "plain": True, "file_format": ".strata", "qsa": True, "kv_bytes": 8192,
+                    "vision": False, "mmproj": None, "models": inkling_models(True), "license": "Apache-2.0"},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
                "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 "
                         "and 3.5 bits",
@@ -1796,7 +1814,8 @@ QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
               "gyro": "Gyro by agentionai", "sync": "Sync by hiruhiru2005",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
-              "hauhaucs": "GGUFs by HauhauCS", "inkling-strata": "SQ files by strata-engine",
+              "hauhaucs": "GGUFs by HauhauCS", "inkling-sq": "SQ files by strata-engine",
+              "inkling-qsa": "SQ files by strata-engine, with a QSA indexer",
               "qsa": "SenseNova QSA indexers",
               "own": "your own files"}
 TIERS = {  # family: (model, version, quantization), in the order each level lists them
@@ -1823,7 +1842,8 @@ TIERS = {  # family: (model, version, quantization), in the order each level lis
     "llmjp": ("llm-jp-4.1", "original", "llm-jp"),
     "glm53": ("glm-5.3-flash", "original", "unsloth"),
     "qwen35-0.8b": ("qwen3.5-0.8b", "original", "unsloth"),
-    "inkling": ("inkling2-mini", "original", "inkling-strata"),
+    "inkling": ("inkling2-mini", "original", "inkling-sq"),
+    "inkling-qsa": ("inkling2-mini", "original", "inkling-qsa"),
     "sensenova-loop-qsa": ("sensenova-loop-9b", "original", "qsa"),
 }
 # a model's line in setup's first question where its original family's "about" does not say what the model is
@@ -1840,7 +1860,8 @@ SIGNAL2_PEAK_RAM_GB = 64.4
 # S or M); else SenseNova-Loop-9B (QSA); else Qwen3.5-2B (LAST_CHOICE), offered when nothing else runs.  A family that
 # is not in FAMILIES is passed over.
 FIRST_CHOICE = (("sc117-swift", ("IQ3_S", "IQ3_XXS"), None, True), ("signal2", None, SIGNAL2_PEAK_RAM_GB, False),
-                ("sync", None, None, False), ("sensenova-loop-qsa", None, None, False),
+                ("sync", None, None, False), ("inkling-qsa", None, None, False),
+                ("sensenova-loop-qsa", None, None, False),
                 ("qwen35-2b", None, None, False))
 LAST_CHOICE = "qwen35-2b"
 
@@ -9378,7 +9399,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # a file whose published name differs from its name on disk (Inkling-2-Mini's Mainline_Support .gguf_file
     # must be a .gguf for the engine and the model folder's scan) gets its local name from "local".
     names_of = [Path(x.get("local", x["path"])).name for x in parts]
-    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
+    # a family of another's files ("files_tag": Inkling-2-Mini's QSA entry shares the plain entry's folder)
+    files_tag = fam.get("files_tag", fam["tag"]) + model
+    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / files_tag
     if d.get("custom"):
         models_dir = Path(a.custom["files"][0]["path"]).parent
 
@@ -9386,8 +9409,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         return all((folder / n).exists() and (done(folder / n) or own) for n in names_of)
     if not own and not all_there(models_dir):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
-            if all_there(r / "models" / tag):
-                models_dir = r / "models" / tag
+            if all_there(r / "models" / files_tag):
+                models_dir = r / "models" / files_tag
                 ok(f"model file found in {models_dir}")
                 break
     gguf = models_dir / names_of[0]
@@ -9446,7 +9469,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 6. the tokenizer and the chat template, for the server
     step(6, "preparing the model for XeStrata")
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
-    if fam.get("strata") and not (tok_dir / "tokenizer" / "vocab.json").exists():   # .strata: its tokenizer.json
+    # a .strata model: the server's tokenizer from its tokenizer.json
+    if fam.get("file_format") == ".strata" and not (tok_dir / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--tokenizer-json",
              str(models_dir / "tokenizer.json"), "--chat-template", str(models_dir / "chat_template.jinja"), "--out",
              str(tok_dir)])
@@ -9459,8 +9483,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
-    if fam.get("strata"):   # Inkling-2-Mini: its QSA indexer loaded always, used where the model's "qsa" setting says
-        args += ["--qsa-indexer", str(models_dir / INKLING_QSA_FILE)]
+    if fam.get("qsa"):   # Inkling-2-Mini (QSA): the indexer on for every request; its budget, local and sink are the
+        # engine's (--qsa-budget, --qsa-local, --qsa-sink: provisional until the MODEL check measures them)
+        args += ["--qsa-indexer", str(models_dir / INKLING_QSA_FILE), "--qsa", "on"]
     if scaling is not None:     # the resolved rope configuration: the explicit flags, or yarn and the derived factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
     if on_cpu:
@@ -9534,7 +9559,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
                            "family": family,
-                           **({"arch": "inkling2_loop", "qsa": "off"} if fam.get("strata") else {}),
+                           **({"arch": "inkling2_loop"} if fam.get("file_format") == ".strata" else {}),
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if not on_cpu:
         cfg["drafting"] = drafting
