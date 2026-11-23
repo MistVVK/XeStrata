@@ -3179,14 +3179,14 @@ bool PlainModel::kv_trim(int64_t cells, int64_t hold, std::string& err) {
 }
 
 void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                                 strata::gpu::Stream cs, const k::KvHostPools* stage) {
+                                 strata::gpu::Stream cs, const k::KvHostPools* stage, bool host_by_dma) {
     const KvPtrs p = kv_ptrs(a, slot);
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
     // --kv-resident: the host copy gets every cell (the identity layout), the VRAM ring its resident pages, and the
     // prompt's staging pool its copy; the one shared append (kv_q8.hpp), so the cells are bit for bit a fully
     // resident layer's (the individual kv_append_* are its wrappers).  The trellis-coded pools have no host copy.
-    const bool streamed = slot < 0 && kv_streamed(a);
+    const bool streamed = slot < 0 && kv_streamed(a) && !(host_by_dma && stage != nullptr);
     const k::KvHostPools host = streamed ? kv_host_[a] : k::KvHostPools{};
     auto base = [&]() {
         k::KvAppend ap;

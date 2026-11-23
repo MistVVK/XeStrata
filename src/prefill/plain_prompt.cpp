@@ -11,6 +11,7 @@
 //
 // The state is left as the windows leave it: the GDN recurrent state and conv history (the same layouts), the K/V
 // cells of the chunk's positions.  The decode then continues at the next position.
+#include "strata/core/kv_host_dma.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/stream_watch.hpp"
 #include "strata/core/plain_cpu.hpp"
@@ -1412,7 +1413,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         stage.page_table = page_table_;   // the identity: the staging pool is a fully resident layout
                         k::kv_stage_from_host(stage, kv_host_[(size_t) a], fmt, (pa + qs.page_size - 1) / qs.page_size,
                                               qs, cs);
-                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs, &P.kv_stage);
+                        // the chunk's cells reach the host copy by DMA from the staging pool, not by the append
+                        // kernel's stores over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                        const bool host_by_dma = opt_.kv_tcq == 0 &&
+                                                 strata::core::kv_host_dma_use(strata::core::kv_host_dma(), true, P.kv_stage.present());
+                        kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs, &P.kv_stage, host_by_dma);
+                        if (host_by_dma)
+                            k::kv_unstage_to_host(stage, kv_host_[(size_t) a], fmt, pa / qs.page_size,
+                                                  (pa + T + qs.page_size - 1) / qs.page_size, qs, cs);
                         pools = stage;
                     } else {
                         kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
