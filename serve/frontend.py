@@ -628,7 +628,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
                               lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
-def tool_arguments(raw) -> dict:
+def tool_arguments(raw, declared=None) -> dict:
     """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
     (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
     number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
@@ -640,6 +640,10 @@ def tool_arguments(raw) -> dict:
         try:
             value = json.loads(raw)
         except ValueError:
+            if declared is None or "arguments" not in declared:
+                cut = cut_arguments(raw)
+                if cut is not None:
+                    return cut
             return {"arguments": raw}
         return value if isinstance(value, dict) else {"arguments": raw}
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
@@ -752,7 +756,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))},
+                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"), declared_parameters(req.get("tools"), fn.get("name")))},
                               "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
@@ -1011,7 +1015,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                     text.append(added)
                     parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
+                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"), declared_parameters(req.get("tools"), block.get("name")))},
                               "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
@@ -1535,6 +1539,8 @@ class _Lenient:
 
     def __init__(self, text: str):
         self.s, self.i = text, 0
+        self.cut_ok = False        # 台帳 P6 carryover 0c99fcf85: cut_arguments は途中で終わる文字列も読む
+        self.cut = False
 
     def peek(self) -> str:
         s, n = self.s, len(self.s)
@@ -1554,6 +1560,11 @@ class _Lenient:
             if c == "\\":
                 self.i += 1
                 e = s[self.i:self.i + 1]
+                if self.cut_ok and (not e or (e == "u" and len(s) - self.i - 1 < 4
+                                              and re.fullmatch(r"[0-9a-fA-F]*", s[self.i + 1:]))):
+                    self.i = len(s)
+                    self.cut = True
+                    return "".join(out)
                 if e == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", s[self.i + 1:self.i + 5]):
                     out.append(chr(int(s[self.i + 1:self.i + 5], 16)))
                     self.i += 5
@@ -1564,6 +1575,9 @@ class _Lenient:
             else:
                 out.append(c)
             self.i += 1
+        if self.cut_ok:
+            self.cut = True
+            return "".join(out)
         raise ValueError("string not closed")
 
     def value(self, depth: int = 0):
@@ -1635,6 +1649,66 @@ def lenient_json(text: str):
     if t[r.i:].strip("]}) \t\r\n"):
         raise ValueError("text after the value")
     return v
+
+
+def cut_arguments(text: str):
+    """`max_tokens` で切れた call の引数から読める member を取り出す（台帳 P6 carryover 0c99fcf85）。
+
+    完全な `"key": value` と、文字列の途中で終わっている値はそこまでを採る。数値・配列・
+    オブジェクトが切れた場合と key が切れた場合は落とす。復元できない物は None。"""
+    t = text.strip()
+    if not t.startswith("{") or len(t) > LENIENT_MAX:
+        return None
+    r = _Lenient(t)
+    r.cut_ok = True
+    r.i = 1
+    first = r.peek()
+    if first and first not in ('"', "'"):
+        return None
+    out: dict = {}
+    while True:
+        c = r.peek()
+        if not c or c == "}":
+            break
+        if c == ",":
+            r.i += 1
+            continue
+        if c not in ('"', "'"):
+            break
+        try:
+            key = r.string()
+            if r.cut or r.peek() != ":":
+                break
+            r.i += 1
+            value = r.value()
+        except (ValueError, RecursionError):
+            break
+        if r.cut:
+            if isinstance(value, str):
+                out[key] = value
+            break
+        if r.i >= len(t) and not isinstance(value, str):
+            break
+        out[key] = value
+    return out
+
+
+def declared_parameters(tools, name):
+    """要求が宣言した tool `name` の parameter 名の集合。無ければ空集合、その工具が無ければ None。"""
+    for t in tools if isinstance(tools, list) else ():
+        if not isinstance(t, dict):
+            continue
+        fn = t["function"] if isinstance(t.get("function"), dict) else t
+        if isinstance(t.get("tools"), list):                          # Responses の namespace
+            found = declared_parameters(t["tools"], name)
+            if found is not None:
+                return found
+        if isinstance(name, str) and name and (fn.get("name") == name or
+                                                (isinstance(fn.get("name"), str) and name.endswith("." + fn["name"]))):
+            schema = fn.get("parameters") or fn.get("input_schema")
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            return set(props) if isinstance(props, dict) else set()
+    return None
 
 
 def _json_type(value) -> str:
