@@ -9,7 +9,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 XeStrata は、文章のモデルと同じ PC、同じ GPU で画像も作ります（All in One）。
 画像を作るモデルは任意で、`xestrata --setup` の質問か `--images` で、文章のモデルと一緒に入れます。
 画像は XeStrata 自身の画像のエンジン `xestrata-image` が作ります。文章のエンジンと同じ SYCL のカーネルで、Intel・AMD・NVIDIA のどの GPU でも動きます。
-Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデルとはまだ組み合わせられません）、文章のモデルと同じサーバーの、Web のページの Images のタブ、チャット、API（vLLM-Omni 互換（OpenAI 互換））から使えます。
+Qwen3.8-Flash-Next のどの版とも組み合わせられ（ほかのモデルとはまだ組み合わせられません）、文章のモデルと同じサーバーの、Web のページの Images のタブ、チャット、API（vLLM-Omni 互換（OpenAI 互換））から使えます。
 文章と画像は 1 枚の GPU を順番に使い、VRAM を分け合います。画像を作る間の文章のモデルの扱い（そのまま残す、VRAM を一時的に空ける、外してあとで戻す）は、その画像に要る VRAM から自動で選びます（[GPU のメモリの分け合い](#gpu-のメモリの分け合い)）。
 
 > **目次:** [モデルの選び方](#モデルの選び方) · [入れ方](#入れ方) · [大きさとメモリ](#大きさとメモリ) · [オプション](#オプション) ·

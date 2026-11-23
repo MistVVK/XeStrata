@@ -31,7 +31,7 @@ Ubuntu 26.04 と Fedora 44・45 には deb と rpm のパッケージ、Windows 
   画像を作るモデルは、Enter を押せば Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つを入れます。
   入れたものは、どれも同じアドレス `http://127.0.0.1:8095` で使えます。
   ブラウザの画面（Chat、Images、Tools、Video、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像と動画の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作り、動画を大きくしたり動画の中の物体を探したりもします。
-- 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image、Anima から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（BETA のモデルとはまだ組み合わせられません）。
+- 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image、Anima から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（ほかのモデルとはまだ組み合わせられません）。
 
 ## XeStrata とは
 
@@ -42,7 +42,7 @@ XeStrata は、オープンな標準の SYCL で書いた 1 つのコードで�
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコードを AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
-- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B・2B・0.8B、GLM-5.3-Flash も動かせます（BETA）。Qwen3.5-2B と 0.8B は GPU のない PC でも CPU だけで動きます。
+- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B・2B・0.8B、GLM-5.3-Flash も動かせます。Qwen3.5-2B と 0.8B は GPU のない PC でも CPU だけで動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもでき、メーカーの違う GPU も組み合わせられます（NVIDIA を含むときは contrib-llvm のビルド）。
   2 枚のときは、2 枚目を層の分担にするか、1 枚目のキャッシュの助けにするかを、速い方に自動で選びます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
@@ -97,21 +97,21 @@ AMD 自身の ROCm（amdrocm のパッケージ、`/opt/rocm/core-<版>`）が�
 
 **迷ったら、`xestrata --setup` の質問で Enter を押してください。** Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L、Gyro-Coder、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に、この PC で動く最初のものを選び、大きさは品質で選びます（GSQ-RCO の版は入れば **IQ3_S**、次に **IQ3_XXS**、どちらも入らなければ入るうちで品質のいちばん高いもの。Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
 setup は、モデル、版（元のもの、Swift 1.5、Coder、誰が拒否を外したものか）、量子化（誰が作ったファイルか）、大きさの順に尋ねます。選び方の決まりは [DETAILS](docs/DETAILS.ja.md#setup-の尋ね方と勧め方) にあります。
-RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルも選べます。
+RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、ほかのモデルも選べます。
 あとから別のモデルを足すときも `xestrata --setup` を実行します。
-表にないモデルでも、GGUF のファイルが手元にあれば `xestrata --setup --gguf <ファイル> --name <名前>` で入れられます（Qwen3.8-Flash-Next と、下の BETA のモデルと同じアーキテクチャのもの。[DETAILS](docs/DETAILS.ja.md#手元の-gguf-から入れる--gguf)）。
+表にないモデルでも、GGUF のファイルが手元にあれば `xestrata --setup --gguf <ファイル> --name <名前>` で入れられます（Qwen3.8-Flash-Next と、下のほかのモデルと同じアーキテクチャのもの。[DETAILS](docs/DETAILS.ja.md#手元の-gguf-から入れる--gguf)）。
 
 | モデル | パラメーター | RAM の目安 | 向いていること |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 1,250 億 | 32〜62 GB | いちばん賢い。下の版と大きさから選びます |
-| **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | 画像も読む。RAM の少ない PC 向け。拒否を外した版もあります |
-| **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
-| **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 画像も読む思考するモデル。RAM の少ない PC 向け |
-| **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
-| **Qwen3.5-2B・0.8B**（BETA） | 20 億・8 億（密） | 8 GB（VRAM は 2〜6 GB）、GPU なしでは 4〜6 GB | 小さな GPU や GPU のない PC 向けの、画像も読む思考するモデル。答えは 9B に及びません |
-| **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
+| **Ornith-1.5** | 350 億（1 トークンで 30 億） | 21〜80 GB | 画像も読む。RAM の少ない PC 向け。拒否を外した版もあります |
+| **llm-jp-4.1** | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
+| **Qwen3.6-35B-A3B** | 350 億（1 トークンで 30 億） | 31〜46 GB | 画像も読む思考するモデル。RAM の少ない PC 向け |
+| **Qwen3.5-9B** | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
+| **Qwen3.5-2B・0.8B** | 20 億・8 億（密） | 8 GB（VRAM は 2〜6 GB）、GPU なしでは 4〜6 GB | 小さな GPU や GPU のない PC 向けの、画像も読む思考するモデル。答えは 9B に及びません |
+| **GLM-5.3-Flash** | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-画像を読ませられる BETA のモデルは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B です（2B と 0.8B は GPU で動かすときだけ）。画像の生成は、GPU があればどのモデルにも足せます。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
+画像を読ませられるほかのモデルは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B です（2B と 0.8B は GPU で動かすときだけ）。画像の生成は、GPU があればどのモデルにも足せます。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 

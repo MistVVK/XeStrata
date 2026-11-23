@@ -31,7 +31,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
   For the image models, Enter installs three: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image.
   Whatever is installed is used at one address, `http://127.0.0.1:8095`:
   the browser app (Chat, Images, Tools, Video, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image and video API (vLLM-Omni-compatible); asked in the chat, it makes images as well, and makes a video larger or finds the objects in it.
-- The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0, MOSS-Image and Anima, and each goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models).
+- The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0, MOSS-Image and Anima, and each goes with any version of Qwen3.8-Flash-Next (not yet with the other models).
 
 ## About XeStrata
 
@@ -42,7 +42,7 @@ A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Inte
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, and the same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
 The models, the install, the app and the API are much the same as Strata's.
 
-- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, 2B and 0.8B and GLM-5.3-Flash (BETA). Qwen3.5-2B and 0.8B also run on the CPU alone, on a PC without a GPU.
+- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, 2B and 0.8B and GLM-5.3-Flash. Qwen3.5-2B and 0.8B also run on the CPU alone, on a PC without a GPU.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC, of different makers too (with NVIDIA, in the contrib-llvm build).
   With two, it chooses by itself whichever is faster: the second GPU taking a share of the layers, or helping the first one's cache ([MULTIGPU](docs/MULTIGPU.md)).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)).
@@ -102,21 +102,21 @@ engine's library path is pointed at it).
 
 **Not sure? Press Enter at `xestrata --setup`'s questions.** It takes the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L, Gyro-Coder, Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs, and its size by quality (the GSQ-RCO versions at **IQ3_S** where it fits, else **IQ3_XXS**, else the best quality that fits; UD-IQ4_XS on a Ryzen AI Max with 80 GB or more).
 setup asks for the model, its version (the original, Swift 1.5, the Coder, or whose copy with the refusals removed), its quantization (whose files) and the size, in that order. How it recommends is in [DETAILS](docs/DETAILS.md#how-setup-asks-and-recommends).
-With less RAM, the Coder (32 GB), Gyro (from 36 GB, or 38 GB of RAM and VRAM together), Gyro-Coder (from 26 GB, or 28 GB together) and the BETA models are there to choose too.
+With less RAM, the Coder (32 GB), Gyro (from 36 GB, or 38 GB of RAM and VRAM together), Gyro-Coder (from 26 GB, or 28 GB together) and the other models are there to choose too.
 To add another model later, run `xestrata --setup` too.
-A model not in the table can be installed from GGUF files you have with `xestrata --setup --gguf <file> --name <name>` (Qwen3.8-Flash-Next, and models of the BETA models' architectures; [DETAILS](docs/DETAILS.md#installing-from-your-own-gguf-files---gguf)).
+A model not in the table can be installed from GGUF files you have with `xestrata --setup --gguf <file> --name <name>` (Qwen3.8-Flash-Next, and models of the other families' architectures; [DETAILS](docs/DETAILS.md#installing-from-your-own-gguf-files---gguf)).
 
 | Model | Parameters | RAM (about) | Good for |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 125B | 32-62 GB | the smartest; choose from the versions and sizes below |
-| **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | reads images too; a PC with less RAM; also with its refusals removed |
-| **llm-jp-4.1** (BETA) | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
-| **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model that reads images too; a PC with less RAM |
-| **Qwen3.5-9B** (BETA) | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
-| **Qwen3.5-2B, 0.8B** (BETA) | 2B, 0.8B (dense) | 8 GB (VRAM 2-6 GB); 4-6 GB without a GPU | thinking models that read images too, for a small GPU or a PC without one; their answers fall short of the 9B's |
-| **GLM-5.3-Flash** (BETA) | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
+| **Ornith-1.5** | 35B (3B a token) | 21-80 GB | reads images too; a PC with less RAM; also with its refusals removed |
+| **llm-jp-4.1** | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
+| **Qwen3.6-35B-A3B** | 35B (3B a token) | 31-46 GB | a thinking model that reads images too; a PC with less RAM |
+| **Qwen3.5-9B** | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
+| **Qwen3.5-2B, 0.8B** | 2B, 0.8B (dense) | 8 GB (VRAM 2-6 GB); 4-6 GB without a GPU | thinking models that read images too, for a small GPU or a PC without one; their answers fall short of the 9B's |
+| **GLM-5.3-Flash** | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
 
-Of the BETA models, Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only); image generation can be added to any model on a PC with a GPU. Their sizes and
+Of the other models, Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only); image generation can be added to any model on a PC with a GPU. Their sizes and
 options are in
 [DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash).
 

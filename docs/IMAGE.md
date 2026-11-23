@@ -9,7 +9,7 @@ English | [日本語](IMAGE.ja.md)
 XeStrata makes images as well, in the same PC and on the same GPU as the text model (All in One).
 The models that make images are optional, installed with the text model by `xestrata --setup`'s questions or `--images`.
 The images are made by XeStrata's own image engine, `xestrata-image`. It runs on the same SYCL kernels as the text engine, on Intel, AMD and NVIDIA GPUs alike.
-It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), and is used from the text model's server: the web page's Images tab, the chat and the API (vLLM-Omni-compatible, so OpenAI-compatible).
+It goes with any version of Qwen3.8-Flash-Next (not yet with the other models), and is used from the text model's server: the web page's Images tab, the chat and the API (vLLM-Omni-compatible, so OpenAI-compatible).
 Text and images take turns on one GPU and share its VRAM. What happens to the text model while an image is made (it stays, gives up VRAM for the while, or is unloaded and comes back) is chosen by itself from the VRAM the image needs ([Sharing the GPU's memory](#sharing-the-gpus-memory)).
 
 > **Contents:** [Choosing a model](#choosing-a-model) · [Installing](#installing) · [Sizes and memory](#sizes-and-memory) · [Options](#options) ·
