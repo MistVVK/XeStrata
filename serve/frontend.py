@@ -1102,6 +1102,8 @@ class Event:
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
+FUNCTION_CALLS_START = "<function_calls>"    # 台帳 carryover 20056dbbe（#6022、recover）
+FUNCTION_CALLS_END = "</function_calls>"
 
 
 PARAM_END = "</parameter>"
@@ -1791,6 +1793,16 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     props = _properties(schema)
     root = schema.get("parameters") if isinstance(schema, dict) else None
     args = {}
+    if recover and rest.lstrip().startswith("{"):
+        # 台帳 carryover 20056dbbe: `<function=T>{"k": v}</function>` の JSON 全体を引数として読む
+        try:
+            value, at = json.JSONDecoder().raw_decode(rest.lstrip())
+            tail = rest.lstrip()[at:].lstrip()
+            if isinstance(value, dict) and (not tail or tail.startswith(FUNC_END) or tail.startswith(CALL_END)):
+                args.update(value)
+                rest = ""
+        except ValueError:
+            pass
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
@@ -2016,6 +2028,8 @@ class OutputParser:
         self.recover = recover
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.rbare = False           # 台帳 carryover c447a2850: reasoning の裸の call
+        self.dialect_call = False    # 台帳 carryover 20056dbbe: <function_calls>/<invoke> を読み替えた call
+        self.dialect_wrapped = False # <function_calls> の wrapper を読み替えた
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276: the end of a misspelt opener still arriving (see _opener)
@@ -2134,6 +2148,30 @@ class OutputParser:
                     return p, True
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
+
+    def _rewrite_dialect(self) -> None:
+        """recover: Claude の方言 `<function_calls><invoke name=T>` と `<parameter name=P>` を
+        XeStrata の call 形式に書き換える（台帳 carryover 20056dbbe）。宣言された工具だけを読む。"""
+        if not self.recover or not self.schemas:
+            return
+        text = self.buf
+        if FUNCTION_CALLS_START not in text and FUNCTION_CALLS_END not in text and "<invoke name=" not in text \
+                and "<parameter name=" not in text and "</invoke>" not in text:
+            return
+        had_start, had_end = FUNCTION_CALLS_START in text, FUNCTION_CALLS_END in text
+        wrapped = had_start or had_end
+        if wrapped:
+            text = text.replace(FUNCTION_CALLS_START, CALL_START).replace(FUNCTION_CALLS_END, CALL_END)
+
+        def opener(m):
+            return m.group(1) + (f"<function={m.group(2)}>" if self._callable(m.group(2)) else m.group(0))
+
+        text = re.sub(r'(?m)^(\s*)<invoke name="([^"<>]+)"\s*>', opener, text)
+        text = text.replace("</invoke>", "</function>")
+        text = re.sub(r'<parameter name="([^"<>]+)"\s*>', r'<parameter=\1>', text)
+        self.dialect_wrapped = self.dialect_wrapped or had_start
+        self.dialect_call = True
+        self.buf = text
 
     def _bare_in_reasoning(self):
         """reasoning の中の宣言済み工具の裸の <function=NAME> を (位置, 決定済み) で返す。"""
@@ -2377,6 +2415,20 @@ class OutputParser:
             elif self.ss == "between":
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
+                if self.recover and stripped.startswith("{"):
+                    try:
+                        value, used = json.JSONDecoder().raw_decode(stripped)
+                    except ValueError:
+                        return out
+                    tail = stripped[used:].lstrip()
+                    if isinstance(value, dict) and (not tail or tail.startswith(FUNC_END) or FUNC_END.startswith(tail)):
+                        for k, v in value.items():
+                            self.sheld.pop(k, None)
+                            self.sheld[k] = v
+                        self.sp += used
+                        self.ss = "between"
+                        continue
+                    return out
                 if stripped.startswith("<parameter="):
                     b = stripped.find(">")
                     if b < 0:
@@ -2567,6 +2619,16 @@ class OutputParser:
             if held:
                 self._held = held
         held = self._prefixed() if self.schemas else None
+        if self.recover and self.schemas:
+            more = self._hold(self.buf, (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>",
+                                         "<parameter name="))
+            part = re.search(r'<(?:invoke|parameter)[^>]*name=?[^>]*$', self.buf)
+            if part:
+                more = max(more, len(self.buf) - part.start())
+            if more:
+                held = self.buf[-more:] + (held or "")
+                self.buf = self.buf[:-more]
+            self._rewrite_dialect()
         out = self._feed()
         if held:
             self.buf += held
@@ -2688,6 +2750,8 @@ class OutputParser:
                 self.state, self.lead, self.after_think = "content", True, True
                 self._reset_track()                                # the answer's own text starts here
             elif self.state == "content":
+                if self.recover and self.dialect_wrapped and CALL_END not in self.buf:
+                    return out          # 台帳 carryover 20056dbbe: <function_calls> の終わりまで文を出さない
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
                     if not stripped:
@@ -2726,8 +2790,10 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END) if self.after_think
-                                                   else (CALL_START,))
+                    tags = (CALL_START, THINK_END) if self.after_think else (CALL_START,)
+                    if self.recover and self.schemas:
+                        tags += (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>", "<parameter name=")
+                    j = len(self.buf) - self._hold(self.buf, tags)
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
@@ -2898,6 +2964,12 @@ class OutputParser:
             self._final = True      # #4701: a call held after its closing tags (could a file go on?) is whole now
             out += self.feed("")
         self._restore_scan_body()   # the final feed may compact a still-incomplete streamed call again
+        self._rewrite_dialect()
+        if self.recover and self.dialect_wrapped and self.buf.rstrip().endswith(FUNC_END):
+            body = self.buf.rstrip()[len(CALL_START):]   # the dialect's wrapper closer was left out (#6022)
+            self.buf, self.state = "", "content"
+            self.dialect_call, self.dialect_wrapped = False, False
+            return out + self._finish_call(body)
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others
