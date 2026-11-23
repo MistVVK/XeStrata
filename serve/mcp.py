@@ -65,6 +65,30 @@ class _Slot:
         self.error = None
 
 
+class McpSessionGone(McpError):
+    """台帳 0634（upstream 2b81d475ee）: 再起動した server が古い session を拒んだ。何も実行されていないので再送できる。"""
+
+
+_SESSION_WORD = re.compile(r"\bsession", re.I)
+_GONE_WORD = re.compile(r"unknown|invalid|expired|not found|no valid|missing|terminated|reinitiali[sz]e", re.I)
+
+
+def _session_gone_error(err: dict) -> bool:
+    msg = str(err.get("message") or "")
+    return err.get("code") in (-32600, -32001, -32000) and bool(_SESSION_WORD.search(msg) and _GONE_WORD.search(msg))
+
+
+def _session_gone_text(body: str) -> bool:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    for m in parsed if isinstance(parsed, list) else [parsed]:
+        if isinstance(m, dict) and isinstance(m.get("error"), dict) and _session_gone_error(m["error"]):
+            return True
+    return False
+
+
 def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str):
     """Wait for a response, checking the chat's stop button and the deadline a few times a second."""
     deadline = time.monotonic() + timeout
@@ -307,16 +331,23 @@ class HttpTransport:
                             found = m
                 if found is None:
                     raise McpError("the server's answer did not contain a response")
+                err = found.get("error")
+                if self.session and isinstance(err, dict) and _session_gone_error(err):
+                    self.broken = McpSessionGone("the server ended the session")
+                    raise McpSessionGone(f"{err.get('message')} (code {err.get('code')})")
                 slot.msg = found
         except urllib.error.HTTPError as e:
-            detail = ""
+            body = ""
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
+                with e:
+                    body = e.read(65536).decode("utf-8", "replace")
             except OSError:
                 pass
-            if e.code == 404 and self.session:           # the session expired: a restart starts a new one
-                self.broken = McpError("the server ended the session")
-            err = McpError(f"HTTP {e.code} {e.reason}{': ' + detail if detail else ''}")
+            detail = body[:300]
+            gone = bool(self.session) and (e.code == 404 or (e.code == 400 and _session_gone_text(body)))
+            if gone:                                     # the session expired: a restart starts a new one
+                self.broken = McpSessionGone("the server ended the session")
+            err = (McpSessionGone if gone else McpError)(f"HTTP {e.code} {e.reason}{': ' + detail if detail else ''}")
             if slot is None:
                 raise err from None
             slot.error = err
@@ -446,23 +477,31 @@ class McpServer:
             return False
 
     def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
-        with self.lock:
-            if self.transport is None or not self.transport.alive():
-                # it stopped since its last call (a crash, an expired session): start it again; one that failed to
-                # start is tried again at most every 10 s, so a broken command does not run on every call
-                if self.status == "failed" and time.monotonic() - self.last_start < 10:
-                    raise McpError(f"the server is not running ({self.error or 'it stopped'})")
-                print(f"[xestrata] MCP server {self.name!r} had stopped; starting it again", flush=True)
-                if not self._start():
-                    raise McpError(f"the server could not be started again: {self.error}")
-            t = self.transport
-        assert t is not None                             # (started above)
-        try:
-            return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
-        except McpError as e:
-            if not t.alive():
-                self.status, self.error = "stopped", str(e)
-            raise
+        for attempt in (1, 2):
+            with self.lock:
+                if self.transport is None or not self.transport.alive():
+                    # it stopped since its last call (a crash, an expired session): start it again; one that failed to
+                    # start is tried again at most every 10 s, so a broken command does not run on every call
+                    if self.status == "failed" and time.monotonic() - self.last_start < 10:
+                        raise McpError(f"the server is not running ({self.error or 'it stopped'})")
+                    print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
+                    if not self._start():
+                        raise McpError(f"the server could not be started again: {self.error}")
+                t = self.transport
+            assert t is not None                         # (started above)
+            try:
+                return t.request("tools/call", {"name": tool, "arguments": arguments}, timeout, cancel)
+            except McpSessionGone as e:
+                # 新しい session で 1 度だけ再送する。2 度目も忘れられたら諦める（#6014）
+                with self.lock:
+                    if self.transport is t:
+                        self.status, self.error = "stopped", str(e)
+                if attempt == 2:
+                    raise
+            except McpError as e:
+                if not t.alive():
+                    self.status, self.error = "stopped", str(e)
+                raise
 
     def close(self):
         with self.lock:
