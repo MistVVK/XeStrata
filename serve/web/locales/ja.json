@@ -315,6 +315,8 @@
   "drawer.segLimit": "区切りの大きさ",
   "drawer.share": "他のアプリにも使う",
   "drawer.shareNote": "omp などの API クライアントが自分で指定しない項目に、この設定が使われます",
+  "settings.qsa": "長い会話の疎な注意（QSA）",
+  "settings.qsaNote": "長い会話で速くなります。遠い前の細部を取りこぼすことがあります（多くの事実を正確に拾うならオフ）。次のメッセージから効きます",
   "drawer.short": "設定",
   "drawer.showThinking": "思考を表示",
   "drawer.showThinkingNote": "生成中は開いた状態にします",

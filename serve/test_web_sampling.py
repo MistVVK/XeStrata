@@ -44,7 +44,7 @@ class WebSampling(unittest.TestCase):
         cls.body = slice_between(src, "  if (!(settings.temperature > 0)) {", "  if (settings.seed)")
 
     def run_js(self, settings: dict, pieces: str, health: dict | None = None):
-        js = (self.defaults + "function projectionLoaded() { return false; }\n"
+        js = (self.defaults + "function projectionLoaded() { return false; }\nfunction qsaLoaded() { return false; }\n"
               f"const health = {json.dumps(health or {})};\n" + self.thinking +
               self.shared +
               f"\nconst settings = {json.dumps(settings)};\nconst body = {{}};\n{pieces}\n"

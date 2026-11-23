@@ -315,6 +315,8 @@
   "drawer.segLimit": "구간 크기",
   "drawer.share": "다른 앱에도 사용",
   "drawer.shareNote": "omp 등 API 클라이언트가 직접 지정하지 않은 항목에 이 설정이 적용됩니다",
+  "settings.qsa": "긴 대화용 희소 어텐션 (QSA)",
+  "settings.qsaNote": "긴 대화에서 더 빠릅니다. 오래전 세부 내용을 놓칠 수 있습니다(많은 사실을 정확히 찾을 때는 끄는 편이 좋습니다). 다음 메시지부터 적용됩니다",
   "drawer.short": "설정",
   "drawer.showThinking": "추론 표시",
   "drawer.showThinkingNote": "작성되는 동안 펼쳐 둡니다",

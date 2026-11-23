@@ -80,7 +80,7 @@ from serve import places  # noqa: E402
 from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
 from serve import notices  # noqa: E402
-from serve import envvars  # noqa: E402
+from serve import envvars, inkling_kind  # noqa: E402
 from serve import autotune  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve import skills as skills_api  # noqa: E402
@@ -1731,7 +1731,8 @@ class StrataEngine:
             keys += " script_table=" + str(sgt["table"]).encode().hex()
             keys += f" script_allow={sgt['allow']}" if sgt.get("allow") else ""
             keys += f" script_pending={sgt['pending']}" if sgt.get("pending") else ""
-        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
+        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias")) + \
+            inkling_kind.qsa_key(sampling)
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -3928,6 +3929,8 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
+    if inkling_kind.is_inkling(cfg):                  # Inkling-2-Mini's engine takes its own options
+        return inkling_kind.engine_args(cfg)
     args = list(cfg["args"])
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited
     # by hand) advertised images and then refused every picture ("this engine was started without --vision").  The
@@ -6105,6 +6108,8 @@ class Service:
                          recover=self.tool_call_recovery, declared_only=declared_only,
                          # #4622: a well-formed call of an undeclared name is a call too, opt-in as for a deferred tool
                          deferred=deferred or self.undeclared_tool_calls == "call"))
+        if getattr(self.template, "inkling", False):    # Inkling-2-Mini's channel tokens (serve/inkling_dialect.py)
+            parser = inkling_kind.Reader(parser)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -11575,7 +11580,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection", "script_guard")
+               "experimental_speed_projection", "script_guard", "xestrata_qsa")
 
 
 def script_guard_name(value) -> str:
@@ -11619,6 +11624,9 @@ def clean_shared_defaults(d) -> dict:
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
+        elif key == "xestrata_qsa":                            # Inkling-2-Mini's QSA indexer (serve/inkling_kind.py)
+            if not isinstance(value, bool):
+                raise ValueError("xestrata_qsa: true or false")
         elif key == "script_guard":
             value = script_guard.parse(value)
         else:

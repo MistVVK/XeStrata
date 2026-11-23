@@ -388,7 +388,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
           P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
           use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots,
-          cfg.bopts.qsa_path.empty() ? 0 : 1);
+          cfg.bopts.qsa_path.empty() ? 0 : cfg.bopts.qsa_default ? 2 : 1);   // 0: no indexer, 1: off, 2: on
     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
     std::vector<ActiveReq> reqs(P);

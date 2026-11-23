@@ -318,6 +318,8 @@
   "drawer.segLimit": "Taille d'un segment",
   "drawer.share": "Utiliser aussi pour les autres applications",
   "drawer.shareNote": "omp et les autres clients API reçoivent ces réglages pour tout ce qu’ils ne définissent pas eux-mêmes",
+  "settings.qsa": "Attention clairsemée pour les longues discussions (QSA)",
+  "settings.qsaNote": "plus rapide avec une longue discussion ; peut manquer des détails lointains (pour beaucoup de faits exacts à la fois, mieux désactivé). S'applique dès le prochain message",
   "drawer.short": "Réglages",
   "drawer.showThinking": "Afficher la réflexion",
   "drawer.showThinkingNote": "déployée pendant la diffusion",
