@@ -36,7 +36,8 @@ struct Graph;
 const char* last_error();
 /// Issue #10: one line on an exception that left the engine: its text, the SYCL error code and Unified Runtime result
 /// when it is a SYCL exception (error 40 is also what a kernel launch refused for device memory reports), the VRAM
-/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
+/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).  Issue #77: a UR
+/// OUT_OF_HOST_MEMORY adds what to check (RAM, the graph's sizes, the startup reserve) and how to make room.
 std::string failure_report(const std::exception& e);
 
 /// `high_priority`: a stream the device may run ahead of the others (Runtime::create_stream).
