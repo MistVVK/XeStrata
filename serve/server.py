@@ -56,6 +56,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -555,6 +556,40 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+HOOK_REASON_MAX = 300   # 台帳 0740/0821: before_load の拒否理由として API に出す長さの上限
+
+
+def hook_text(output) -> str:
+    """before_load の出力をテキストにする。UTF-8 で読めなければ機械の文字コードで読む。"""
+    if not isinstance(output, bytes):
+        return output or ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return output.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX, stderr=None) -> str:
+    """コマンドが書いた最後の非空行を API 向けに整える。stderr を優先し、制御文字を空白に、
+    空白を 1 つに、長さを limit に制限する（#5987）。"""
+    for text in (stderr, output):
+        for line in reversed(hook_text(text).splitlines()):
+            s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+            if s:
+                return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+    return ""
+
+
+def hook_echo(output, stream=None) -> None:
+    """コマンドの出力をサーバーの出力へそのまま流す（#5987 で読む前の動作を保つ）。"""
+    if not output:
+        return
+    lines = hook_text(output).splitlines()
+    if lines:
+        print("\n".join(lines), file=stream or sys.stdout, flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -5004,13 +5039,18 @@ class Service:
         if self.before_load:
             cmd = self.before_load
             print(f"[xestrata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
+            why, reason = None, ""
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                hook_echo(r.stdout)
+                hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
+                    reason = hook_reason(r.stdout, stderr=r.stderr)
+            except subprocess.TimeoutExpired as e:
+                hook_echo(e.output)
+                hook_echo(e.stderr, sys.stderr)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
@@ -5022,8 +5062,8 @@ class Service:
                 if self.before_load_strict and not self.before_load_ignore_failure:
                     print(f"[xestrata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
+                    raise GpuBusy(reason or f"the before_load command failed ({why}): the GPU was not given back, "
+                                            "so the model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
                     print(f"[xestrata] the before_load command failed ({why}); loading anyway"
