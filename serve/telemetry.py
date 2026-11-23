@@ -240,7 +240,9 @@ class _XeGpu:
         if not self.ok():
             return None
         device = (_read(os.path.join(self.dev, 'device'), str) or '').replace('0x', '')
-        name = _pci_ids_name(self.dev) or f"GPU {device}"
+        vendor = _read(os.path.join(self.dev, 'vendor'), str)
+        name = (hardware.pci_product_name(vendor, device) if vendor and device else None) or \
+            _pci_ids_name(self.dev) or f"GPU {device}"
         return f"Intel {name} at {self.pci}"
 
     def _link(self):

@@ -3,9 +3,14 @@
 """Standard-library hardware information shared by setup and the server."""
 import ctypes
 import os
+import re
 import struct
 import sys
 from pathlib import Path
+
+UDEV_PCI_HWDB = ("/usr/lib/udev/hwdb.d/20-pci-vendor-model.hwdb",
+                 "/usr/etc/udev/hwdb.d/20-pci-vendor-model.hwdb",
+                 "/etc/udev/hwdb.d/20-pci-vendor-model.hwdb")
 
 
 def linux_desktop(env=None) -> bool:
@@ -40,6 +45,36 @@ def ram_gb() -> float:
     except (OSError, IndexError, ValueError):
         pass
     return 0.0
+
+
+def pci_product_name(vendor, device) -> str | None:
+    """The card's product name in udev's PCI hardware database, or None.  A line like
+    `ID_MODEL_FROM_DATABASE=Battlemage G31 [Arc Pro B70]` names the die before the brackets and the board in them:
+    this returns "Arc Pro B70", not the die.  A bracket that holds no product ("Intel Graphics") is not a name.
+    The IDs come from the card, so no maker or model is picked here."""
+    v = int(vendor, 16) if isinstance(vendor, str) else int(vendor)
+    d = int(device, 16) if isinstance(device, str) else int(device)
+    key = "pci:v%08xd%08x" % (v, d)     # udev writes both IDs in eight hexadecimal digits
+    for path in UDEV_PCI_HWDB:
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if not line.lower().startswith(key):
+                continue
+            for value in lines[i + 1:i + 5]:
+                if value.strip() and value[:1] not in (" ", "\t"):
+                    break                                # the next device's entry
+                if not value.strip().startswith("ID_MODEL_FROM_DATABASE="):
+                    continue
+                name = value.strip().split("=", 1)[1].strip()
+                found = re.search(r"\[([^]]+)]\s*$", name)
+                if not found:
+                    return None
+                product = found.group(1).strip()
+                return None if product.lower().startswith(("intel graphics", "graphics", "gpu")) else product
+    return None
 
 
 def missing_devices(vendor: str, render: str | None) -> list:

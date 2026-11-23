@@ -8,6 +8,7 @@ used do not change, and a card named with --gpu or --gpus asks nothing.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +42,27 @@ class UnusedCardSaid(unittest.TestCase):
 
     def test_a_card_that_cannot_be_used_is_not_called_unused(self):
         self.assertEqual(self.notes([card(0, "a", 24.0), card(1, "b", 6.0, problem="too old")], {0}), [])
+
+
+class PciProductName(unittest.TestCase):
+    """A product name in udev's PCI database beats the die name in pci.ids (the B70's "Battlemage G31")."""
+
+    def test_product_name_and_fallback(self):
+        from serve import hardware
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "pci.hwdb"
+            db.write_text("\n".join(("pci:v00008086d0000E223*",
+                                     " ID_MODEL_FROM_DATABASE=Battlemage G31 [Arc Pro B70]", "",
+                                     "pci:v000010DEd00002786*", " ID_MODEL_FROM_DATABASE=AD104 [GeForce RTX 4070]", "",
+                                     "pci:v00000001d00000002*", " ID_MODEL_FROM_DATABASE=a die [Intel Graphics]", "",
+                                     "pci:v00000001d00000003*", " ID_MODEL_FROM_DATABASE=a die without a product", "")))
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", (str(db),)):
+                self.assertEqual(setup.pci_name(0x8086, 0xe223), "Intel Arc Pro B70")
+                self.assertEqual(hardware.pci_product_name("0x8086", "0xe223"), "Arc Pro B70")
+                self.assertEqual(hardware.pci_product_name(0x10de, 0x2786), "GeForce RTX 4070")
+                self.assertIsNone(hardware.pci_product_name(1, 2))               # no product in the brackets
+                self.assertIsNone(hardware.pci_product_name(1, 3))               # no brackets
+                self.assertIsNone(hardware.pci_product_name(9, 9))               # no entry
 
 
 if __name__ == "__main__":

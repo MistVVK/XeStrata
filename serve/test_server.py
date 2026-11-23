@@ -5220,6 +5220,29 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class IntelTelemetry(unittest.TestCase):
+    """A card with a product name in udev's PCI database is not named by the die in pci.ids."""
+
+    def test_name(self):
+        from serve import hardware, telemetry
+        with tempfile.TemporaryDirectory() as d:
+            dev = Path(d) / "0000:03:00.0"
+            dev.mkdir()
+            (dev / "vendor").write_text("0x8086\n")
+            (dev / "device").write_text("0xe223\n")
+            db = Path(d) / "pci.hwdb"
+            db.write_text("pci:v00008086d0000E223*\n ID_MODEL_FROM_DATABASE=Battlemage G31 [Arc Pro B70]\n")
+            ids = Path(d) / "pci.ids"
+            ids.write_text("8086  Intel Corporation\n\te223  Battlemage G31 [Intel Graphics]\n")
+            g = telemetry._XeGpu.__new__(telemetry._XeGpu)
+            g.dev, g.pci = str(dev), "0000:03:00.0"
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", (str(db),)):
+                self.assertEqual(g.name(), "Intel Arc Pro B70 at 0000:03:00.0")
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", ()), \
+                    mock.patch.object(telemetry, "PCI_IDS", (str(ids),)):
+                self.assertEqual(g.name(), "Intel Battlemage G31 [Intel Graphics] at 0000:03:00.0")
+
+
 class AmdTelemetry(unittest.TestCase):
     """upstream #301 and #1733: an AMD card's readings from a fake amdgpu sysfs tree, chosen by its PCI address."""
 

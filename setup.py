@@ -2374,8 +2374,11 @@ def drm_graphics_ip(render: str) -> int | None:
 
 
 def pci_name(vendor: int, device: int) -> str:
-    """The card's name from the PCI ID database (hwdata), or its IDs."""
+    """The card's product name from udev's PCI database, its name in the PCI ID list, or its IDs."""
     maker = {0x8086: "Intel", 0x1002: "AMD"}.get(vendor, f"0x{vendor:04x}")
+    product = hardware.pci_product_name(vendor, device)
+    if product:
+        return f"{maker} {product}"
     for f in ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"):
         try:
             text = Path(f).read_text(encoding="utf-8", errors="replace")
