@@ -1313,8 +1313,8 @@ if(STRATA_ENABLE_XE)
     if(_strata_cudnn_inc)
       include(FetchContent)
       FetchContent_Populate(strata_cudnn_fe QUIET
-        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.32.2.tar.gz
-        URL_HASH SHA256=5c8dc0e757fb55efb8145837c1c02b61c0b60c6cd5cfb38c5ca5565d3f30e700
+        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.33.0.tar.gz
+        URL_HASH SHA256=135a2c56c91dc6b1eca6a75369a0c8c8a3747da95c099be31b4f2a9788f91ce6
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
       # built into the kernels' library: the plain models' prompt attention shares the SDPA (kernels::cudnn_sdpa)
