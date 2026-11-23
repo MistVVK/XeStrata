@@ -17,6 +17,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/inkling2/engine.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/runtime.hpp"
@@ -2450,6 +2451,8 @@ int main(int argc, char** argv) {
     }
     for (int i = 1; i + 1 < argc; ++i)   // setup's --gguf: whether the model runs here, no GPU opened
         if (std::strcmp(argv[i], "--check-model") == 0) return check_model(argv[i + 1]);
+    // Inkling-2-Mini's .strata v1.1 file: its own engine (src/inkling2) on the engine's runtime
+    if (const int r = strata::inkling2::inkling_main(argc, argv); r >= 0) return r;
     // a model with one residual stream (Ornith-1.5): plain_generate.cpp runs it
     if (const int r = strata::program::plain_main(argc, argv); r >= 0) return r;
     Options o;

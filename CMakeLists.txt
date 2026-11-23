@@ -604,8 +604,19 @@ if(STRATA_ENABLE_XE)
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
                                    src/core/plain_inkling.cpp
                                    src/core/plain_dspark.cpp
-                                   src/core/auto_pick.cpp)
+                                   src/core/auto_pick.cpp
+                                   src/inkling2/ink_main.cpp src/inkling2/sycl/ink_sycl_backend.cpp
+                                   src/inkling2/inkling2_loop.cpp src/artifact/strata_reader.cpp
+                                   src/quant/sk_codecs.cpp)
   target_include_directories(strata_engine PUBLIC include)
+  # Inkling-2-Mini's engine (src/inkling2, upstream's inkling2 on the engine's runtime): its .strata files' manifests
+  # are zstd frames (libzstd, free), its pictures read through stb_image (third_party/main/stb), and its CPU experts
+  # (the hybrid pool's) take the AVX2 forms of the S_K codecs
+  find_library(STRATA_ZSTD_LIB zstd REQUIRED)
+  target_link_libraries(strata_engine PRIVATE ${STRATA_ZSTD_LIB})
+  target_include_directories(strata_engine SYSTEM PRIVATE third_party/main/stb)
+  set_source_files_properties(src/quant/sk_codecs.cpp src/inkling2/inkling2_loop.cpp PROPERTIES COMPILE_OPTIONS
+                              "-mavx2;-mfma;-mf16c")
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
   set_source_files_properties(src/core/plain_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)

@@ -33,6 +33,8 @@ ALLOWED = [
     r'\bstrata_(?:mcp|prefix|checkpoint|tune|rejected_tool_calls)\b', r'"service": "strata"',
     r'strata:(?:[a-z_{]|$)', r'(?:HELP|TYPE) strata:', r'\bstrata\.(?:ple|[a-z_]+)\b', r'strata\.r1:',
     r'\bstrata_(?:version|commit)\b',
+    # the .strata model format (upstream's, Inkling-2-Mini's files): its extension, its magic and the format's name
+    r'\.strata\b', r'STRATA(?:\\+x?0+)?\\+x01', r'format=strata\b',
     # the marks inside files and the state setup keeps beside them, which older files carry
     r'\bstrata-(?:ple|embd|pack)\b', r'strata-pack v', r'# strata pack index', r'\.strata-(?:pip\.json|mcp)\b',
     r'strata-shared-expert-arena', r'\bstrata_(?:tokenizer|onemath)\b',
