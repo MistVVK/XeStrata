@@ -90,7 +90,7 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
   ROCm 7.14 の AMD のパッケージは ld.so.conf を入れないので、setup はその `lib` をエンジンのライブラリの探索先（設定の `lib_dirs`）に加えます。
   見つからなければ HIP なしでビルドします。
 - AMD の GPU 向けのコードには、libclc の libspirv（AMD 向け）と ROCm のデバイスライブラリが要ります。
-  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 10.1 のデバイスライブラリは LLVM 24 製で、intel/llvm 7.2.0 の LLVM 23 では読めません）、
+  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 10.1 のデバイスライブラリは LLVM 24 製で、intel/llvm 7.2.1 の LLVM 23 では読めません）、
   スクリプトはデバイスライブラリを、intel/llvm と同じ LLVM の ROCm のリリース（ROCm 7.14.1。TheRock のタグ `therock-7.14.1` が使う ROCm の llvm-project のコミットの `amd/device-libs`、University of Illinois/NCSA ライセンス）から取ってきて、同じツリーでビルドし、`install/amdgcn/bitcode` に入れます。
   入れるのは、SYCL の AMD 向けのコードがリンクするもの（`ocml`、`ockl`、`oclc_*`）と、ドライバーが有無を確かめる `opencl` です。
   CMake は、入っている ROCm のデバイスライブラリをコンパイラが読めればそちらを使い、読めないときにこれを使います。これが通らなくても intel/llvm はできます。
@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は intel/llvm v7.2.0 に対して 20 です。v7.1.1 に当てていた 16 のうち、libclc の AMD の対象名の修正は v7.2.0 で libclc の作りが変わっていらなくなり、AMD の FMA の修正は v7.2.0 で直っていました（2026-10-22）。
+  今の修正は intel/llvm v7.2.1 に対して 29 です（v7.2.0 の 29 がそのまま当たりました。v7.2.1 はタグがなく、版を 7.2.1 に上げた sycl-rel-7_2 のコミット ea269d5f7 を使います、2026-11-24）。v7.1.1 に当てていた 16 のうち、libclc の AMD の対象名の修正は v7.2.0 で libclc の作りが変わっていらなくなり、AMD の FMA の修正は v7.2.0 で直っていました（2026-10-22）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -165,7 +165,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   修正後は、AMD 向けの libspirv がスカラーの型について 4 つの GroupNonUniform の shuffle を SubgroupShuffle*INTEL で定義します（`hip-group-shuffle`）。
   18 番目: HIP のアダプタは仮想メモリの呼び出し（`urVirtualMem*`・`urPhysicalMem*`）に全部 UNSUPPORTED を返し、対応なしと報告していたので、AMD の GPU では SYCL の `ext_oneapi_virtual_mem` がなく、`--vram-elastic` と `--kv-grow` が 1 つの割り当てに戻っていました。
   intel/llvm はリリースの後にこれを実装しました（コミット c13ad6c7e3「[UR][HIP] Implement virtual and physical memory management」、pull request 22671）: CUDA のアダプタが CUDA の仮想メモリで実装するのと同じく HIP の仮想メモリ（`hipMemAddressReserve`・`hipMemCreate`・`hipMemMap` など）で実装し、対応の有無は HIP の `hipDeviceAttributeVirtualMemoryManagementSupported` のとおりに報告します。
-  パッチはそのコミットの差分をそのまま v7.2.0 に当てます（`hip-virtual-mem`。XeStrata の変更はなく、intel/llvm をこのコミットを含む版に上げたら外します）。
+  パッチはそのコミットの差分をそのまま v7.2.1 に当てます（`hip-virtual-mem`。XeStrata の変更はなく、intel/llvm をこのコミットを含む版に上げたら外します）。
   19 番目: グローバルな ID を使う SYCL のカーネルは `__spirv_BuiltInGlobalOffset` を呼び、GlobalOffset のパスがそれをコード生成の段で（`_with_offset` の複製の引数か 0 に）置き換えます。
   AMDGPU の属性推論はその前に走り、この呼び出しを中身の分からない関数と見なしたので、そうしたカーネルはどれも暗黙の引数を全部、hostcall のバッファーも含めて持っていました（XeStrata 0.2.2 の AMD 向けのカーネル 32,556 のうち 14,304。v7.1.1 では 48,084 のうち 0）。
   HIP は、PCIe の atomic 操作が通らない GPU（仮想マシンに渡した GPU、チップセットの先のスロットの GPU）では hostcall のバッファーを持つカーネルを起動しないので、最初のカーネルが `hipErrorIllegalState` で止まっていました（XeStrata の issue #40 と #54）。
@@ -241,7 +241,7 @@ intel/llvm の SYCL のランタイムは Windows では MSVC の ABI だけに�
 - lld-link（LLVM の `lld`）: `sudo apt install lld-21`（21.1）
 - MSVC の CRT と Windows SDK: [xwin](https://github.com/Jake-Shadle/xwin)（0.10.0）で Microsoft から落とします。
   自由ソフトウェアではなく、Microsoft のライセンスは `--accept-license` で受け入れます。リポジトリには入れません。
-- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.2.0）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
+- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.2.1）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
 
 ```sh
 mkdir -p .tools/xwin

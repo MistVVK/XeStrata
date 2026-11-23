@@ -50,7 +50,7 @@ The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen b
 
 - **free** (`-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
   Free software only; no oneAPI environment is used.
-  Validated with intel/llvm v7.2.0 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
+  Validated with intel/llvm v7.2.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long.
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
@@ -67,7 +67,7 @@ The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen b
 - **contrib-llvm** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
-  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.2.0.
+  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.2.1.
   Validated to run on an RTX 4070 (sm_89).
   The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
   So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
