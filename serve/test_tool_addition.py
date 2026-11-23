@@ -10,8 +10,13 @@ import copy
 import json
 import unittest
 
-from serve.frontend import (CALL_START, OutputParser, anthropic_to_messages, anthropic_tools,
-                            forced_call)
+from serve.frontend import (
+    CALL_START,
+    OutputParser,
+    anthropic_to_messages,
+    anthropic_tools,
+    forced_call,
+)
 
 MCP = "mcp__docs__batch"
 READ = {"name": "Read", "description": "Read a file.",

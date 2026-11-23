@@ -69,8 +69,8 @@ class McpSessionGone(McpError):
     """台帳 0634（upstream 2b81d475ee）: 再起動した server が古い session を拒んだ。何も実行されていないので再送できる。"""
 
 
-_SESSION_WORD = re.compile(r"\bsession", re.I)
-_GONE_WORD = re.compile(r"unknown|invalid|expired|not found|no valid|missing|terminated|reinitiali[sz]e", re.I)
+_SESSION_WORD = re.compile(r"\bsession", re.IGNORECASE)
+_GONE_WORD = re.compile(r"unknown|invalid|expired|not found|no valid|missing|terminated|reinitiali[sz]e", re.IGNORECASE)
 
 
 def _session_gone_error(err: dict) -> bool:

@@ -7,7 +7,7 @@
 """
 import unittest
 
-from serve.frontend import OutputParser, parse_tool_call, param_value
+from serve.frontend import OutputParser, param_value, parse_tool_call
 
 TOOL = {"name": "write_note", "parameters": {"type": "object", "properties": {
     "formatted": {"type": "boolean"}, "title": {"type": "string"}, "pinned": {"type": ["boolean", "null"]},

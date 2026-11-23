@@ -1872,7 +1872,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         try:
             value, at = json.JSONDecoder().raw_decode(rest.lstrip())
             tail = rest.lstrip()[at:].lstrip()
-            if isinstance(value, dict) and (not tail or tail.startswith(FUNC_END) or tail.startswith(CALL_END)):
+            if isinstance(value, dict) and (not tail or tail.startswith((FUNC_END, CALL_END))):
                 args.update(value)
                 rest = ""
         except ValueError:

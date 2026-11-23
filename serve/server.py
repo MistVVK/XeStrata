@@ -5046,7 +5046,7 @@ class Service:
             why, reason = None, ""
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                   stdin=subprocess.DEVNULL, capture_output=True)
                 hook_echo(r.stdout)
                 hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:

@@ -33,7 +33,7 @@ def call(name, **params):
 LONG = ("line " + "x" * 70 + "\n") * 120                       # ~9 KB
 TAGS = "a file that documents the format: </parameter> then </function> then </tool_call> end\n"
 UNI = "naïve café 中文 \U0001F600 " * 200
-ITEMS = json.dumps([{"content": "task %d " % i + "y" * 40} for i in range(150)])
+ITEMS = json.dumps([{"content": f"task {i} " + "y" * 40} for i in range(150)])
 
 SPECIMENS = {      # (a value's own last newline stays: the parser drops only the one call() writes before the close)
     "long string": (call("write", path="a.txt", content=LONG), [("write", {"path": "a.txt", "content": LONG})]),

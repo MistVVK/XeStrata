@@ -228,8 +228,9 @@ class ConversationCacheCard(unittest.TestCase):
     RESTORE = "xestrata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
 
     def test_the_log(self):
-        from serve.server import ConvCacheLog
         import tempfile
+
+        from serve.server import ConvCacheLog
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "strata.log"
             log.write_text("an earlier run\n" + self.PARK, encoding="utf-8")
@@ -283,27 +284,28 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertIn(f'"{el}"', js)
 
 
-    SKIPS = [
+    SKIPS = [  # noqa: RUF012
         "strata serve: conversation cache: skip parking (12 tokens, below the 512 minimum ...)\n",
         "strata serve: conversation cache: skip parking (snapshot 9000 MiB exceeds available budget)\n",
-        "strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
-        "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n",
-        "strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
-        "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest stay parked)\n",
+        ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+        "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n"),
+        ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+        "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest stay parked)\n"),
         "strata serve: conversation cache: skip parking (RAM floor after capture: 2560 MiB needed, MemAvailable 2000 MiB)\n",
         "strata serve: conversation cache: allocation failed; skip parking\n",
         "strata serve: conversation cache: allocation failed; skip parking slot 2\n",
         "strata serve: conversation cache: skip parking (stage CUDA1: invalid session running-state targets)\n",
         "strata serve: conversation cache: skip parking (conversation snapshot: invalid live token/image metadata)\n",
-        "strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 evictions=2 snapshot_bytes=1 "
-        "reused_kv_bytes=0\n",
+        ("strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 evictions=2 snapshot_bytes=1 "
+        "reused_kv_bytes=0\n"),
     ]
 
     def test_refused_parks_by_reason(self):
         """#6081: every refusal the engine logs is counted once, under a stable reason; a poll that reads nothing new
         counts nothing; another start of the engine starts at zero."""
-        from serve.server import ConvCacheLog
         import tempfile
+
+        from serve.server import ConvCacheLog
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "strata.log"
             log.write_text("", encoding="utf-8")

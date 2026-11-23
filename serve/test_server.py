@@ -4284,7 +4284,7 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertLessEqual(len(msg), 300)
         self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
-        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "​" for c in msg), repr(msg[:60]))
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "\u200b" for c in msg), repr(msg[:60]))
         from serve.server import hook_reason
         self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
         self.assertEqual(hook_reason(""), "")

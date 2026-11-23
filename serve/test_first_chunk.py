@@ -136,7 +136,7 @@ class RoleChunkAfterPrefill(unittest.TestCase):
         got = []
         with self.assertRaises(ValueError):
             for c in openai_chunks(svc, {}, [1], False, None, 16, None):
-                got.append(c)
+                got.append(c)  # noqa: PERF402
         self.assertEqual(got, [None])                 # no role chunk: the caller sends the error as the first data
 
     def test_collect_unchanged(self):

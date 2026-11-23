@@ -19,7 +19,12 @@ import unittest
 from pathlib import Path
 
 from serve import frontend
-from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages, tool_arguments
+from serve.frontend import (
+    ChatTemplate,
+    anthropic_to_messages,
+    openai_to_messages,
+    tool_arguments,
+)
 from serve.responses import input_messages
 
 TEMPLATE = ChatTemplate(Path(__file__).resolve().parent / "test_chat_template.jinja")
@@ -124,7 +129,7 @@ class CutCalls(unittest.TestCase):
                 "messages": [{"role": "user", "content": "go"},
                              {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "write_file", "input": CUT}]},
                              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "cut off"}]}]}
-        msgs, tools, kw = anthropic_to_messages(areq)
+        msgs, _tools, _kw = anthropic_to_messages(areq)
         call = next(c for m in msgs for c in m.get("tool_calls") or [])
         self.assertEqual(call["function"]["arguments"], {"path": "core/lease_audit.py", "content": CUT_TEXT})
         rreq = {"model": "m", "tools": [{"type": "function", "name": "write_file", "description": "w", "parameters": WRITE["function"]["parameters"]}],
@@ -139,11 +144,13 @@ class CutCalls(unittest.TestCase):
 
 
 class ValidHistoriesRenderAsBefore(unittest.TestCase):
-    VALID = [
+    VALID = [  # noqa: RUF012
         '{"path": "core/a.py", "content": "x\\ny"}', '{}', '{"a": 1, "b": [1, 2], "c": {"d": null}}', '{"content": "\\"\\"\\"doc\\"\\"\\"\\n"}',
         '  {"x": true}  ', json.dumps({"path": "p", "content": "line\n" * 2000}), '{"arguments": "{\\"path\\": \\"a\\"}"}',
     ]
-    OTHER = ["path=core/x.py", "[1, 2]", "12", "null", '"text"', "true", "ls -la", "[", "plain", "{cut", "{malformed_json", "{ x: 1", "{1}"]
+    OTHER = [  # noqa: RUF012
+        "path=core/x.py", "[1, 2]", "12", "null", '"text"', "true", "ls -la", "[", "plain", "{cut",
+        "{malformed_json", "{ x: 1", "{1}"]
 
     def test_valid_json_objects_and_parsed_objects_are_unchanged(self):
         for raw in self.VALID:
