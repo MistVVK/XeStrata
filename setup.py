@@ -10359,7 +10359,7 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
     if scaling is not None:
         assert rope_scale is not None
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         args += ["--kv", kv]
     if low_ram:
         args += ["--resident-experts" if resident else "--mmap-experts"]
@@ -11218,11 +11218,13 @@ def main() -> int:
                   else "as requested")
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
-    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21).
+    # Up to 8K the engine's 16-bit unless --kv names another (upstream #6354 made 8-bit the default there on small
+    # cards; here it is a choice only, as it changes the answers: OUT, 2026-11-23)
+    kv = (a.kv or "fp16") if ctx <= 8192 else (a.kv or "int8")
     if ctx > 8192 and not a.kv and not a.yes:
         kv = ask_option("kv", a.yes)
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
     if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
@@ -11535,7 +11537,7 @@ def main() -> int:
         args += ["--draft", "mtp"]
     if scaling is not None:     # the resolved configuration: the explicit flags, or yarn and the derived factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
