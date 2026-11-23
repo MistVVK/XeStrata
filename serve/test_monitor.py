@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Request inspection through HTTP; no native model or GPU is required."""
 import json
+import tempfile
 import threading
 import time
 import unittest
@@ -31,21 +32,29 @@ class ReloadableEngine(MockEngine):
         self.running, self.unloaded = True, False
 
 
-class MonitorOff(unittest.TestCase):
-    """#332 is opt-in: by default no prompt or answer is kept, and the monitor's endpoints do not exist."""
+class MonitorDisabled(unittest.TestCase):
+    """An explicit "api_monitor": false keeps #332 off: no prompt or answer is kept, no endpoint."""
 
-    def test_off_by_default(self):
+    @staticmethod
+    def service():
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
-                      ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
+        return Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                       ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
+
+    def chat(self, base):
+        req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"messages": [{"role": "user",
+                                                                    "content": "secret"}]}).encode())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_off_when_disabled(self):
+        svc = self.service()
+        svc.api_monitor = False
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
-                                         data=json.dumps({"messages": [{"role": "user",
-                                                                        "content": "secret"}]}).encode())
-            with urllib.request.urlopen(req, timeout=10) as r:
-                self.assertEqual(r.status, 200)
+            self.chat(base)
             self.assertEqual(len(svc.api_requests), 0)
             for path in ("/api/requests", "/api-monitor"):
                 with self.assertRaises(urllib.error.HTTPError) as e:
@@ -55,6 +64,35 @@ class MonitorOff(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_on_by_default(self):
+        svc = self.service()
+        self.assertTrue(svc.api_monitor)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            self.chat(base)
+            self.assertEqual(len(svc.api_requests), 1)
+            with urllib.request.urlopen(base + "/api/requests", timeout=10) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ApiMonitorConfig(unittest.TestCase):
+    """The run config is read from JSON the same way as at startup."""
+
+    def test_default_and_explicit_false(self):
+        from serve.server import api_monitor_of, read_config
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "xestrata-test.json"
+            for body, want in (("{}", True), ('{"api_monitor": true}', True), ('{"api_monitor": false}', False)):
+                path.write_text(body, encoding="utf-8")
+                with self.subTest(body=body):
+                    self.assertEqual(api_monitor_of(read_config(path), False), want)
+            path.write_text('{"api_monitor": false}', encoding="utf-8")
+            self.assertTrue(api_monitor_of(read_config(path), True))   # --api-monitor still turns it on
 
 
 class MonitorLinks(unittest.TestCase):
@@ -79,7 +117,7 @@ class Monitor(unittest.TestCase):
         self.engine = ReloadableEngine(self.tok, "Thought.</think>\nHello <script>alert(1)</script>.",
                                        max_context=16384)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
-        self.svc.api_monitor = True                       # opt-in ("api_monitor": true / --api-monitor)
+        self.svc.api_monitor = True                       # on by default; true in the config / --api-monitor too
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

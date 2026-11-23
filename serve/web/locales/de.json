@@ -63,7 +63,7 @@
   "about.cfgIdle": "Das Modell nach so vielen Sekunden ohne Anfragen entladen (0 oder leer: nie)",
   "about.cfgLazy": "Ohne das Modell zu laden starten; die erste Anfrage lädt es (nur Text)",
   "about.cfgSilence": "Eine Anfrage beenden, wenn die Engine so lange nichts sagt (Standard 300 s, 0 = warten)",
-  "about.cfgMonitor": "Eingaben und Antworten der letzten 100 Anfragen für /api-monitor im Speicher behalten",
+  "about.cfgMonitor": "Eingaben und Antworten der letzten 100 Anfragen für /api-monitor im Speicher behalten (standardmäßig an; mit false aus)",
   "about.cfgBrowser": "Die Chatseite im Browser öffnen, wenn das Modell bereit ist",
   "about.cfgReserve": "VRAM in MiB, das die Engine für andere Programme frei lässt (Engine-Standard 700)",
   "about.cfgDefault": "Standard",

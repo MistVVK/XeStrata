@@ -63,7 +63,7 @@
   "about.cfgIdle": "Descargar el modelo tras estos segundos sin solicitudes (0 o vacío: nunca)",
   "about.cfgLazy": "Arrancar sin cargar el modelo; la primera solicitud lo carga (solo texto)",
   "about.cfgSilence": "Terminar una solicitud cuando el motor no dice nada durante este tiempo (por defecto 300 s, 0 = esperar)",
-  "about.cfgMonitor": "Guardar en memoria los mensajes y respuestas de las últimas 100 solicitudes para /api-monitor",
+  "about.cfgMonitor": "Guardar en memoria los mensajes y respuestas de las últimas 100 solicitudes para /api-monitor (activado por defecto; false lo desactiva)",
   "about.cfgBrowser": "Abrir la página del chat en el navegador cuando el modelo esté listo",
   "about.cfgReserve": "VRAM en MiB que el motor deja libre para otros programas (por defecto del motor 700)",
   "about.cfgDefault": "por defecto",

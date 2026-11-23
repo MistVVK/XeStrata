@@ -63,7 +63,7 @@
   "about.cfgIdle": "这么多秒没有请求就卸载模型（0 或留空：永不）",
   "about.cfgLazy": "启动时不加载模型；第一个请求时加载（仅文本）",
   "about.cfgSilence": "引擎这么久不出声就结束请求（默认 300 秒，0 = 等待）",
-  "about.cfgMonitor": "在内存中保留最近 100 个请求的提示词和回答，供 /api-monitor 使用",
+  "about.cfgMonitor": "在内存中保留最近 100 个请求的提示词和回答，供 /api-monitor 使用（默认启用；false 关闭）",
   "about.cfgBrowser": "模型就绪时在浏览器中打开聊天页面",
   "about.cfgReserve": "引擎为其他程序留出的 VRAM（MiB，引擎默认 700）",
   "about.cfgDefault": "默认",

@@ -63,7 +63,7 @@
   "about.cfgIdle": "요청이 이 초 동안 없으면 모델을 내림(0이나 비우면 내리지 않음)",
   "about.cfgLazy": "모델을 불러오지 않고 시작. 첫 요청이 불러옵니다(텍스트만)",
   "about.cfgSilence": "엔진이 이 시간 동안 아무 말도 없으면 요청을 끝냄(기본 300초, 0 = 기다림)",
-  "about.cfgMonitor": "최근 요청 100개의 프롬프트와 답을 /api-monitor용으로 메모리에 보관",
+  "about.cfgMonitor": "최근 요청 100개의 프롬프트와 답을 /api-monitor용으로 메모리에 보관 (기본적으로 켜짐; false 로 끔)",
   "about.cfgBrowser": "모델이 준비되면 브라우저에서 채팅 페이지를 엶",
   "about.cfgReserve": "엔진이 다른 프로그램을 위해 비워 두는 VRAM(MiB, 엔진 기본 700)",
   "about.cfgDefault": "기본",
