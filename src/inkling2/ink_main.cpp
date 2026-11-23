@@ -217,8 +217,7 @@ int inkling_main(int argc, char** argv) {
             }
             return x;
         };
-        if (a == "--native") next();
-        else if (a == "--gpu") next();   // generate.cpp's main took it (XESTRATA_GPU_PCI)
+        if (a == "--native" || a == "--gpu") next();   // --gpu: generate.cpp's main took it (XESTRATA_GPU_PCI)
         else if (a == "--serve") serve = true;
         else if (a == "--info") info = true;
         else if (a == "--selfcheck") selfcheck = true;
@@ -226,7 +225,7 @@ int inkling_main(int argc, char** argv) {
         else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--tokens") tokens = next();
         else if (a == "--max-new") max_new = (int) num(1, 1 << 24);
-        else if (a == "--temperature") so.temperature = (float) std::atof(next());
+        else if (a == "--temperature") so.temperature = (float) std::strtod(next(), nullptr);
         else if (a == "--seed") so.seed = std::strtoull(next(), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next();
         else if (a == "--max-context") cfg.bopts.max_ctx = (int) num(256, 1 << 24);
@@ -234,7 +233,7 @@ int inkling_main(int argc, char** argv) {
         else if (a == "--chunk") cfg.bopts.chunk = (int) num(1, 1 << 16);
         else if (a == "--vision") cfg.vision_path = cfg.bopts.vision_path = next();
         else if (a == "--vram-reserve-mib") cfg.bopts.vram_reserve_mib = (int) num(0, 1 << 30);
-        else if (a == "--vram-experts-gb") cfg.bopts.vram_experts_gb = std::atof(next());
+        else if (a == "--vram-experts-gb") cfg.bopts.vram_experts_gb = std::strtod(next(), nullptr);
         else if (a == "--draft") {
             cfg.draft_mode = next();
             if (cfg.draft_mode != "auto" && cfg.draft_mode != "dspark" && cfg.draft_mode != "off") {

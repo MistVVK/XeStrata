@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -328,7 +329,7 @@ inline void unpack_s15_sb(const uint8_t* pl, int8_t q[256]) noexcept {
 
 inline void unpack_s125_sb(const uint8_t* pl, int8_t q[256], float fine[4]) noexcept {
     for (int g = 0; g < 8; ++g) {
-        const uint8_t* p = pl + g * 5;
+        const uint8_t* p = pl + static_cast<std::ptrdiff_t>(g) * 5;
         const uint64_t bits40 =
             (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
             ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32);
@@ -484,7 +485,7 @@ float dot_sk_q8_1_row(const uint8_t* raw, SkCode code, const BlockQ8_1_G64* x, s
             const int8_t* q = reinterpret_cast<const int8_t*>(pl);
             for (int g = 0; g < NUM_SUB; ++g) {
                 const float eff = D * (static_cast<float>(u[g]) / 255.0f);
-                const int32_t isum = dot_i8_i8_64(q + g * SUB_G, xb[g].qs);
+                const int32_t isum = dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb[g].qs);
                 total += eff * xb[g].d * static_cast<float>(isum);
             }
         } else if (code == SkCode::S1_5) {
@@ -492,7 +493,7 @@ float dot_sk_q8_1_row(const uint8_t* raw, SkCode code, const BlockQ8_1_G64* x, s
             unpack_s15_sb(pl, q);
             for (int g = 0; g < NUM_SUB; ++g) {
                 const float eff = D * (static_cast<float>(u[g]) / 255.0f);
-                const int32_t isum = dot_i8_i8_64(q + g * SUB_G, xb[g].qs);
+                const int32_t isum = dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb[g].qs);
                 total += eff * xb[g].d * static_cast<float>(isum);
             }
         } else if (code == SkCode::S1_25) {
@@ -501,7 +502,7 @@ float dot_sk_q8_1_row(const uint8_t* raw, SkCode code, const BlockQ8_1_G64* x, s
             unpack_s125_sb(pl, q, fine);
             for (int g = 0; g < NUM_SUB; ++g) {
                 const float eff = D * (static_cast<float>(u[g]) / 255.0f) * fine[g];
-                const int32_t isum = dot_i8_i8_64(q + g * SUB_G, xb[g].qs);
+                const int32_t isum = dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb[g].qs);
                 total += eff * xb[g].d * static_cast<float>(isum);
             }
         } else {
@@ -517,7 +518,7 @@ float dot_sk_q8_1_row(const uint8_t* raw, SkCode code, const BlockQ8_1_G64* x, s
             }
             for (int g = 0; g < NUM_SUB; ++g) {
                 const float eff = D * (static_cast<float>(u[g]) / 255.0f);
-                const int32_t isum = dot_u8_i8_64(q + g * SUB_G, xb[g].qs);
+                const int32_t isum = dot_u8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb[g].qs);
                 total += eff * (xb[g].d * static_cast<float>(isum) - half * xb[g].s);
             }
         }
@@ -562,7 +563,7 @@ void gemm_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f);
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * x_stride + s * NUM_SUB + g];
-                            acc[t] += eff * xb.d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, xb.qs));
+                            acc[t] += eff * xb.d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs));
                         }
                     }
                 } else if (code == SkCode::S1_5 || code == SkCode::S1_25) {
@@ -574,7 +575,7 @@ void gemm_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f) * fine[g];
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * x_stride + s * NUM_SUB + g];
-                            acc[t] += eff * xb.d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, xb.qs));
+                            acc[t] += eff * xb.d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs));
                         }
                     }
                 } else {
@@ -592,7 +593,7 @@ void gemm_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f);
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * x_stride + s * NUM_SUB + g];
-                            const int32_t isum = dot_u8_i8_64(q + g * SUB_G, xb.qs);
+                            const int32_t isum = dot_u8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs);
                             acc[t] += eff * (xb.d * static_cast<float>(isum) - half * xb.s);
                         }
                     }
@@ -899,7 +900,7 @@ void gemv_paired2_sk_q8_1(
                     const bool is_r1 = (sub_global >= sub_per_row);
                     const size_t xg = is_r1 ? (sub_global - sub_per_row) : sub_global;
                     const float eff = D * (static_cast<float>(u[g]) / 255.0f);
-                    const float term = eff * x[xg].d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, x[xg].qs));
+                    const float term = eff * x[xg].d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, x[xg].qs));
                     if (is_r1) acc1 += term; else acc0 += term;
                 }
             } else if (code == SkCode::S1_5 || code == SkCode::S1_25) {
@@ -911,7 +912,7 @@ void gemv_paired2_sk_q8_1(
                     const bool is_r1 = (sub_global >= sub_per_row);
                     const size_t xg = is_r1 ? (sub_global - sub_per_row) : sub_global;
                     const float eff = D * (static_cast<float>(u[g]) / 255.0f) * fine[g];
-                    const float term = eff * x[xg].d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, x[xg].qs));
+                    const float term = eff * x[xg].d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, x[xg].qs));
                     if (is_r1) acc1 += term; else acc0 += term;
                 }
             } else {
@@ -929,7 +930,7 @@ void gemv_paired2_sk_q8_1(
                     const bool is_r1 = (sub_global >= sub_per_row);
                     const size_t xg = is_r1 ? (sub_global - sub_per_row) : sub_global;
                     const float eff = D * (static_cast<float>(u[g]) / 255.0f);
-                    const int32_t isum = dot_u8_i8_64(q + g * SUB_G, x[xg].qs);
+                    const int32_t isum = dot_u8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, x[xg].qs);
                     const float term = eff * (x[xg].d * static_cast<float>(isum) - half * x[xg].s);
                     if (is_r1) acc1 += term; else acc0 += term;
                 }
@@ -981,7 +982,7 @@ void gemm_paired2_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f);
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * sub_per_row + xg];
-                            const float term = eff * xb.d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, xb.qs));
+                            const float term = eff * xb.d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs));
                             if (is_r1) acc1[t] += term; else acc0[t] += term;
                         }
                     }
@@ -996,7 +997,7 @@ void gemm_paired2_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f) * fine[g];
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * sub_per_row + xg];
-                            const float term = eff * xb.d * static_cast<float>(dot_i8_i8_64(q + g * SUB_G, xb.qs));
+                            const float term = eff * xb.d * static_cast<float>(dot_i8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs));
                             if (is_r1) acc1[t] += term; else acc0[t] += term;
                         }
                     }
@@ -1017,7 +1018,7 @@ void gemm_paired2_sk_q8_1(
                         const float eff = D * (static_cast<float>(u[g]) / 255.0f);
                         for (size_t t = 0; t < m_tile; ++t) {
                             const auto& xb = xs[(t0 + t) * sub_per_row + xg];
-                            const int32_t isum = dot_u8_i8_64(q + g * SUB_G, xb.qs);
+                            const int32_t isum = dot_u8_i8_64(q + static_cast<std::ptrdiff_t>(g) * SUB_G, xb.qs);
                             const float term = eff * (xb.d * static_cast<float>(isum) - half * xb.s);
                             if (is_r1) acc1[t] += term; else acc0[t] += term;
                         }
