@@ -27,7 +27,7 @@
   },
   "ALLOWED_HOSTS": {
    "reads": [
-    "serve/server.py:12682"
+    "serve/server.py:12697"
    ]
   },
   "ALLOW_UNPINNED": {
@@ -38,14 +38,14 @@
   },
   "API_KEY": {
    "reads": [
-    "serve/server.py:12360",
-    "serve/server.py:12659",
-    "setup.py:8647"
+    "serve/server.py:12374",
+    "serve/server.py:12674",
+    "setup.py:8659"
    ]
   },
   "ARENA_HOST_USM": {
    "reads": [
-    "src/core/expert_source.cpp:4488"
+    "src/core/expert_source.cpp:4492"
    ]
   },
   "ARENA_LOW_RAM": {
@@ -55,7 +55,7 @@
   },
   "ARENA_MMAP": {
    "reads": [
-    "src/core/expert_source.cpp:4351"
+    "src/core/expert_source.cpp:4355"
    ]
   },
   "ARENA_PIN_GIB": {
@@ -65,7 +65,7 @@
   },
   "ARENA_RAM_WAIT_S": {
    "reads": [
-    "src/core/expert_source.cpp:4426"
+    "src/core/expert_source.cpp:4430"
    ]
   },
   "ARENA_RELEASE": {
@@ -132,7 +132,7 @@
   },
   "BATCH_DECODE_SHARE": {
    "reads": [
-    "src/program/generate.cpp:12490"
+    "src/program/generate.cpp:12492"
    ]
   },
   "BATCH_GROUPS_NV_SERIAL": {
@@ -196,12 +196,12 @@
   },
   "BLOCKING_CONSOLE": {
    "reads": [
-    "serve/server.py:12328"
+    "serve/server.py:12342"
    ]
   },
   "CACHE_MESSAGE_BOUNDARY": {
    "reads": [
-    "src/program/generate.cpp:12773"
+    "src/program/generate.cpp:12775"
    ]
   },
   "CANON": {
@@ -230,8 +230,8 @@
   },
   "CKPT_REREAD": {
    "reads": [
-    "src/program/generate.cpp:12123",
-    "src/program/generate.cpp:12188"
+    "src/program/generate.cpp:12125",
+    "src/program/generate.cpp:12190"
    ]
   },
   "CKPT_STAGE": {
@@ -246,7 +246,7 @@
   },
   "COLD_OVERLAP": {
    "reads": [
-    "src/core/expert_source.cpp:3300",
+    "src/core/expert_source.cpp:3304",
     "src/program/generate.cpp:5435"
    ]
   },
@@ -311,18 +311,18 @@
   "DEBUG": {
    "reads": [
     "serve/mcp.py:161",
-    "serve/server.py:6774",
-    "serve/server.py:6946"
+    "serve/server.py:6779",
+    "serve/server.py:6951"
    ]
   },
   "DECODE_TIMING": {
    "reads": [
-    "src/program/generate.cpp:12982"
+    "src/program/generate.cpp:12984"
    ]
   },
   "DEC_BATCH": {
    "reads": [
-    "src/core/expert_source.cpp:3503",
+    "src/core/expert_source.cpp:3507",
     "src/core/verify.cpp:839",
     "src/kernels/xe/shared_expert.cpp:103"
    ]
@@ -349,7 +349,7 @@
   },
   "DF2_BLOCK_LOG": {
    "reads": [
-    "src/program/generate.cpp:14009",
+    "src/program/generate.cpp:14011",
     "src/program/plain_generate.cpp:2418"
    ]
   },
@@ -406,12 +406,12 @@
   },
   "DISK_SKIP_FROM": {
    "reads": [
-    "src/core/expert_source.cpp:3350"
+    "src/core/expert_source.cpp:3354"
    ]
   },
   "DL_CONNECTIONS": {
    "reads": [
-    "setup.py:3907",
+    "setup.py:3912",
     "tools/mtp_fetch.py:254"
    ]
   },
@@ -459,7 +459,7 @@
   },
   "DUMP_FIRST_LOGITS": {
    "reads": [
-    "src/program/generate.cpp:13763"
+    "src/program/generate.cpp:13765"
    ]
   },
   "EMB_REUSE_ACCOUNT": {
@@ -536,12 +536,12 @@
   },
   "FOLLOW": {
    "reads": [
-    "src/program/generate.cpp:12928"
+    "src/program/generate.cpp:12930"
    ]
   },
   "FOLLOW_LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12949"
+    "src/program/generate.cpp:12951"
    ]
   },
   "FORCE_AVX2": {
@@ -557,7 +557,7 @@
   },
   "FREE_MISSES": {
    "reads": [
-    "src/core/expert_source.cpp:3380"
+    "src/core/expert_source.cpp:3384"
    ]
   },
   "FUSE_HITS": {
@@ -613,11 +613,11 @@
     "serve/images.py:2744",
     "serve/images.py:6292",
     "serve/lora_train.py:396",
-    "serve/server.py:12452",
-    "serve/server.py:12603",
-    "serve/server.py:12608",
-    "serve/server.py:12611",
-    "serve/server.py:12755",
+    "serve/server.py:12466",
+    "serve/server.py:12618",
+    "serve/server.py:12623",
+    "serve/server.py:12626",
+    "serve/server.py:12770",
     "serve/server.py:3703",
     "serve/server.py:4335",
     "src/core/device.cpp:202",
@@ -632,7 +632,7 @@
   },
   "GRAMMAR": {
    "reads": [
-    "serve/server.py:4875"
+    "serve/server.py:4879"
    ]
   },
   "GROUPED_BENCH": {
@@ -694,7 +694,7 @@
   },
   "HTTP_BACKLOG": {
    "reads": [
-    "serve/server.py:11404"
+    "serve/server.py:11409"
    ]
   },
   "HUNYUANIMAGE3_HOST_ENDS": {
@@ -1028,7 +1028,7 @@
   },
   "LAYER_SPLIT": {
    "reads": [
-    "serve/server.py:12482",
+    "serve/server.py:12496",
     "serve/server.py:4024",
     "serve/server.py:4281",
     "serve/server.py:4403"
@@ -1056,13 +1056,13 @@
   },
   "LOGPOS": {
    "reads": [
-    "src/program/generate.cpp:12346",
-    "src/program/generate.cpp:12378"
+    "src/program/generate.cpp:12348",
+    "src/program/generate.cpp:12380"
    ]
   },
   "LOGPOS_EXTRA": {
    "reads": [
-    "src/program/generate.cpp:12382"
+    "src/program/generate.cpp:12384"
    ]
   },
   "LOGPOS_TOPK": {
@@ -1083,13 +1083,13 @@
   },
   "LOOKUP_CHAIN_FIXED": {
    "reads": [
-    "src/program/generate.cpp:12966",
-    "src/program/generate.cpp:15172"
+    "src/program/generate.cpp:12968",
+    "src/program/generate.cpp:15174"
    ]
   },
   "LOOP_GUARD": {
    "reads": [
-    "serve/server.py:11937"
+    "serve/server.py:11942"
    ]
   },
   "MANIFEST": {
@@ -1104,7 +1104,7 @@
   },
   "MAX_BODY_MIB": {
    "reads": [
-    "serve/server.py:8203"
+    "serve/server.py:8208"
    ]
   },
   "MEMORY_LIMIT_MIB": {
@@ -1361,7 +1361,7 @@
   },
   "PENALTY_PROMPT": {
    "reads": [
-    "src/program/generate.cpp:12752",
+    "src/program/generate.cpp:12754",
     "src/program/plain_generate.cpp:1639"
    ]
   },
@@ -1409,7 +1409,7 @@
   },
   "PIPE_ADAPT_EVERY": {
    "reads": [
-    "src/program/generate.cpp:10612",
+    "src/program/generate.cpp:10614",
     "src/program/generate.cpp:7579"
    ]
   },
@@ -1506,7 +1506,7 @@
   },
   "POOL_TRACE": {
    "reads": [
-    "src/core/expert_source.cpp:3291"
+    "src/core/expert_source.cpp:3295"
    ]
   },
   "POOL_UMWAIT": {
@@ -1766,7 +1766,7 @@
   "RAM_ADAPT": {
    "reads": [
     "src/core/plain_model.cpp:5476",
-    "src/program/generate.cpp:13708"
+    "src/program/generate.cpp:13710"
    ]
   },
   "RAM_RESERVE_MIB": {
@@ -1792,7 +1792,7 @@
   },
   "REPLICA_START": {
    "reads": [
-    "serve/server.py:12027"
+    "serve/server.py:12032"
    ]
   },
   "REQUEST_LINES": {
@@ -1855,8 +1855,7 @@
   "ROUTE_TAIL_SKIP": {
    "reads": [
     "src/core/expert_source.cpp:3096",
-    "src/program/generate.cpp:3655",
-    "src/program/generate.cpp:9004"
+    "src/core/expert_source.cpp:3105"
    ]
   },
   "SCRIPT_GUARD": {
@@ -1897,7 +1896,7 @@
   },
   "SERVE_STOP_BOUND": {
    "reads": [
-    "src/program/generate.cpp:12960"
+    "src/program/generate.cpp:12962"
    ]
   },
   "SESSION_BUFFERED": {
@@ -1928,12 +1927,12 @@
   },
   "SNAPSHOT_FULL_CAPTURE": {
    "reads": [
-    "src/program/generate.cpp:12076"
+    "src/program/generate.cpp:12078"
    ]
   },
   "SNAPSHOT_VERIFY": {
    "reads": [
-    "src/program/generate.cpp:12055"
+    "src/program/generate.cpp:12057"
    ]
   },
   "SOURCE": {
@@ -1954,7 +1953,7 @@
   },
   "SPEC_DEPTH": {
    "reads": [
-    "src/program/generate.cpp:14336"
+    "src/program/generate.cpp:14338"
    ]
   },
   "SPEC_GUMBEL": {
@@ -1964,7 +1963,7 @@
   },
   "SPEC_WATCH": {
    "reads": [
-    "src/program/generate.cpp:15098"
+    "src/program/generate.cpp:15100"
    ]
   },
   "SPLIT_CPU_GBPS": {
@@ -2041,7 +2040,7 @@
   },
   "SPLIT_TIMING": {
    "reads": [
-    "src/program/generate.cpp:14309"
+    "src/program/generate.cpp:14311"
    ]
   },
   "SSD_KEEPALIVE": {
@@ -2087,13 +2086,13 @@
   },
   "STATE_HASH": {
    "reads": [
-    "src/program/generate.cpp:14070"
+    "src/program/generate.cpp:14072"
    ]
   },
   "STATE_HASH_GDN": {
    "reads": [
     "src/prefill/prefill.cpp:4640",
-    "src/program/generate.cpp:14101"
+    "src/program/generate.cpp:14103"
    ]
   },
   "SUB_GROUP_32": {
@@ -2103,7 +2102,7 @@
   },
   "TAIL_SKIP_MAX_CACHED": {
    "reads": [
-    "src/program/generate.cpp:9012"
+    "src/program/generate.cpp:9014"
    ]
   },
   "TEST_CACHE_FAIL": {
@@ -2143,12 +2142,12 @@
     "src/prefill/gemm.cpp:265",
     "src/prefill/prefill.cpp:2706",
     "src/program/generate.cpp:1232",
-    "src/program/generate.cpp:9600"
+    "src/program/generate.cpp:9602"
    ]
   },
   "TRACE_ADAPT": {
    "reads": [
-    "src/program/generate.cpp:14954"
+    "src/program/generate.cpp:14956"
    ]
   },
   "TRAIN_CONTROL_MS": {
@@ -2196,7 +2195,7 @@
   },
   "UNDECLARED_TOOL_CALLS": {
    "reads": [
-    "serve/server.py:12309"
+    "serve/server.py:12323"
    ]
   },
   "USAGE_SEED": {
@@ -2211,7 +2210,7 @@
   },
   "VERIFY_DEVICE_PLAN": {
    "reads": [
-    "src/core/expert_source.cpp:3507",
+    "src/core/expert_source.cpp:3511",
     "src/core/verify.cpp:790"
    ]
   },
