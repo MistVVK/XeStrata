@@ -293,7 +293,7 @@ class HttpTransport:
         self.protocol = None                             # sent as MCP-Protocol-Version once negotiated
         self.next_id = 0
         self.lock = threading.Lock()
-        self.broken = None
+        self.broken: McpSessionGone | None = None
 
     def start(self):
         pass

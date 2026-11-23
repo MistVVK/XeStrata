@@ -970,7 +970,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     # 台帳 0668: すでに prompt の先頭に載っている名前は tool_addition で再掲しない。added な工具は
     # 呼び出し側と同じ定義（_anthropic_callables）を表示する。
     shown = {t["name"] for t in declared if t["name"] not in deferred}
-    callable_defs = {}
+    callable_defs: dict[str, dict] = {}
     for t in _anthropic_callables(req):
         callable_defs.setdefault(t["name"], t)
     messages = []
@@ -2813,7 +2813,8 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    tags = ((THINK_END, CALL_START, FUNC_START) if self.recover else (THINK_END, CALL_START)) \
+                    tags: tuple[str, ...] = (
+                        (THINK_END, CALL_START, FUNC_START) if self.recover else (THINK_END, CALL_START)) \
                         if self.schemas else (THINK_END,)
                     keep = self._hold(self.buf, tags)
                     if len(self.buf) > keep:
