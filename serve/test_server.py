@@ -5149,6 +5149,26 @@ class AmdTelemetry(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:                     # no amdgpu: nothing, and nothing breaks
             self.assertFalse(telemetry._AmdGpu(None, sysfs=d).ok())
 
+    def test_name_without_product_name(self):
+        """A board without product_name (no FRU EEPROM, the R9700 on a rented machine) is named from libdrm's
+        amdgpu.ids by device ID and revision, before the PCI ID list and the bare "AMD Radeon"."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            amd = Path(d) / "devices" / "pci0000:00" / "0000:00:01.0" / "0000:0a:00.0"
+            (amd / "product_name").unlink()
+            for name, text in (("vendor", "0x1002"), ("device", "0x7551"), ("revision", "0xc0")):
+                (amd / name).write_text(text + "\n")
+            ids = Path(d) / "amdgpu.ids"
+            ids.write_text("# device_id,\trevision_id,\tproduct_name\n1.0.0\n"
+                           "7551,\tC1,\tAMD Radeon AI Pro R9700S\n7551,\tC0,\tAMD Radeon AI PRO R9700\n")
+            g = telemetry._AmdGpu("0000:0a:00.0", sysfs=d)
+            with mock.patch.object(telemetry, "PCI_IDS", ()):
+                with mock.patch.object(telemetry, "AMDGPU_IDS", (str(Path(d) / "missing.ids"), str(ids))):
+                    self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
+                with mock.patch.object(telemetry, "AMDGPU_IDS", ()):
+                    self.assertEqual(g.name(), "AMD Radeon")
+
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
         claimed when every hop could be read (pcie_path says how many were)."""

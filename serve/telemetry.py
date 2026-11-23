@@ -161,6 +161,31 @@ def _pci_ids_name(dev):
     return None
 
 
+AMDGPU_IDS = ("/usr/share/libdrm/amdgpu.ids", "/opt/amdgpu/share/libdrm/amdgpu.ids",
+              "/opt/rocm/lib/rocm_sysdeps/share/libdrm/amdgpu.ids", "/opt/rocm/share/libdrm/amdgpu.ids")
+
+
+def _amdgpu_ids_name(dev):
+    """The card's marketing name in libdrm's amdgpu.ids ("AMD Radeon AI PRO R9700") from its sysfs folder's device
+    ID and revision, or None: the list ROCm's runtime names a card by, where amdgpu gives no product_name (the board
+    has no FRU EEPROM) and the system has no PCI ID list (a container)."""
+    device = _read(os.path.join(dev or "", "device"), str)
+    revision = _read(os.path.join(dev or "", "revision"), str)
+    if not device or not revision:
+        return None
+    key = (device.upper().replace("0X", ""), revision.upper().replace("0X", "").zfill(2))
+    for path in AMDGPU_IDS:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    fields = [x.strip() for x in line.split(",", 2)]
+                    if len(fields) == 3 and (fields[0].upper(), fields[1].upper()) == key and fields[2]:
+                        return fields[2]
+        except OSError:
+            continue
+    return None
+
+
 def _gen(text):
     """The PCIe generation of a link-speed file's contents ("16.0 GT/s PCIe" -> 4), or None."""
     try:
@@ -364,7 +389,8 @@ class _AmdGpu:
         if not self.ok():
             return None
         listed = _pci_ids_name(self.dev)
-        return _read(os.path.join(self.dev, "product_name"), str) or (f"AMD {listed}" if listed else "AMD Radeon")
+        return (_read(os.path.join(self.dev, "product_name"), str) or _amdgpu_ids_name(self.dev)
+                or (f"AMD {listed}" if listed else "AMD Radeon"))
 
     _gen = staticmethod(_gen)
     _bdf = staticmethod(_bdf)
