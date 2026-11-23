@@ -191,6 +191,8 @@ FIT_MIN_ROOM = 1024          # 台帳 0828 (#5924): fit_max_tokens never shorten
 def fit_floor(ctx: int) -> int:
     """The least room fit_max_tokens shortens to: FIT_MIN_ROOM, at most a quarter of a small context."""
     return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
+
+
 # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 ANSWER_RESERVE_MIN = 512
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
@@ -276,7 +278,8 @@ class ContextOverflow(ValueError):
 
     def anthropic_text(self) -> str:
         if self.min_room:              # 台帳 0828: room left, but less than an answer needs: the client should compact
-            return f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; {self}"
+            return (f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} "
+                    f"maximum; {self}")
         room = self.context - CTX_SLACK
         if self.max_new is None or self.prompt > room - 1:   # the prompt alone leaves no room
             return f"prompt is too long: {self.prompt} tokens > {room - 1} maximum; {self}"

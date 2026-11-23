@@ -164,7 +164,6 @@ class ContextOverflow(unittest.TestCase):
                         self.assertEqual(prepared, ids)
                         self.assertEqual(maximum, 1 if budget == 1 else room)
 
-
     def test_fit_never_shortens_below_room_for_an_answer(self):
         # #5924: "max_tokens 4096 shortened to 221" left a thinking model no answer; agents looped on one sentence.
         # Below the floor the default (fit on) answers the context 400 instead, before anything is generated;
@@ -189,7 +188,8 @@ class ContextOverflow(unittest.TestCase):
                     self.assertIn("send max_tokens 221 or less", message)
                     if path == "/v1/messages":
                         self.assertTrue(message.startswith(
-                            f"prompt is too long: {tight} tokens > {CTX - CTX_SLACK - FIT_MIN_ROOM} maximum; "), message)
+                            f"prompt is too long: {tight} tokens > {CTX - CTX_SLACK - FIT_MIN_ROOM} "
+                            f"maximum; "), message)
                     if path == "/v1/responses":
                         self.assertEqual(body["error"]["code"], "context_length_exceeded")
         for path, key in APIS:

@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""serve/test_cut_arguments.py - a call max_tokens cut short, replayed in a client's history (soak 11-17, 0.2.16): its arguments
-arrive as text that starts like a JSON object and is not valid JSON.  The prompt must show the model the call it wrote, with
+"""serve/test_cut_arguments.py - a call max_tokens cut short, replayed in a client's history (soak 11-17, \
+0.2.16): its arguments
+arrive as text that starts like a JSON object and is not valid JSON.  The prompt must show the model the call it \
+wrote, with
 its parameters, not `<parameter=arguments>` + the cut text: after a dozen cut calls in a history the model wrote
 {"arguments": "<json>"} calls itself (and every one of them failed in the client).
 
@@ -29,11 +31,13 @@ from serve.responses import input_messages
 
 TEMPLATE = ChatTemplate(Path(__file__).resolve().parent / "test_chat_template.jinja")
 WRITE = {"type": "function", "function": {"name": "write_file", "description": "w", "parameters": {
-    "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}}
+    "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+    "required": ["path", "content"]}}}
 # a tool that really has a parameter called "arguments"
 WRAPPED = {"type": "function", "function": {"name": "invoke", "description": "i", "parameters": {
     "type": "object", "properties": {"arguments": {"type": "string"}}, "required": ["arguments"]}}}
-CUT = '{"path":"core/lease_audit.py","content":"\\"\\"\\"core.lease_audit: audit leases.\\n\\nCovers:\\n    a   b.py:1\\nSecond line cut mid-sen'
+CUT = ('{"path":"core/lease_audit.py","content":"\\"\\"\\"core.lease_audit: audit leases.\\n\\nCovers:\\n'
+       '    a   b.py:1\\nSecond line cut mid-sen')
 CUT_TEXT = '"""core.lease_audit: audit leases.\n\nCovers:\n    a   b.py:1\nSecond line cut mid-sen'
 
 
@@ -72,7 +76,8 @@ def history_call(prompt):
 class CutCalls(unittest.TestCase):
     def test_a_cut_call_shows_its_complete_members_and_the_partial_last_string(self):
         shown = history_call(chat_prompt("write_file", CUT, [WRITE]))
-        self.assertEqual(shown, "<tool_call>\n<function=write_file>\n<parameter=path>\ncore/lease_audit.py\n</parameter>\n"
+        self.assertEqual(shown, "<tool_call>\n<function=write_file>\n<parameter=path>\n"
+                         "core/lease_audit.py\n</parameter>\n"
                                 "<parameter=content>\n" + CUT_TEXT + "\n</parameter>\n</function>\n</tool_call>")
         self.assertNotIn("<parameter=arguments>", shown)
 
@@ -85,16 +90,16 @@ class CutCalls(unittest.TestCase):
     def test_the_recovered_members(self):
         cases = {
             CUT: {"path": "core/lease_audit.py", "content": CUT_TEXT},
-            '{"path":"a.py","content":"x"': {"path": "a.py", "content": "x"},                # every pair complete, no closing brace
+            '{"path":"a.py","content":"x"': {"path": "a.py", "content": "x"},  # every pair complete, no closing brace
             '{"path":"a.py","con': {"path": "a.py"},                                         # a cut key is no member
             '{"path":"a.py","content":"b\\': {"path": "a.py", "content": "b"},               # a half escape is not text
             '{"path":"a.py","content":"b\\u00': {"path": "a.py", "content": "b"},
             '{"c":"caf\\u00e9 \\u00e': {"c": "café "},
-            '{"path":"a.py","start_line":12': {"path": "a.py"},                              # a number the text ends in may be cut
+            '{"path":"a.py","start_line":12': {"path": "a.py"},  # a number the text ends in may be cut
             '{"path":"a.py","n":12,"content":"c': {"path": "a.py", "n": 12, "content": "c"},
             '{"a":{"b":"c"},"d":"e': {"a": {"b": "c"}, "d": "e"},
-            '{"a":{"b":"c': {},                                                               # a nested value cut short is left out
-            "{'path': 'a.py', 'content': 'x": {"path": "a.py", "content": "x"},              # _Lenient's slips are forgiven
+            '{"a":{"b":"c': {},  # a nested value cut short is left out
+            "{'path': 'a.py', 'content': 'x": {"path": "a.py", "content": "x"},  # _Lenient's slips are forgiven
         }
         for raw, want in cases.items():
             with self.subTest(raw[-30:]):
@@ -103,7 +108,8 @@ class CutCalls(unittest.TestCase):
 
     def test_a_tool_that_declares_arguments_keeps_the_old_form(self):
         shown = history_call(chat_prompt("invoke", '{"arguments": "ls -la", "x', [WRAPPED]))
-        self.assertEqual(shown, '<tool_call>\n<function=invoke>\n<parameter=arguments>\n{"arguments": "ls -la", "x\n</parameter>\n'
+        self.assertEqual(shown, '<tool_call>\n<function=invoke>\n<parameter=arguments>\n'
+                         '{"arguments": "ls -la", "x\n</parameter>\n'
                                 "</function>\n</tool_call>")
         self.assertEqual(tool_arguments('{"a": "b', {"arguments"}), {"arguments": '{"a": "b'})
 
@@ -114,10 +120,12 @@ class CutCalls(unittest.TestCase):
     def test_declared_parameters(self):
         dp = frontend.declared_parameters
         self.assertEqual(dp([WRITE], "write_file"), {"path", "content"})
-        self.assertEqual(dp([{"name": "t", "input_schema": {"properties": {"a": {}}}}], "t"), {"a"})          # Anthropic
-        self.assertEqual(dp([{"type": "function", "name": "t", "parameters": {"properties": {"b": {}}}}], "t"), {"b"})   # Responses
-        self.assertEqual(dp([{"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "t", "parameters": {
-            "properties": {"c": {}}}}]}], "ns.t"), {"c"})
+        self.assertEqual(dp([{"name": "t", "input_schema": {"properties": {"a": {}}}}], "t"), {"a"})  # Anthropic
+        self.assertEqual(
+            dp([{"type": "function", "name": "t", "parameters": {"properties": {"b": {}}}}], "t"), {"b"})  # Responses
+        self.assertEqual(dp([{"type": "namespace", "name": "ns", "tools": [
+            {"type": "function", "name": "t", "parameters": {"properties": {"c": {}}}}]
+        }], "ns.t"), {"c"})
         self.assertEqual(dp([{"name": "t"}], "t"), set())
         self.assertIsNone(dp([WRITE], "other"))
         self.assertIsNone(dp(None, "t"))
@@ -125,28 +133,35 @@ class CutCalls(unittest.TestCase):
 
     def test_the_anthropic_and_responses_histories_render_the_same_members(self):
         # /v1/messages: the tool_use input as text; /v1/responses: the function_call's arguments string
-        areq = {"model": "m", "tools": [{"name": "write_file", "description": "w", "input_schema": WRITE["function"]["parameters"]}],
+        areq = {"model": "m", "tools": [{"name": "write_file", "description": "w",
+                                        "input_schema": WRITE["function"]["parameters"]}],
                 "messages": [{"role": "user", "content": "go"},
-                             {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "write_file", "input": CUT}]},
-                             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "cut off"}]}]}
+                             {"role": "assistant", "content": [
+                                 {"type": "tool_use", "id": "c1", "name": "write_file", "input": CUT}]},
+                             {"role": "user", "content": [
+                                 {"type": "tool_result", "tool_use_id": "c1", "content": "cut off"}]}]}
         msgs, _tools, _kw = anthropic_to_messages(areq)
         call = next(c for m in msgs for c in m.get("tool_calls") or [])
         self.assertEqual(call["function"]["arguments"], {"path": "core/lease_audit.py", "content": CUT_TEXT})
-        rreq = {"model": "m", "tools": [{"type": "function", "name": "write_file", "description": "w", "parameters": WRITE["function"]["parameters"]}],
+        rreq = {"model": "m", "tools": [{"type": "function", "name": "write_file", "description": "w",
+                                        "parameters": WRITE["function"]["parameters"]}],
                 "input": [{"role": "user", "content": "go"},
                           {"type": "function_call", "call_id": "c1", "name": "write_file", "arguments": CUT},
                           {"type": "function_call_output", "call_id": "c1", "output": "cut off"}]}
         call = next(c for m in input_messages(rreq) for c in m.get("tool_calls") or [])
         self.assertEqual(call["function"]["arguments"], {"path": "core/lease_audit.py", "content": CUT_TEXT})
-        rreq["tools"] = [{"type": "function", "name": "write_file", "parameters": {"properties": {"arguments": {"type": "string"}}}}]
+        rreq["tools"] = [{"type": "function", "name": "write_file",
+                          "parameters": {"properties": {"arguments": {"type": "string"}}}}]
         call = next(c for m in input_messages(rreq) for c in m.get("tool_calls") or [])
-        self.assertEqual(call["function"]["arguments"], {"arguments": CUT})                 # declared "arguments": the old form
+        self.assertEqual(call["function"]["arguments"], {"arguments": CUT})  # declared "arguments": the old form
 
 
 class ValidHistoriesRenderAsBefore(unittest.TestCase):
     VALID = [  # noqa: RUF012
-        '{"path": "core/a.py", "content": "x\\ny"}', '{}', '{"a": 1, "b": [1, 2], "c": {"d": null}}', '{"content": "\\"\\"\\"doc\\"\\"\\"\\n"}',
-        '  {"x": true}  ', json.dumps({"path": "p", "content": "line\n" * 2000}), '{"arguments": "{\\"path\\": \\"a\\"}"}',
+        '{"path": "core/a.py", "content": "x\\ny"}', '{}',
+        '{"a": 1, "b": [1, 2], "c": {"d": null}}', '{"content": "\\"\\"\\"doc\\"\\"\\"\\n"}',
+        '  {"x": true}  ', json.dumps({"path": "p", "content": "line\n" * 2000}),
+        '{"arguments": "{\\"path\\": \\"a\\"}"}',
     ]
     OTHER = [  # noqa: RUF012
         "path=core/x.py", "[1, 2]", "12", "null", '"text"', "true", "ls -la", "[", "plain", "{cut",

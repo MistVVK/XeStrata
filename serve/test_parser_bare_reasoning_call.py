@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""#5804: (1) a declared tool's `<function=NAME>` written without its `<tool_call>` wrapper INSIDE the reasoning was never read (only the answer's was), so
-the turn ended with the call as reasoning text and no `tool_calls`; (2) a lone `<parameter=arguments>` whose value is a JSON object reached the client as
-`{"arguments": {...}}` (also in the streamed argument deltas) when the tool has no parameter of that name.  Both with tool_call_recovery (recover) on.
+"""#5804: (1) a declared tool's `<function=NAME>` written without its `<tool_call>` wrapper INSIDE the reasoning was \
+never read (only the answer's was), so
+the turn ended with the call as reasoning text and no `tool_calls`; (2) a lone `<parameter=arguments>` whose value \
+is a JSON object reached the client as
+`{"arguments": {...}}` (also in the streamed argument deltas) when the tool has no parameter of that name.  \
+Both with tool_call_recovery (recover) on.
 
     python -m unittest serve.test_parser_bare_reasoning_call
 """
@@ -87,13 +90,15 @@ class LoneArgumentsParameter(unittest.TestCase):
                 self.assertEqual(json.loads(streamed), {"path": "a.py", "content": "x = 1"})
 
     def test_a_tool_that_declares_arguments_keeps_it(self):
-        t = '<tool_call>\n<function=arguments_tool>\n<parameter=arguments>{"k": 1}</parameter>\n</function>\n</tool_call>'
+        t = ('<tool_call>\n<function=arguments_tool>\n<parameter=arguments>{"k": 1}</parameter>\n'
+             '</function>\n</tool_call>')
         for piece in (0, 7):
             evs = run(t, False, piece=piece, stream_tools=True)
             self.assertEqual(calls(evs), [("arguments_tool", {"arguments": {"k": 1}})])
 
     def test_arguments_beside_another_parameter_is_not_unwrapped(self):
-        t = ('<tool_call>\n<function=exec>\n<parameter=path>\na.py\n</parameter>\n<parameter=arguments>{"k": 1}</parameter>\n'
+        t = ('<tool_call>\n<function=exec>\n<parameter=path>\na.py\n</parameter>\n'
+             '<parameter=arguments>{"k": 1}</parameter>\n'
              '</function>\n</tool_call>')
         evs = run(t, False)
         self.assertEqual(calls(evs), [("exec", {"path": "a.py", "arguments": {"k": 1}})])

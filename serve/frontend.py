@@ -321,7 +321,7 @@ def _parts_of(content):
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
 ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking",
-                                                             "tool_addition")
+                                                           "tool_addition")
 
 
 def _check_parts(content, path: str, kinds):
@@ -756,7 +756,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"), declared_parameters(req.get("tools"), fn.get("name")))},
+                calls.append({"function": {"name": fn.get("name"),
+                                           "arguments": tool_arguments(
+                                               fn.get("arguments"),
+                                               declared_parameters(req.get("tools"), fn.get("name")))},
                               "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
@@ -1011,11 +1014,14 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 elif d["name"] not in shown:
                     shown.add(d["name"])
                     added = "<tools>\n" + json.dumps(_anthropic_tool(callable_defs[d["name"]]),
-                                                    ensure_ascii=False) + "\n</tools>"
+                                                     ensure_ascii=False) + "\n</tools>"
                     text.append(added)
                     parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"), declared_parameters(req.get("tools"), block.get("name")))},
+                calls.append({"function": {"name": block.get("name"),
+                                           "arguments": tool_arguments(
+                                               block.get("input"),
+                                               declared_parameters(req.get("tools"), block.get("name")))},
                               "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
@@ -1704,7 +1710,7 @@ def declared_parameters(tools, name):
             if found is not None:
                 return found
         if isinstance(name, str) and name and (fn.get("name") == name or
-                                                (isinstance(fn.get("name"), str) and name.endswith("." + fn["name"]))):
+                                               (isinstance(fn.get("name"), str) and name.endswith("." + fn["name"]))):
             schema = fn.get("parameters") or fn.get("input_schema")
             props = schema.get("properties") if isinstance(schema, dict) else None
             return set(props) if isinstance(props, dict) else set()
@@ -2103,7 +2109,7 @@ class OutputParser:
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.rbare = False           # 台帳 carryover c447a2850: reasoning の裸の call
         self.dialect_call = False    # 台帳 carryover 20056dbbe: <function_calls>/<invoke> を読み替えた call
-        self.dialect_wrapped = False # <function_calls> の wrapper を読み替えた
+        self.dialect_wrapped = False  # <function_calls> の wrapper を読み替えた
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276: the end of a misspelt opener still arriving (see _opener)
@@ -2872,7 +2878,8 @@ class OutputParser:
                     # so emitting them early would make streamed and whole outputs differ.
                     tags = (CALL_START, THINK_END) if self.after_think else (CALL_START,)
                     if self.recover and self.schemas:
-                        tags += (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>", "<parameter name=")
+                        tags += (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>",
+                                 "<parameter name=")
                     j = len(self.buf) - self._hold(self.buf, tags)
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
@@ -3089,7 +3096,8 @@ class OutputParser:
                     value = rest[1:] if rest.startswith("\n") else rest
                     declared = self.sprops.get(self.spname)
                     v = _argument_value(value, declared, self.sroot)
-                    if _nonstring_type(declared, self.sroot) or (self.recover and self.sraw_pname.strip() == "arguments"):
+                    if (_nonstring_type(declared, self.sroot)
+                            or (self.recover and self.sraw_pname.strip() == "arguments")):
                         if v is not _SKIP:
                             self.sheld.pop(self.sraw_pname, None)
                             self.sheld[self.sraw_pname] = v

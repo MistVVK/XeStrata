@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""A value whose text has `</parameter>` and then `</function>` on the next line, followed by more of the file (#4701's rule, one tag short).
+"""A value whose text has `</parameter>` and then `</function>` on the next line, \
+followed by more of the file (#4701's rule, one tag short).
 
-Live (Pi on /v1/chat/completions, Qwen3.8-Flash-Next): a write of an XML file whose element `<parameter ...>...</parameter>` was the last
-child of a `<function ...>` element.  The value ended at that `</parameter>`, the call went out with the file cut there and no error,
-and the rest of the file was lost.  The sequence now ends the value only as #4701 decided for the three tags: unless a later closing
+Live (Pi on /v1/chat/completions, Qwen3.8-Flash-Next): \
+a write of an XML file whose element `<parameter ...>...</parameter>` was the last
+child of a `<function ...>` element.  The value ended at that `</parameter>`, the call went out with \
+the file cut there and no error,
+and the rest of the file was lost.  The sequence now ends the value only as #4701 decided for the \
+three tags: unless a later closing
 tag follows inside the same wrapped call.
 
     python -m unittest serve.test_value_closer_pair
@@ -21,10 +25,12 @@ def tool(name, **props):
 
 S = {"type": "string"}
 TOOLS = [tool("read", path=S), tool("write", path=S, content=S)]
-XML = ('<catalog>\n  <function name="esc_case">\n    <parameter name="path" type="str">C:\\tmp\\a.xml</parameter>\n  </function>\n'
+XML = ('<catalog>\n  <function name="esc_case">\n'
+       '    <parameter name="path" type="str">C:\\tmp\\a.xml</parameter>\n  </function>\n'
        '  <function name="next">\n    <call id="c-5">noop</call>\n  </function>\n</catalog>')
 READ = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>"
-READ_OPEN = "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n"      # its </tool_call> left out
+READ_OPEN = ("<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+             "</function>\n")  # its </tool_call> left out
 
 
 def write(first, second):

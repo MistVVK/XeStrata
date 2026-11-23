@@ -29,12 +29,14 @@ class BooleanArguments(unittest.TestCase):
     def test_strings_and_other_words_are_left_as_they_were(self):
         self.assertEqual(param_value("True", TOOL["parameters"]["properties"]["title"]), "True")
         self.assertEqual(param_value("True", TOOL["parameters"]["properties"]["label"]), "True")
-        self.assertEqual(param_value("True", TOOL["parameters"]["properties"]["formatted"] | {"enum": ["True"]}), "True")
+        self.assertEqual(param_value(
+            "True", TOOL["parameters"]["properties"]["formatted"] | {"enum": ["True"]}), "True")
         self.assertEqual(param_value("yes", TOOL["parameters"]["properties"]["formatted"]), "yes")
         self.assertEqual(param_value("True", None), "True")
 
     def test_whole_call_and_streamed_parser(self):
-        body = "<function=write_note>\n<parameter=formatted>\nTrue\n</parameter>\n<parameter=title>\nTrue\n</parameter>\n</function>"
+        body = ("<function=write_note>\n<parameter=formatted>\nTrue\n</parameter>\n"
+                "<parameter=title>\nTrue\n</parameter>\n</function>")
         self.assertEqual(parse_tool_call(body, TOOL).arguments, {"formatted": True, "title": "True"})
         parser = OutputParser(thinking=False, tools=[TOOL], stream_tools=True)
         events = parser.feed("<tool_call>\n" + body + "\n</tool_call>") + parser.finish()

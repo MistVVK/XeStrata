@@ -94,7 +94,7 @@ class RoleChunkAfterPrefill(unittest.TestCase):
                                     ("event", Event("reasoning", "Let me check.")),
                                     ("event", Event("content", "42")), DONE]))
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"reasoning_content": "Let me check.",
-                                                           "reasoning": "Let me check."})
+                                                            "reasoning": "Let me check."})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "42"})
 
     def test_requested_progress_opens_during_prefill(self):
@@ -102,7 +102,7 @@ class RoleChunkAfterPrefill(unittest.TestCase):
                        ("event", Event("content", "hi")), DONE])
         svc.engine = SimpleNamespace(progress=(100, 1000), reused=50, progress_ms=25)
         out = [(svc.read, c) for c in openai_chunks(svc, {"return_progress": True},
-                                                   [1], False, None, 16, None)]
+                                                    [1], False, None, 16, None)]
         self.assertFalse(out[0][0])
         chunks = [c for _, c in out]
         self.assertEqual(chunks[0]["choices"][0]["delta"], ROLE)
