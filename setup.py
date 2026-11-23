@@ -8472,7 +8472,7 @@ def run_gui(args: list) -> int:
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
-    --vram-reserve-mib)."""
+    --vram-reserve-mib, --ple-io, --route-tail-skip)."""
     cfg = repoint_engine(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     cfg = upgrade_config(cfg_path, cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
@@ -8488,6 +8488,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args += ["--vram-reserve-mib", str(reserve)]
         write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+    tail = keep.pop("route_tail_skip", None)           # the route tail skip: the config's route_tail_skip_default
+    if tail is not None:
+        cfg["route_tail_skip_default"] = route_tail_skip_value(tail)
+        write_config(cfg_path, cfg)
+        ok(f"saved for this model: the route tail skip {tail} (--route-tail-skip)")
     ple_io = keep.pop("ple_io", None)                  # #49: how the engine reads the n-gram table, in the args
     if ple_io is not None:
         args = cfg["args"]
@@ -8893,7 +8898,7 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "family", "log", "lib_dirs", "port",
-                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom", "route_tail_skip_default"})
+                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
@@ -9628,6 +9633,8 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     STATE.mkdir(parents=True, exist_ok=True)
     if getattr(a, "custom", None):                     # a model of the user's own files: what setup read of them
         cfg["custom"] = a.custom
+    if getattr(a, "route_tail_skip", None):            # else an earlier config's own choice is carried over
+        cfg["route_tail_skip_default"] = route_tail_skip_value(a.route_tail_skip)
     keep_old_names(cfg, cfg_path if cfg_path.is_file() else adopted)
     cal = saved_calibration(cfg) if tune else None
     if cal is not None:
@@ -10012,11 +10019,33 @@ OPTIONS = [
                      ["ram", "The whole table in RAM (faster new prompts, ~29 GB more RAM)"],
                      ["direct", "Read from the SSD as needed"]],
             default=""),
+    # the route tail skip (XESTRATA_ROUTE_TAIL_SKIP, the config's route_tail_skip_default): off by default (upstream
+    # 9624759956, owner 11-19; Q6 2026-11-23 on the RX 9060 XT: rank 7 moved the answers by KL 0.078 against a 0.019
+    # floor for +12% decode); the choice of upstream 98ebfb3e1c kept: auto (rank 7 where the engine's rule allows),
+    # off, 1-9
+    _option("route-tail-skip", "Skip rarely used parts of the model (faster answers that can change slightly)",
+            "the route tail skip: an expert not in VRAM that every token of a verify window routes at the rank or "
+            "lower is neither read nor computed: off (default), auto = rank 7 except where nearly every expert is in "
+            "VRAM or with --parallel, 1-9 = that rank (lower skips more: faster, the answers change more; only 7 is "
+            "measured)",
+            place="start",
+            choices=[["", "As set up (off the first time)"],
+                     ["off", "Off (recommended)"],
+                     ["auto", "Automatic: on where it helps (rank 7)"],
+                     ["7", "On: rank 7 (the measured one)"],
+                     *[[str(r), str(r)] for r in (1, 2, 3, 4, 5, 6, 8, 9)]],
+            about="Lower numbers skip more parts: faster, and the answers change more. Only 7 has been measured.",
+            default=""),
     _option("old-driver", "Start although the Intel GPU's driver is older than the one setup asks for",
             "start although the Level Zero driver predates the fix setup stops on (see its message)",
             kind="flag", place="start", default=False),
 ]
 OPTION = {o["name"]: o for o in OPTIONS}
+
+
+def route_tail_skip_value(choice: str) -> str:
+    """--route-tail-skip's choice as XESTRATA_ROUTE_TAIL_SKIP's value (the config's route_tail_skip_default)."""
+    return "0" if choice == "off" else choice
 
 
 def option_args(ap) -> None:
@@ -10345,9 +10374,8 @@ def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gp
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"),
                            "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
                            "experts_gb": MODELS[model]["arena_gb"], "draft_vocab": draft_vocab}
-    # R7 KL against off on B70 at 12 GiB: XS 0.008904, S 0.010352, M 0.011171; above the 0.0058 reference.
-    # Leave it off unless the user opts in, without changing other models' engine defaults.
-    cfg["route_tail_skip_default"] = 0
+    # the route tail skip stays off, as the engine's default (R7 KL against off on B70 at 12 GiB: XS 0.008904,
+    # S 0.010352, M 0.011171; above the 0.0058 reference); --route-tail-skip turns it on
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]
     replicas_config(a, cfg)
@@ -10821,7 +10849,8 @@ def main() -> int:
                                        a.yes)) - 1]
             return start(run_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         update_installed_engine()
         pick_cfg = have[0]
         if len(have) > 1:
@@ -10836,13 +10865,14 @@ def main() -> int:
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                                           keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
                                                 "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser,
-                                                "ple_io": a.ple_io})
+                                                "ple_io": a.ple_io, "route_tail_skip": a.route_tail_skip})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -10851,7 +10881,8 @@ def main() -> int:
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
 
     # ---- 1. the PC
     step(1, "checking your PC")

@@ -58,7 +58,7 @@ class SyncFiles(unittest.TestCase):
         cfg = finish.call_args.args[1]
         self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-sync-xs")
         self.assertEqual(cfg["aliases"], ["Sync-XS", "sync-xs"])
-        self.assertEqual(cfg["route_tail_skip_default"], 0)
+        self.assertNotIn("route_tail_skip_default", cfg)   # off as the engine's default; --route-tail-skip sets it
         self.assertIn("--resident-experts", cfg["args"])
         self.assertEqual(cfg["args"][cfg["args"].index("--pack") + 1], "/pack")
         self.assertEqual(cfg["tokenizer"], "/shared/tokenizer")
@@ -69,7 +69,7 @@ class SyncFiles(unittest.TestCase):
                   mock.patch.object(setup, "replicas_config"), mock.patch.object(setup, "finish_setup") as other):
                 setup.setup_sync(a, "sync", model, gpu, [0], [gpu], True, 64, [], 8095, None, 8192, "fp16",
                                  "none", True, True, None, 1.0)
-            self.assertEqual(other.call_args.args[1]["route_tail_skip_default"], 0)
+            self.assertNotIn("route_tail_skip_default", other.call_args.args[1])
 
     def test_draft_subset_does_not_change_the_shared_files(self):
         with tempfile.TemporaryDirectory() as temp:

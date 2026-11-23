@@ -3086,8 +3086,8 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
 }
 
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
-// skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
-// default where it applies.
+// skipped (upstream b4e3407b).  The environment value is read once: unset, 0 or anything but 1-9 is off (upstream
+// 9624759956); "auto" is off here too, and the serve start-up (generate.cpp) sets rank 7 where the rule allows.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
 int tail_skip_rank() {
@@ -3101,6 +3101,10 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+bool tail_skip_auto() {
+    const char* v = strata::env_get("ROUTE_TAIL_SKIP");
+    return v != nullptr && std::strcmp(v, "auto") == 0;
+}
 
 void expert_pool_count(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k) {
     if (!d.usage.empty() && d.usage_by_window && !d.route_rec.empty() && d.layers < d.route_rec_layers &&

@@ -90,7 +90,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   Up to four GPUs every order is tried, from five on the order by bandwidth (the fastest last); the config's order changes only for one predicted 2% faster or more.
   The first GPU is set when the engine starts and is not swapped, but when another first GPU is predicted faster, the log names the cards' order to set.
 - A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
-- The misses left to the CPU are priced without those the route tail skip (default rank 7, [DETAILS](DETAILS.md)) neither reads nor computes.
+- The misses left to the CPU are priced without those the route tail skip (when it is on, [DETAILS](DETAILS.md)) neither reads nor computes.
 - With `--pipeline-windows 2` a window is priced at its slowest stage, not the stages' sum: the first GPU runs the next window while the later ones verify this one, so a balanced split is the faster one.
 - Last, the first GPU alone is priced too: unless the second GPU's role (split or helper) is predicted 5% shorter, the first GPU runs alone (`XESTRATA_SPLIT_GAIN_PCT`). On a B70 + RTX 4070 the first GPU alone decoded IQ3_XXS fastest (32K: 104 tok/s, the helper 96, the split 79; predicted 12.0, 12.1 and 12.3 ms), and the helper won with IQ3_S and with both GPUs at 12 GiB (predicted 9% shorter or more).
 - `--split-roles helper` (the server's, when it makes images on the second GPU) gives the second GPU a helper cache's role or none: a helper can be closed and opened again between requests (`HELPER off` / `HELPER on`; [IMAGE](IMAGE.md)).
