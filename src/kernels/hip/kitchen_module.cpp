@@ -19,7 +19,7 @@ extern "C" void launch_int8_gemm_kernel(const void* a, const void* b, void* c, c
 extern "C" void launch_int8_gemm_a_tiled128_kernel(const void* a, const void* b, void* c, const void* scale_a,
                                                    const void* scale_b, int scale_b_stride, const void* bias,
                                                    int bias_code, int M, int N, int K, int ldc, int out_code,
-                                                   hipStream_t stream);
+                                                   int b_tiled, hipStream_t stream);
 
 struct SageDenseMask16;
 extern "C" void launch_sage_quant_qk_int8(const void* q, void* q_int8, void* q_scale, const void* k, void* k_int8,
@@ -76,7 +76,8 @@ STRATA_KITCHEN_EXPORT int strata_kitchen_i8_gemm_tiled(const int8_t* x, const in
     if (K % 128 != 0 || hipStreamGetDevice(s, &dev) != hipSuccess || hipSetDevice(dev) != hipSuccess) return 1;
     (void) hipGetLastError();
     try {
-        launch_int8_gemm_a_tiled128_kernel(x, w, y, sx, sw, 1, bias, 0, (int) T, (int) N, (int) K, (int) ldy, 2, s);
+        launch_int8_gemm_a_tiled128_kernel(x, w, y, sx, sw, 1, bias, 0, (int) T, (int) N, (int) K, (int) ldy, 2,
+                                           0 /* b_tiled: W is row-major */, s);
     } catch (...) {
         return 1;
     }

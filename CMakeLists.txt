@@ -1235,10 +1235,11 @@ if(STRATA_ENABLE_XE)
     # inside a checkout), in which git apply would skip the paths outside its folder without a word
     find_package(Git REQUIRED)
     FetchContent_Populate(strata_kitchen QUIET
-      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.41.tar.gz
-      URL_HASH SHA256=53050948120731ea817581d8f94bcdd79fb69d07ed51447dcf128e8a0a771865
+      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.42.tar.gz
+      URL_HASH SHA256=9e68c366691d62fe4ac6a381d7d5c7f092bb1b8124cf61c0e974f54e3fab21e3
       PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
                     ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0001-wmma-bf16-operands.patch
+                    ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0002-big-tiled-long-k.patch
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-subbuild)
     set(_strata_kitchen_hip ${strata_kitchen_SOURCE_DIR}/comfy_kitchen/backends/hip)
