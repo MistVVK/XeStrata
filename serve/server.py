@@ -4064,7 +4064,8 @@ def engine_args(cfg: dict) -> list[str]:
         args.append("--session-save-reclaim")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
-    return conversation_save_args(cfg, learned_profile_args(cfg, conversation_cache_args(cfg, args)))
+    args = conversation_save_args(cfg, learned_profile_args(cfg, conversation_cache_args(cfg, args)))
+    return draft_costs_args(cfg, args)
 
 
 def conversation_cache_args(cfg: dict, args: list[str]) -> list[str]:
@@ -4129,6 +4130,54 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if "--batch-groups" not in args and (g == autotune.AUTO or (
             isinstance(g, int) and not isinstance(g, bool) and g >= 1)):
         out += ["--batch-groups", str(g)]
+    return out
+
+
+_engine_texts: dict = {}
+
+
+def engine_has_text(exe: str, needle: bytes) -> bool | None:
+    """Does the engine program contain `needle` (an option it knows)?  None when it cannot be read.  Read once per
+    path, size and time (upstream bb21ee1f5)."""
+    import mmap
+    try:
+        st = os.stat(exe)
+    except (OSError, ValueError):
+        return None
+    key = (exe, st.st_size, st.st_mtime_ns, needle)
+    if key not in _engine_texts:
+        try:
+            with open(exe, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                _engine_texts[key] = data.find(needle) >= 0
+        except (OSError, ValueError):
+            _engine_texts[key] = None
+    return _engine_texts[key]
+
+
+def draft_costs_args(cfg: dict, args: list[str]) -> list[str]:
+    """"draft_costs": true in the config (opt-in, upstream 4c999bcde .. 1b11a76e8) has the engine fix its draft
+    windows' costs to a table built on this computer from its own requests (--draft-costs): the same request then gives
+    the same windows on every start.  Off by default on every GPU: upstream turned it on for Metal alone, having
+    measured the table below live costs on CUDA (code and chat 1.5% slower), and XeStrata has no Metal.  The table is
+    draft-costs/<model>-<hash of every engine argument>.costs in the engine's folder (the config's "cwd"), or in
+    XESTRATA_DRAFT_COSTS_DIR; --draft-costs-key adds the engine file's size, so a new engine builds its table again
+    (the engine itself checks the devices, the driver and the model).  An engine seen without the option is not given
+    it."""
+    if cfg.get("draft_costs") is not True or "--draft-costs" in args:
+        return args
+    exe = os.path.join(cfg.get("cwd") or ".", str(cfg["exe"])) if cfg.get("exe") else None
+    if exe and engine_has_text(exe, b"--draft-costs") is False:
+        return args
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(cfg.get("model_name") or "model"))[:64]
+    digest = hashlib.sha256("\0".join(map(str, args)).encode("utf-8", "replace")).hexdigest()[:12]
+    folder = envvars.get("DRAFT_COSTS_DIR") or "draft-costs"
+    out = args + ["--draft-costs", os.path.join(folder, f"{name}-{digest}.costs")]
+    try:
+        size = os.path.getsize(exe) if exe else 0
+    except OSError:
+        size = 0
+    if size:
+        out += ["--draft-costs-key", f"engine file {size} bytes"]
     return out
 
 

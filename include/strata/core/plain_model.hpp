@@ -259,6 +259,9 @@ struct PlainOptions {
     /// cannot give up their room later (not --vram-elastic), so the start can measure them; 0: none
     int draft_windows_wide = 0;
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
+    /// --serve, --draft-costs FILE: the window costs' table (as generate.cpp's); draft_costs_key: the server's part of
+    /// its key on the command line, the whole key (strata::spec::draft_costs_key) once the devices are up
+    std::string draft_costs, draft_costs_key;
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
     /// chosen at load from each GPU's free memory.  Empty and false: one GPU, the current one.
@@ -426,6 +429,8 @@ public:
     /// --serve: a request's prompt reads the residency table again, so the windows are not where a switch that changes
     /// when a swap is applied can be measured against the prompt's rounding (auto_pick.hpp).
     void set_serve(bool on) { for (PlainModel* st : chain()) st->serve_ = on; }
+    /// The draft policy of the MTP's windows (--draft-costs fixes its costs, strata::spec::DraftCosts)
+    strata::spec::DraftPolicy& draft_policy() { return policy_; }
     /// The PCIe share of the missed experts for this request (setup's calibration, pcie_frac=); < 0: the engine's own
     void set_pcie_frac(double f);
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
