@@ -8156,11 +8156,11 @@ def anthropic_structured(events, validator):
 # ------------------------------------------------------------------------------------------------ HTTP
 # Anthropic's error types by HTTP status (its "errors" page); a 5xx without its own is an api_error
 ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
-                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
-                         529: "overloaded_error"}
+                         404: "not_found_error", 409: "conflict_error", 413: "request_too_large",
+                         429: "rate_limit_error", 500: "api_error", 529: "overloaded_error"}
 
 
-def api_error_body(path: str, status: int, obj):
+def api_error_body(path: str, status: int, obj, request_id: str | None = None):
     """An error body in the shape of the API its path belongs to: Anthropic's routes (/v1/messages...) answer
     {"type": "error", "error": {"type", "message"}}, the other /v1/ routes OpenAI's {"error": {"message", "type",
     "param", "code"}} (param and code null when the error has none).  Anything else is left as it is."""
@@ -8169,10 +8169,17 @@ def api_error_body(path: str, status: int, obj):
         return obj
     message = str(err.get("message") or "")
     if path.startswith("/v1/messages"):
-        if obj.get("type") == "error":
+        if obj.get("type") == "error" and request_id is None:
             return obj
-        kind = ANTHROPIC_ERROR_TYPES.get(status, "api_error" if status >= 500 else "invalid_request_error")
-        return {"type": "error", "error": {"type": kind, "message": message}}
+        # 台帳 0804（upstream 25d88c4a5b）: 502/503 は overload と読ませないため既存の type を保つ
+        kind = ANTHROPIC_ERROR_TYPES.get(status)
+        if kind is None:
+            kind = err.get("type") or "api_error" if status >= 500 else "invalid_request_error"
+        error = {**err, "type": kind, "message": message}
+        body = {"type": "error", **obj, "error": error}
+        if request_id:
+            body["request_id"] = request_id
+        return body
     kind = err.get("type") or ("server_error" if status >= 500 else "invalid_request_error")
     return {**obj, "error": {**err, "message": message, "type": kind, "param": err.get("param"),
                              "code": err.get("code")}}
@@ -8529,7 +8536,11 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
-            obj = api_error_body(self.path.split("?")[0].rstrip("/"), code, obj)
+            request_id = "req_" + (self.record["id"] if self.record is not None else uuid.uuid4().hex[:12])
+            path = self.path.split("?")[0].rstrip("/")
+            obj = api_error_body(path, code, obj, request_id)
+            if code >= 400 and path.startswith("/v1/messages"):
+                headers = {**(headers or {}), "request-id": request_id}
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
