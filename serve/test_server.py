@@ -2663,6 +2663,41 @@ class DesktopVramNote(unittest.TestCase):
             self.assertFalse(server.linux_desktop({}))
 
 
+class DraftCosts(unittest.TestCase):
+    """"draft_costs": true in the config: --draft-costs <folder>/<model>-<hash>.costs and the engine file's size as
+    --draft-costs-key; off without the key or with false (the default on every GPU); an engine program seen without
+    the option is not given it (upstream bb21ee1f5, a32d1b368, 1b11a76e8)."""
+
+    def run_args(self, **cfg):
+        from serve import server
+        base = {"args": ["--native", "m.gguf", "--spec", "4"], "model_name": "qwen3.8/iq3",
+                "session_save_reclaim": False, "expert_profile_save": False}
+        base.update(cfg)
+        return server.engine_args(base)
+
+    def test_off_by_default(self):
+        self.assertNotIn("--draft-costs", self.run_args())
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=False))
+
+    def test_on_names_a_file_per_model_and_arguments(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "xestrata-engine"
+        exe.write_bytes(b"\0 --draft-costs FILE \0")
+        with mock.patch.dict(os.environ, {"XESTRATA_DRAFT_COSTS_DIR": str(d / "dc")}):
+            got = self.run_args(draft_costs=True, exe=str(exe))
+            other = self.run_args(draft_costs=True, exe=str(exe), args=["--native", "m.gguf", "--spec", "6"])
+        i = got.index("--draft-costs")
+        self.assertTrue(got[i + 1].startswith(str(d / "dc" / "qwen3.8-iq3-")) and got[i + 1].endswith(".costs"))
+        self.assertEqual(got[i + 2:i + 4], ["--draft-costs-key", f"engine file {exe.stat().st_size} bytes"])
+        self.assertNotEqual(other[other.index("--draft-costs") + 1], got[i + 1])
+
+    def test_an_engine_without_the_option_is_not_given_it(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "old-engine"
+        exe.write_bytes(b"\0 --draft-rule \0")
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=True, exe=str(exe)))
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
     begins from it when it is a profile of the same model; without the key expert-profile-<model>.bin, and false
