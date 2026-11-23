@@ -17,11 +17,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
     <None Include="describe.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Avalonia.Headless.XUnit" Version="12.1.4" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Headless.XUnit" Version="12.2.0" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.2.0" />
+    <!-- xunit.v3 4 pulls Microsoft.Testing.Platform 2, which fails dotnet test on the .NET 10 SDK here -->
     <PackageReference Include="xunit.v3" Version="3.2.2" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Gui/Gui.fsproj" />
