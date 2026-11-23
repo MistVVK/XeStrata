@@ -630,8 +630,8 @@ if(STRATA_ENABLE_XE)
   if(STRATA_GRAMMAR)
     include(FetchContent)
     FetchContent_Populate(strata_xgrammar QUIET
-      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.8.tar.gz
-      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be
+      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.9.tar.gz
+      URL_HASH SHA256=a653eb2b372d4efe1ed6677b0f2be61b7606196052cc88f4c77ae0ca48f307fb
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-subbuild)
     FetchContent_Populate(strata_dlpack QUIET
