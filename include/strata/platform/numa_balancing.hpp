@@ -73,7 +73,13 @@ inline int thread_count() {
 inline long read_balancing() {
     long v = -1;
     if (std::FILE* f = std::fopen("/proc/sys/kernel/numa_balancing", "r")) {
-        if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+        char line[32] = {};
+        if (std::fgets(line, sizeof line, f) != nullptr) {
+            char* end = nullptr;
+            errno = 0;
+            const long n = std::strtol(line, &end, 10);
+            if (end != line && errno == 0) v = n;
+        }
         std::fclose(f);
     }
     return v;
