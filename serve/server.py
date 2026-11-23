@@ -4627,6 +4627,10 @@ class Service:
         self.draining = False                            # 台帳 0589: the stop closed admission
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP ("answer_room": false: off)
+        # upstream d353539037 (#6536), opt-in here (it changes the answers' default; OUT, 2026-11-23): with the MTP
+        # drafts on, a request that names no sampling stays greedy instead of taking the model card's
+        # ("mtp_greedy": true)
+        self.mtp_greedy = False
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends in it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction rendered with its own tools
         self.codex_thread_titles = False              # #923 (opt-in): Codex's thread-title turns without the engine
@@ -6166,9 +6170,10 @@ class Service:
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking,
-                                          greedy=asks_greedy(sampling, self.shared, self.sampling_defaults)),
-                    **self.sampling_defaults, **self.shared}
+        card = {} if self.mtp_greedy and not request_asks_sampling(sampling, self.shared, self.sampling_defaults) else \
+            model_card_sampling(self.model_arch, thinking,
+                                greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
+        defaults = {**card, **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -10211,9 +10216,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True,
-                                              greedy=asks_greedy(svc.shared, svc.sampling_defaults)),
-                        **svc.sampling_defaults, **svc.shared}
+            card = {} if svc.mtp_greedy and not request_asks_sampling(svc.shared, svc.sampling_defaults) else \
+                model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
+            defaults = {**card, **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -12290,6 +12295,15 @@ def model_card_sampling(arch, thinking, greedy: bool = False) -> dict:
     return card
 
 
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                 "repetition_penalty")
+
+
+def request_asks_sampling(*layers) -> bool:
+    """A layer (request, shared settings, config) names any sampling or penalty setting (upstream d353539037)."""
+    return any(isinstance(layer, dict) and any(layer.get(k) is not None for k in SAMPLING_KEYS) for layer in layers)
+
+
 def asks_greedy(*layers) -> bool:
     """The first layer that sets a temperature (request, shared settings, config) says 0: greedy was asked for."""
     for layer in layers:
@@ -12580,6 +12594,7 @@ def _main() -> int:
     if a.engine == "xestrata":                          # the model card's sampling when nothing else is said
         svc.model_arch = card_family(cfg)
     svc.answer_room = cfg.get("answer_room") is not False
+    svc.mtp_greedy = cfg.get("mtp_greedy") is True and "--mtp" in eargs   # opt-in, off by default
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         # the default image model ("images") and the others a request can name ("image_models")

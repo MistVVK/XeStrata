@@ -53,6 +53,7 @@ class ModelCardSampling(unittest.TestCase):
 
     def tearDown(self):
         self.svc.model_arch = None
+        self.svc.mtp_greedy = False
 
     def keys(self, **body):
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, **body}
@@ -69,6 +70,17 @@ class ModelCardSampling(unittest.TestCase):
         self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
         self.assertEqual(model_card_sampling(None, True), {})
         self.assertEqual(model_card_sampling("unknown", False), {})
+
+    def test_mtp_greedy_opt_in(self):
+        # "mtp_greedy": true (upstream d353539037, opt-in here): a request naming no sampling stays greedy; one that
+        # names any keeps the card for the rest, as without it
+        self.svc.mtp_greedy = True
+        self.assertNotIn("temperature=1.0", self.keys())
+        k = self.keys(top_p=0.9)
+        self.assertIn("temperature=1.0", k)
+        self.assertIn("top_p=0.9", k)
+        self.svc.sampling_defaults = {"temperature": 0.6}
+        self.assertIn("temperature=0.6", self.keys())
 
     def test_thinking_default(self):
         k = self.keys()
