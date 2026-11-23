@@ -14,6 +14,9 @@
 #define NOMINMAX
 #include <fcntl.h>
 #include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <cerrno>

@@ -23,6 +23,9 @@
 #endif
 #if STRATA_CUTLASS || STRATA_HIP_KITCHEN
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
