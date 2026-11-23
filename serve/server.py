@@ -5945,7 +5945,7 @@ class Service:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
                                       f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
-                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"context, fewer than the {floor} an answer needs; XeStrata never truncates "
                                       f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
                                       prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:

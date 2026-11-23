@@ -484,7 +484,7 @@ class McpServer:
                     # start is tried again at most every 10 s, so a broken command does not run on every call
                     if self.status == "failed" and time.monotonic() - self.last_start < 10:
                         raise McpError(f"the server is not running ({self.error or 'it stopped'})")
-                    print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
+                    print(f"[xestrata] MCP server {self.name!r} had stopped; starting it again", flush=True)
                     if not self._start():
                         raise McpError(f"the server could not be started again: {self.error}")
                 t = self.transport
