@@ -173,6 +173,9 @@ int usage(int rc) {
                  "  --vision FILE.strata       Inkling-2-Mini-Vision's shard (pictures)\n"
                  "  --vram-reserve-mib N       VRAM to leave free beside the experts (the engine's room by default)\n"
                  "  --vram-experts-gb G        the experts' VRAM outright\n"
+                 "  --qsa-indexer FILE         the QSA indexer (QSAW v1): long prompts attend to the blocks it picks\n"
+                 "  --qsa on|off               whether a request without its own qsa= key uses it (off)\n"
+                 "  --qsa-budget N --qsa-local N --qsa-sink N   the tokens it keeps (2048, 256, 16)\n"
                  "  --info                     the model's shape, nothing loaded\n"
                  "  --selfcheck [--verify-hash] one token's logits finite (and the file's SHA-256)\n",
                  kWho);
@@ -240,13 +243,34 @@ int inkling_main(int argc, char** argv) {
             }
             cfg.bopts.enable_dspark = cfg.draft_mode != "off";
         }
+        else if (a == "--qsa-indexer") cfg.bopts.qsa_path = next();
+        else if (a == "--qsa") {
+            const std::string v = next();
+            if (v != "on" && v != "off") {
+                std::fprintf(stderr, "%s: --qsa takes on or off\n", kWho);
+                return 2;
+            }
+            cfg.bopts.qsa_default = v == "on";
+        }
+        else if (a == "--qsa-budget") cfg.bopts.qsa_budget = (int) num(64, 1 << 20);
+        else if (a == "--qsa-local") cfg.bopts.qsa_local = (int) num(0, 1 << 20);
+        else if (a == "--qsa-sink") cfg.bopts.qsa_sink = (int) num(0, 1 << 20);
         else if (a == "--help" || a == "-h") return usage(0);
         else {
             std::fprintf(stderr, "%s: unknown option %s (Inkling-2-Mini's engine takes these:)\n", kWho, a.c_str());
             return usage(2);
         }
     }
+    if (cfg.bopts.qsa_default && cfg.bopts.qsa_path.empty()) {
+        std::fprintf(stderr, "%s: --qsa on needs --qsa-indexer\n", kWho);
+        return 2;
+    }
     std::string err;
+    if (!qsa_geometry_ok(cfg.bopts, err)) {
+        std::fprintf(stderr, "%s: %s\n", kWho, err.c_str());
+        return 2;
+    }
+
     const double t0 = now_s();
     InkModelFile mf;
     if (!mf.open(native, err, /*keep_tokenizer=*/false)) {
@@ -295,6 +319,7 @@ int inkling_main(int argc, char** argv) {
             return 1;
         }
     }
+    backend->set_slot_qsa(0, cfg.bopts.qsa_default);
     return cmd_generate(mf, *backend, cfg, ids, max_new, so, stop_eos, dump.get(), now_s() - t0);
 }
 

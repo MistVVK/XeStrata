@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ink_sy_common.h"
+#include "strata/kernels/qsa.hpp"
 
 namespace ink_sycl {
 
@@ -251,7 +252,11 @@ inline void k_relpos_sink_gqa_sg16(
     const float* q_buf, const float* r_buf, const float* rel_proj_pad, const float* sinks_buf,
     const float* gate_buf, const half* k_cache, const half* v_cache,
     const int* slot_ids, const int* pos_buf, float* attn_out,
-    int M, int is_swa, int swa_win, int rel_extent, int kv_stride) {
+    int M, int is_swa, int swa_win, int rel_extent, int kv_stride,
+    const int32_t* sel_ids = nullptr, const int32_t* sel_steps = nullptr, const uint8_t* sel_use = nullptr,
+    int sel_cap = 0) {
+    // sel_ids (a full-attention visit with the QSA indexer, ink_sy_qsa.h): a query with sel_use[m] attends to the
+    // cells sel_ids[m][0, width) (ascending positions; width = sel_steps[m][kStepWidth]) instead of 0..qpos
     const float scale = 1.0f / std::sqrt((float)INK_HD);
     Q().submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh_m(8, h);
@@ -273,15 +278,19 @@ inline void k_relpos_sink_gqa_sg16(
             const float* qp = q_buf + ((size_t)m * INK_NH + head) * INK_HD + lane * 8;
             for (int u = 0; u < 8; ++u) { qv[u] = qp[u] * scale; o_acc[u] = 0.0f; }
 
-            const int k_start = is_swa ? sycl::max(0, qpos - swa_win + 1) : 0;
-            const int k_end = qpos + 1;
+            const bool sel = sel_ids != nullptr && sel_use[m] != 0;
+            const int32_t* ids = sel ? sel_ids + (size_t)m * sel_cap : nullptr;
+            const int k_start = sel ? 0 : is_swa ? sycl::max(0, qpos - swa_win + 1) : 0;
+            const int k_end = sel ? sel_steps[(size_t)m * strata::kernels::kStepCount + strata::kernels::kStepWidth]
+                                  : qpos + 1;
             float m_max = (sg == 0) ? sinks_buf[(size_t)m * INK_NH + head] : -1e30f;
             float l_sum = (sg == 0) ? 1.0f : 0.0f;
             const size_t slot_base = (size_t)slot * kv_stride;
 
             // every logical sub-group takes the same number of steps (both halves of a 32-wide one reach the sums)
             for (int k0 = k_start; k0 < k_end; k0 += 8) {
-                const int k = sycl::min(k0 + sg, k_end - 1);
+                const int kk = sycl::min(k0 + sg, k_end - 1);   // a position, or with sel an index into ids
+                const int k = sel ? ids[kk] : kk;
                 const bool live = k0 + sg < k_end;
                 const int kidx = is_swa ? (k & 1023) : k;
                 const size_t kv_off = ((slot_base + kidx) * INK_NKV + kh) * INK_HD + lane * 8;

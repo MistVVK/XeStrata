@@ -29,7 +29,28 @@ struct BackendOpts {
     bool kv_dtype_auto = true;   // auto selects FP8_E4M3 when parallel >= 16 on <= 32 GiB GPU
     bool enable_dspark = true;
     std::string vision_path;
+    // The QSA indexer (QSAW v1, sycl/ink_sy_qsa.h): loaded where a path is given; a slot uses it where its request
+    // says so (serve's qsa= key, set_slot_qsa), else `qsa_default`.  The tokens a query keeps: `qsa_budget` in all,
+    // the first `qsa_sink` and the last `qsa_local` of them always (multiples of the indexer's 4-token block).
+    std::string qsa_path;
+    bool qsa_default = false;
+    int qsa_budget = 2048;
+    int qsa_local = 256;
+    int qsa_sink = 16;
 };
+
+/// Whether the QSA settings are whole blocks and leave the indexer room to choose (`err` says which is not).
+inline bool qsa_geometry_ok(const BackendOpts& o, std::string& err) {
+    if (o.qsa_budget % 4 || o.qsa_local % 4 || o.qsa_sink % 4) {
+        err = "--qsa-budget, --qsa-local and --qsa-sink take multiples of 4 (the indexer's block)";
+        return false;
+    }
+    if (o.qsa_sink + o.qsa_local >= o.qsa_budget) {
+        err = "--qsa-budget must exceed --qsa-sink + --qsa-local";
+        return false;
+    }
+    return true;
+}
 
 struct BackendStats {
     size_t vram_experts_loaded = 0;
@@ -102,6 +123,9 @@ public:
         (void)img; (void)out_embeds; (void)err;
         return false;
     }
+
+    // Whether `slot`'s queries attend to the blocks the QSA indexer picks (where one is loaded) or to every cell
+    virtual void set_slot_qsa(int slot, bool on) { (void)slot; (void)on; }
 
     // Verify Section 5 selfcheck / golden ops parity on this backend
     virtual bool selfcheck(std::string& err) = 0;

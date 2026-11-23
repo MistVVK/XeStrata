@@ -165,6 +165,7 @@ struct ParsedGen {
     std::vector<std::string> images;
     bool prefill_only = false;
     bool slot_read = false;
+    int qsa = -1;         // qsa=0|1: this request's queries through the QSA indexer; -1: the engine's --qsa
 };
 
 inline bool parse_id_list(const std::string& s, std::vector<int32_t>& out, std::string& err) {
@@ -236,6 +237,7 @@ inline bool parse_gen_cmd(const std::string& line, ParsedGen& r, std::string& er
         else if (key == "prefill") r.prefill_only = (d != 0.0);
         else if (key == "slot_read") r.slot_read = (d != 0.0);
         else if (key == "image") r.images.push_back(pct_decode(val));
+        else if (key == "qsa") r.qsa = (d != 0.0) ? 1 : 0;
         else if (key == "hold") {
             size_t col = val.find(':');
             if (col != std::string::npos) {
@@ -382,10 +384,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
 
-    proto("INFO engine=xestrata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
+    proto("INFO engine=xestrata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d qsa=%d",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
           P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
-          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
+          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots,
+          cfg.bopts.qsa_path.empty() ? 0 : 1);
     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
     std::vector<ActiveReq> reqs(P);
@@ -430,6 +433,12 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.cancelled = false;
         rq.admitted = false;
         rq.slot_read = pg.slot_read;
+        if (pg.qsa == 1 && cfg.bopts.qsa_path.empty()) {
+            err = "qsa=1: the engine started without --qsa-indexer";
+            rq.active = false;
+            return false;
+        }
+        backend.set_slot_qsa(rq.slot, pg.qsa < 0 ? cfg.bopts.qsa_default : pg.qsa == 1);
         rq.drafts_offered = 0;
         rq.drafts_accepted = 0;
         rq.t_start = now_s();

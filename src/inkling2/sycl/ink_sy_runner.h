@@ -23,6 +23,7 @@
 #include "ink_sy_dspark.h"
 #include "ink_sy_hybrid.h"
 #include "ink_sy_ops.h"
+#include "ink_sy_qsa.h"
 #include "ink_sy_vision.h"
 
 namespace ink_sycl {
@@ -141,11 +142,13 @@ struct InkSyRunner {
 
     InkSyVision vis;
     InkSyHybridEngine hybrid;
+    InkSyQsa qsa;
 
     ~InkSyRunner() { release(); }
 
     void release() {
         hybrid.release();
+        qsa.release();
         for (auto* p : kv_k) dfree(p);
         for (auto* p : kv_v) dfree(p);
         for (auto* p : sc_hist_k) dfree(p);
@@ -397,6 +400,7 @@ struct InkSyRunner {
             last_ver_m = M;
         }
 
+        if (qsa.loaded) qsa.plan(slot_ids, positions, M);
         h2d(b_tok_ids, tok_ids, (size_t)M * 4);
         h2d(b_slot_ids, slot_ids, (size_t)M * 4);
         h2d(b_pos, positions, (size_t)M * 4);
@@ -522,11 +526,19 @@ struct InkSyRunner {
             k_kv_norm_store_f16_sg16(b_k, b_v, kv_k[visit], kv_v[visit],
                                      b_slot_ids, b_pos, M, is_swa ? 1 : 0, visit_kv_stride[visit]);
 
+            // The QSA indexer's keys and, where a query's context passes its budget, its selection (ink_sy_qsa.h)
+            const int qf = (qsa.loaded && !is_swa) ? qsa.fidx_of_visit[(size_t)visit] : -1;
+            const bool qsel = qf >= 0 && qsa.any_sparse;
+            if (qf >= 0) qsa.keys(qf, in_k, M);
+            if (qsel) qsa.select(qf, in_q, M);
+
             // Fused RelPos + Sink 24:8 GQA Flash Attention + sigmoid(gate_attn)
             k_relpos_sink_gqa_sg16(b_q, b_r, mod->rel_proj_pad_dev + (size_t)ip * 16 * 1025,
                                    b_sinks, b_gate_attn, kv_k[visit], kv_v[visit],
                                    b_slot_ids, b_pos, b_attn_out, M, is_swa ? 1 : 0,
-                                   c.swa_win, c.rel_extent, visit_kv_stride[visit]);
+                                   c.swa_win, c.rel_extent, visit_kv_stride[visit],
+                                   qsel ? qsa.ids : nullptr, qsel ? qsa.steps : nullptr, qsel ? qsa.use : nullptr,
+                                   qsa.cap);
             if (visit == 0) {
                 dbg_buf("v0_q", b_q, 3072); dbg_buf("v0_k", b_k, 1024); dbg_buf("v0_v", b_v, 1024);
                 dbg_buf("v0_sinks", b_sinks, 24); dbg_buf("v0_attn", b_attn_out, 3072);

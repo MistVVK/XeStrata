@@ -69,7 +69,12 @@ public:
         const size_t act_est = (size_t)batch_cap * 512ull * 1024ull + (128ull << 20);
         const size_t vis_est = !opts.vision_path.empty() ? (700ull << 20) : 0ull;
         const size_t hyb_xmx_est = (320ull << 20);  // Elastic VRAM cache ring (<=256 MiB) + XMX scratch (~32 MiB) + ping-pong
-        const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est;
+        // the QSA indexer (ink_sy_qsa.h): its weights, the slots' block keys and tails, the batch's scores and ids
+        const size_t qsa_blocks = (size_t)ctx / 4 + 1;
+        const size_t qsa_est = opts.qsa_path.empty() ? 0ull
+            : (24ull << 20) + (size_t)par * 8ull * (qsa_blocks * 128ull + 4ull * (size_t)mc.hidden) * 4ull +
+              (size_t)batch_cap * (qsa_blocks + (size_t)opts.qsa_budget + 4ull + 3ull * (size_t)mc.hidden) * 4ull;
+        const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est + qsa_est;
         if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve, opts.vram_reserve_mib)) return false;
         if (!runner_.init(mod_, par, ctx, batch_cap, opts.enable_dspark, err)) {
             return false;
@@ -77,6 +82,15 @@ public:
         if (!opts.vision_path.empty()) {
             if (!runner_.vis.load(opts.vision_path, err)) return false;
         }
+        if (!opts.qsa_path.empty() &&
+            !runner_.qsa.load(opts.qsa_path, mc.n_visits, mc.hidden, opts.qsa_budget, opts.qsa_local, opts.qsa_sink, par,
+                              ctx, runner_.max_batch, err))
+            return false;
+        for (int v = 0; v < mc.n_visits && runner_.qsa.loaded; ++v)
+            if (runner_.qsa.fidx_of_visit[(size_t)v] >= 0 && mc.is_swa[(size_t)mc.visit_to_phys[(size_t)v]]) {
+                err = opts.qsa_path + ": its visit " + std::to_string(v) + " is a sliding-window visit of this model";
+                return false;
+            }
         slot_used_.assign((size_t)par, 0);
         return true;
     }
@@ -97,6 +111,9 @@ public:
     }
 
     void reset_slot(int slot) override { runner_.reset_slot(slot); }
+    void set_slot_qsa(int slot, bool on) override {
+        if (runner_.qsa.loaded && slot >= 0 && slot < runner_.max_slots) runner_.qsa.slot_on[(size_t)slot] = on ? 1 : 0;
+    }
     void snapshot_slot(int slot) override { runner_.snapshot_slot(slot); }
     void rollback_slot(int slot, int keep_len) override { runner_.rollback_slot(slot, keep_len); }
 
