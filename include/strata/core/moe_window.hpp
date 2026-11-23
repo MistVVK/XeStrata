@@ -156,13 +156,16 @@ public:
     // ---- the host, around one launch of the caller's graph
     /// Before the launch: the rings and flags back to 0.
     void reset();
+    /// Right after launching the caller's graph: marks the queue's tail so `wait_ring` reads a device loss as Failed
+    /// instead of a queue that is still working (issue #78).  Call again after each segment launch.
+    bool mark_done(strata::gpu::Stream cs, std::string& err);
     /// After the launch: answers `rings` rings in order, ring r being MoE layer layers[r - 1] for token group
     /// grps[r - 1] of `groups` (tokens [tb, tb + n) of the group's split).  `cs` is the stream the graph runs on.
     bool serve(int64_t rings, const int64_t* layers, const int* grps, int groups, const int* tbs, const int* ns,
                MoePoolFn pool, void* user, strata::gpu::Stream cs, std::string& err);
     /// What serve does a ring, for a caller with its own loop.  `wait_ring` spins until ring `want` has rung (a
-    /// segment: until the segment that rings it has run), noticing a failed or finished graph and a 20 s stall;
-    /// `who` and `layer` name it in the error.
+    /// segment: until the segment that rings it has run), reading `mark_done`'s event for a failed or finished graph
+    /// and a 20 s stall; without a mark it falls back to the stream's status.  `who` and `layer` name it in the error.
     bool wait_ring(uint32_t want, strata::gpu::Stream cs, const char* who, int64_t layer, std::string& err) const;
     /// Ring `want` answered: the pool's CPU experts and plan for tokens [tb, tb + n) of group `grp` of `groups`, an
     /// empty plan where the pool published none, and the flags raised.
@@ -205,6 +208,8 @@ private:
     strata::gpu::Stream copies_[2] = {nullptr, nullptr};   ///< 0 the normal priority, 1 high
     strata::gpu::Stream copy_ = nullptr;                   ///< copies_[the chosen one] (the stream in use)
     bool copy_used_ = false;               ///< copies queued on copy_ since it was last drained
+    strata::gpu::Event* ev_wait_ = nullptr;  ///< the launched graph's tail, read by wait_ring (init)
+    bool wait_marked_ = false;               ///< mark_done was called since reset
     uint32_t cur_ring_ = 0;
 
     // mapped staging: the host's view (h_) and the device's (m_) of the same bytes

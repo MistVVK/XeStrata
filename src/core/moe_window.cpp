@@ -57,6 +57,7 @@ int64_t plan_ptr_off(int64_t cap) { return ((4 + (cap + 1) + 2 * cap) + 1) & ~1l
 }  // namespace
 
 MoeWindow::~MoeWindow() {
+    if (ev_wait_ != nullptr) strata::gpu::event_destroy(ev_wait_);
     for (strata::gpu::Stream& c : copies_) {
         if (c == nullptr) continue;
         strata::gpu::stream_sync(c);
@@ -418,6 +419,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
                               : core::integrated_gpu(core::Runtime::get().device()) ||
                                     !strata::kernels::doorbell_visible(probe);
     strata::gpu::stream_destroy(probe);
+    if (!strata::gpu::event_create(&ev_wait_)) { err = "moe window: event create failed"; return false; }
     return true;
 }
 
@@ -910,7 +912,17 @@ void MoeWindow::reset() {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    wait_marked_ = false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+bool MoeWindow::mark_done(strata::gpu::Stream cs, std::string& err) {
+    if (!strata::gpu::event_record(ev_wait_, cs)) {
+        err = std::string("moe window: event record failed: ") + strata::gpu::last_error();
+        return false;
+    }
+    wait_marked_ = true;
+    return true;
 }
 
 bool MoeWindow::wait_ring(uint32_t want, strata::gpu::Stream cs, const char* who, int64_t layer,
@@ -929,7 +941,10 @@ bool MoeWindow::wait_ring(uint32_t want, strata::gpu::Stream cs, const char* who
         const auto now = Clock::now();
         if (now - last_flush > std::chrono::microseconds(2000)) {
             last_flush = now;
-            const strata::gpu::Status st = strata::gpu::stream_status(cs);
+            // Issue #78: ext_oneapi_empty cannot report a banned queue, but the event recorded after the launch
+            // carries the device's error.  A caller without a mark keeps the old stream query.
+            const strata::gpu::Status st = wait_marked_ ? strata::gpu::event_status(ev_wait_)
+                                                        : strata::gpu::stream_status(cs);
             if (st == strata::gpu::Status::Failed) {
                 err = std::string(who) + ": layer " + std::to_string(layer) + ": " + strata::gpu::last_error();
                 return false;
@@ -980,6 +995,10 @@ bool MoeWindow::next_segment(uint32_t want, strata::gpu::Graph* next, strata::gp
         err = std::string(who) + ": launch segment: " + strata::gpu::last_error();
         return false;
     }
+    if (!mark_done(cs, err)) {   // the next ring watches this segment, not the one before
+        err = std::string(who) + ": the segment of layer " + std::to_string(layer) + ": " + err;
+        return false;
+    }
     return true;
 }
 
@@ -1020,6 +1039,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, int
     static const bool times = strata::env_get("WINDOW_TIMES") != nullptr;
     static double t_wait = 0.0, t_answer = 0.0, t_tail = 0.0;
     static int64_t n_rings = 0, n_windows = 0;
+    if (!mark_done(cs, err)) return false;
     Clock::time_point last_answer = Clock::now();
     for (int64_t r = 0; r < rings; ++r) {
         const uint32_t want = (uint32_t) (r + 1);
