@@ -4595,9 +4595,9 @@ class Service:
         # "parallel" (the engine's batch slots, #465): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
-        # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
-        self.api_monitor = False
+        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory;
+        # it is on by default, and "api_monitor": false in the config turns it off
+        self.api_monitor = True
         # bounded I/O in memory; no headers or API keys
         self.api_requests: collections.deque[dict] = collections.deque(maxlen=100)
         self.request_trace = threading.local()
@@ -11666,6 +11666,11 @@ def read_config(path) -> dict:
                          'list.') from None
 
 
+def api_monitor_of(cfg: dict, flag: bool) -> bool:
+    """The request monitor is on unless the config says false; --api-monitor still turns it on."""
+    return flag or cfg.get("api_monitor") is not False
+
+
 def lift_reasoning_effort_arg(cfg: dict) -> None:
     """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
     option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
@@ -12191,7 +12196,7 @@ def _main() -> int:
                     help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
-                         "memory (also \"api_monitor\": true in the config; off by default)")
+                         "memory (on by default; \"api_monitor\": false in the config turns it off)")
     ap.add_argument("--debug-chat-log", action="store_true",
                     help="write every chat request's prompt, tool rounds, answer and pictures, and the web page's "
                          "chats, to the state folder's debug-chat-log/ (also \"debug_chat_log\": true in the config "
@@ -12508,7 +12513,7 @@ def _main() -> int:
               if "*" in svc.allowed_hosts
               else f"[xestrata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)",
               flush=True)
-    svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.api_monitor = api_monitor_of(cfg, a.api_monitor)
     if svc.api_monitor:
         print("[xestrata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept "
               "in memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),

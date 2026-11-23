@@ -49,7 +49,8 @@ EDITABLE = [
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
     ("engine_silence_s", "num>=0",
      "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
-    ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+    ("api_monitor", "bool",
+     "Keep the last 100 requests' prompts and answers in memory for /api-monitor (on by default; false turns it off)"),
     ("debug_chat_log", "bool",
      "Debug chat log: write every chat request's prompt, tool rounds, answer and pictures, and the web page's chats, "
      "to the state folder's debug-chat-log/ (off by default)"),

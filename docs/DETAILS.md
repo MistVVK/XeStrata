@@ -1750,9 +1750,9 @@ A language is a file `serve/web/locales/<lang>.json`; the English text lives in 
 
 ### API request monitor
 
-Off by default, since it keeps prompts and answers in memory.
-Turn it on with `"api_monitor": true` in `xestrata-<model>.json` (or `serve/server.py --api-monitor`);
-otherwise nothing is recorded and the endpoints below answer 404.
+On by default: it keeps prompts and answers in memory.
+Set `"api_monitor": false` in `xestrata-<model>.json` to turn it off (`serve/server.py --api-monitor` still turns it on).
+When off, nothing is recorded and the endpoints below answer 404.
 Apart from it, the server keeps in its process memory the text and tokens of its last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they are gone when the server stops.
 
 `/api-monitor` shows the model state, load/unload controls, active and queued requests,
