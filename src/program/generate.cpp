@@ -111,6 +111,7 @@
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa_balancing.hpp"
 #include "strata/platform/io_priority.hpp"
 #include <fcntl.h>
 #include <filesystem>
@@ -2388,6 +2389,13 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(__linux__)
+    // upstream 87c9821bb1 (#4866): keep the kernel's NUMA scanner off the memory the GPU reads, before any thread is made
+    // or anything allocated (include/strata/platform/numa_balancing.hpp: it evicted the GPU queues for minutes per start
+    // on a two-socket host).  Both engines: the plain one runs from this main too.
+    if (const std::string numa = strata::platform::numa_balancing::keep_scanner_off(); !numa.empty())
+        std::fprintf(stderr, "%s\n", numa.c_str());
+#endif
     // upstream b89bf5947: not the low disk priority of the program that started this one (a model read at Low is
     // several times slower).  The plain engine runs from this main too (plain_generate.cpp's plain_main).
     strata::platform::restore_normal_io_priority();
