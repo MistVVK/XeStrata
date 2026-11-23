@@ -191,48 +191,51 @@ class Requirements(unittest.TestCase):
             self.assertIn(p, names)
         for x in lines:
             self.assertIn("==", x, x)
-        self.assertEqual(setup.req_name('numpy==2.5.3; python_version >= "3.12"'), "numpy")
+        self.assertEqual(setup.req_name(next(x for x in lines if x.startswith("numpy=="))), "numpy")
         self.assertEqual(setup.req_name("charset_normalizer==3"), "charset-normalizer")
 
-    def pip(self, stamp, packages, installed=()):
+    def pip(self, stamp, packages, legacy=None, stamp_for=None):
         ran = []
         with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / setup.pip_stamp_path(stamp_for or packages).name
             if stamp is not None:
-                (Path(d) / ".strata-pip.json").write_text(json.dumps(stamp))
+                path.write_text(json.dumps(stamp))
                 # written by this system (#3634's marker): without it the stamp is believed only when
                 # numpy/jinja2/regex/yaml import in the Python running the tests, which made these depend on the box
-                (Path(d) / ".strata-pip.json.os").write_text(setup.sys.platform)
+                path.with_name(path.name + ".os").write_text(setup.sys.platform)
+            old = Path(d) / ".strata-pip.json"
+            if legacy is not None:
+                old.write_text(json.dumps(legacy))
+                old.with_name(old.name + ".os").write_text(setup.sys.platform)
             with mock.patch.object(setup.sys, "prefix", d), \
-                    mock.patch.object(setup, "run", lambda cmd, **kw: ran.append(cmd)), \
-                    mock.patch.object(setup, "_installed", lambda name: name in installed):
+                    mock.patch.object(setup, "run", lambda cmd, **kw: ran.append(cmd)):
                 quiet(setup.pip_install, packages, "the packages")
-            after = json.loads((Path(d) / ".strata-pip.json").read_text()) if ran else stamp
-        return [c for cmd in ran for c in cmd if "==" in c or c in setup.PY_PACKAGES], after
+            after = json.loads(path.read_text()) if path.exists() else stamp
+            old_left = old.exists() or old.with_name(old.name + ".os").exists()
+        return [c for cmd in ran for c in cmd if "==" in c or c in setup.PY_PACKAGES], after, old_left
 
     def test_fresh_install_gets_every_pin(self):
         lines = setup.requirement_lines()
-        ran, stamp = self.pip(None, lines)
+        ran, stamp, _ = self.pip(None, lines)
         self.assertEqual(ran, lines)
         self.assertEqual(sorted(stamp), sorted(lines))
         self.assertEqual(self.pip(stamp, lines)[0], [])                       # the second run: nothing
 
-    def test_an_install_from_before_the_pins_is_left_alone(self):
+    def test_an_install_from_before_the_pins_gets_the_current_pins(self):
         lines = setup.requirement_lines()
         legacy = sorted(setup.PY_PACKAGES) + ["nvidia-cublas==13.0.2.14"]
-        deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama"}
-        # jsonschema came after the pins (json_schema's and strict tools' checks): it and what it takes are installed
-        added = {"jsonschema", "attrs", "jsonschema-specifications", "referencing", "rpds-py", "typing-extensions"}
-        newer = [x for x in lines if setup.req_name(x) in added]
-        self.assertEqual(self.pip(legacy, lines, installed=deps)[0], newer)
-        missing = [p for p in legacy if p != "psutil"]                         # an older list without psutil
-        ran, _ = self.pip(missing, lines, installed=deps)
-        self.assertEqual([x for x in ran if x not in newer], ["psutil==7.2.2"])
+        ran, stamp, old_left = self.pip(None, lines, legacy=legacy)
+        self.assertEqual(ran, lines)
+        self.assertEqual(sorted(stamp), sorted(lines))
+        self.assertFalse(old_left)                                            # the pin-less record is dropped
 
     def test_a_changed_pin_is_installed(self):
         lines = setup.requirement_lines()
         old = [x.replace("tqdm==4.70.1", "tqdm==4.60.0") for x in lines]
-        ran, _ = self.pip(old, lines)
-        self.assertEqual(ran, ["tqdm==4.70.1"])
+        ran, _, _ = self.pip(old, lines, stamp_for=old)
+        self.assertEqual(ran, lines)                                          # the old record names another pin set
+        self.assertIn("tqdm==4.70.1", ran)
+        self.assertEqual(self.pip(lines, lines)[0], [])                       # the new record: nothing
 
 
 if __name__ == "__main__":

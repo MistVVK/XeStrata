@@ -5324,7 +5324,7 @@ def get_llama_cpp():
 
 
 def req_name(line: str) -> str:
-    """The distribution name of a requirement line ("numpy==2.5.3; python_version >= '3.12'" -> "numpy")."""
+    """The distribution name of a requirement line ("numpy==2.5.5; python_version >= '3.12'" -> "numpy")."""
     return re.split(r"[\s<>=!~;\[]", line.strip(), maxsplit=1)[0].lower().replace("_", "-")
 
 
@@ -5352,15 +5352,6 @@ def _marker_met(line: str) -> bool:
     return Marker(line.split(";", 1)[1]).evaluate()
 
 
-def _installed(name: str) -> bool:
-    try:
-        import importlib.metadata as md
-        md.distribution(name)
-        return True
-    except Exception:
-        return False
-
-
 def pip_stamp_is_ours(stamp: Path) -> bool:
     """The list of installed packages was written for this system (upstream fb3bae20c, #3634): a .venv on a disk that
     Windows and Linux both start from keeps the other one's list, which then says "already installed" about packages
@@ -5376,17 +5367,25 @@ def pip_stamp_is_ours(stamp: Path) -> bool:
     return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
 
 
+def pip_stamp_path(packages) -> Path:
+    """The install record for this exact list of requirements.  A changed pin gets a different record, so an
+    existing .venv cannot say "already installed" about the old versions (2026-11-24)."""
+    digest = hashlib.sha256("\n".join(packages).encode("utf-8")).hexdigest()[:16]
+    # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into
+    # the user's site, and the list is kept there
+    root = Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())
+    return root / f".strata-pip-{digest}.json"
+
+
 def pip_install(packages, what):
-    """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
-    requirements recorded bare names: those packages are kept as they are (nothing is reinstalled), and the pinned
-    dependencies it already has count as installed."""
-    # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into the
-    # user's site, and the list is kept there
-    stamp = (Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())) / ".strata-pip.json"
+    """pip install into .venv, skipped when this exact list was installed before.  An install from before the
+    pinned requirements recorded bare names: its old record is dropped so the current pins are installed."""
+    stamp = pip_stamp_path(packages)
+    old = stamp.parent / ".strata-pip.json"
+    for f in (old, old.with_name(old.name + ".os")):
+        f.unlink(missing_ok=True)
     have = json.loads(stamp.read_text()) if stamp.exists() and pip_stamp_is_ours(stamp) else []
-    bare = {p.lower() for p in have if req_name(p) == p.lower()}
-    need = [p for p in packages if p not in have and req_name(p) not in bare
-            and not (bare and "==" in p and _installed(req_name(p)))]
+    need = [p for p in packages if p not in have]
     if not need:
         ok(f"{what} already installed")
         return
