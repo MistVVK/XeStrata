@@ -1164,12 +1164,14 @@ def _close_verdict(after: str, final: bool) -> str:
     return "hold"
 
 
-def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
+              split_repeats: bool = False) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
     `<parameter=` or `</function>`, or by the wrapper's `</tool_call>` when the call's `</function>` was left out
     (#4427) - the same text inside a value (a file that documents the call format, #210) is part of the value.
     #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than `</function>` before it), or one
-    followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.  -1: none yet;
+    followed by the same parameter `name` again, is part of the value too, unless `split_repeats` (台帳 0863:
+    a non-string parameter written twice is two writes, later wins).  `text` starts at the value.  -1: none yet;
     -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
@@ -1179,7 +1181,7 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                 gt = after.find(">")
                 if gt < 0:
                     return at if final else -2
-                if name is None or after[len(PARAM_START):gt].strip() != name:
+                if split_repeats or name is None or after[len(PARAM_START):gt].strip() != name:
                     return at
             elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
                 verdict = _close_verdict(after, final) if hold else "end"   # hold=False: a bare call keeps its old rule
@@ -1706,6 +1708,25 @@ def param_value(text: str, schema, root=None, notes: list | None = None):
     return value
 
 
+_SKIP = object()          # 台帳 0863: a parameter the model left out; it must not be sent as a written placeholder
+
+
+def _nonstring_type(schema, root=None) -> bool:
+    """Whether the declaration says the parameter is not a string (台帳 0863).  An unknown type keeps the old rule."""
+    types, _ = _schema_hints(schema, root)
+    return types is not None and "string" not in types
+
+
+def _argument_value(text: str, schema, root=None, notes: list | None = None):
+    """A parameter written in a call -> its value, or _SKIP for an empty/null placeholder where no string is allowed
+    (upstream 8426249f01, 台帳 0863).  A declaration that allows null gives null; otherwise the parameter is left out."""
+    types, _ = _schema_hints(schema, root)
+    s = text.strip()
+    if types is not None and "string" not in types and (not s or s.lower() in ("null", "none")):
+        return None if "null" in types else _SKIP
+    return param_value(text, schema, root, notes)
+
+
 def _properties(schema) -> dict:
     """A tool's parameters' properties, {} where the schema has none or is not an object (a boolean schema)."""
     params = schema.get("parameters") if isinstance(schema, dict) else None
@@ -1729,14 +1750,18 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        declared = props.get(pname)
+        # 台帳 0863: two writes of a non-string parameter are the same parameter; a later write wins.
+        end = param_end(rest, final=True, name=pname.strip(), split_repeats=_nonstring_type(declared, root))
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = param_value(value, props.get(pname), root, notes)
+        v = _argument_value(value, declared, root, notes)
+        if v is not _SKIP:
+            args[pname] = v
     return ToolCall(name=name, arguments=args)
 
 
@@ -2199,6 +2224,8 @@ class OutputParser:
         self.sprops = {}             # the streamed call's parameters' schemas
         self.sroot = None            # their reference resolution root (the full parameters schema)
         self.spname = ""             # the parameter being streamed
+        self.sraw_pname = ""         # its unstripped name (台帳 0863)
+        self.sheld: dict = {}        # non-string parameters, sent once at the call's end; a later write wins
         self.svstart = 0             # where its string value starts in self.buf (#4078)
 
     def _wrapped_call_end(self) -> int:
@@ -2250,13 +2277,17 @@ class OutputParser:
                     if b < 0:
                         return out
                     pname = self.spname = stripped[11:b]
-                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
-                    self.sfirst = False
+                    self.sraw_pname = pname
                     self.sp += b + 1
+                    held = _nonstring_type(self.sprops.get(pname), self.sroot)
+                    if not held:
+                        args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                        self.sfirst = False
                     if _text_only(self.sprops.get(pname), self.sroot):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
+                        # 台帳 0863: a declared non-string is held until the call closes, so a later write wins
                         self.ss = "raw"
                 elif stripped.startswith("</function>"):
                     self.sp += len("</function>")
@@ -2298,7 +2329,9 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, self._final, name=self.spname.strip())
+                declared = self.sprops.get(self.spname)
+                end = param_end(rest, self._final, name=self.spname.strip(),
+                                split_repeats=_nonstring_type(declared, self.sroot))
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -2306,7 +2339,13 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                args(json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False))
+                v = _argument_value(value, declared, self.sroot)
+                if self.sheld is not None and _nonstring_type(declared, self.sroot):
+                    if v is not _SKIP:
+                        self.sheld.pop(self.sraw_pname, None)
+                        self.sheld[self.sraw_pname] = v
+                elif v is not _SKIP:
+                    args(json.dumps(v, ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -2321,7 +2360,18 @@ class OutputParser:
         if self.ss == "str":
             tail += '"'
         elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
+            declared = self.sprops.get(self.spname)
+            v = _argument_value(self.buf[self.sp:].strip("\n"), declared, self.sroot)
+            if _nonstring_type(declared, self.sroot):
+                if v is not _SKIP:
+                    self.sheld.pop(self.sraw_pname, None)
+                    self.sheld[self.sraw_pname] = v
+            elif v is not _SKIP:
+                tail += json.dumps(v, ensure_ascii=False)
+        for k, v in self.sheld.items():
+            tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+            self.sfirst = False
+        self.sheld = {}
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
@@ -2752,7 +2802,19 @@ class OutputParser:
                     tail = json.dumps(rest)[1:-1] + '"'
                 else:
                     value = rest[1:] if rest.startswith("\n") else rest
-                    tail = json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False)
+                    declared = self.sprops.get(self.spname)
+                    v = _argument_value(value, declared, self.sroot)
+                    if _nonstring_type(declared, self.sroot):
+                        if v is not _SKIP:
+                            self.sheld.pop(self.sraw_pname, None)
+                            self.sheld[self.sraw_pname] = v
+                        tail = ""
+                    else:
+                        tail = json.dumps(v, ensure_ascii=False) if v is not _SKIP else ""
+                for k, v in self.sheld.items():
+                    tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+                    self.sfirst = False
+                self.sheld = {}
                 out.append(Event("tool_args", tail + "}", call=self.scall))
                 self.ss = "done"
                 call = self.scall
