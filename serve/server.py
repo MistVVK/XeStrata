@@ -384,6 +384,10 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class EngineClosing(RuntimeError):
+    """台帳 0589/0673（upstream 3cf22f5ef1/b1cdaa3899）: 停止中に届いた要求。受け付けず 503 server_draining。"""
+
+
 class EngineStarting(RuntimeError):
     """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
     not a 400 about the prompt."""
@@ -4548,6 +4552,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.fit_max_tokens = fit_max_tokens
+        self.draining = False                            # 台帳 0589: the stop closed admission
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP ("answer_room": false: off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends in it
@@ -5812,10 +5817,16 @@ class Service:
             ids = out
         return messages, ids, encoded_ids, encoded
 
+    def begin_drain(self):
+        """Close admission at the start of a stop (台帳 0589): new requests get 503 server_draining."""
+        self.draining = True
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if getattr(self, "draining", False):
+            raise EngineClosing("the server is stopping; retry against another instance")
         self.embeddings.path = None
         self.embeddings.keys = None
         messages, ids, encoded_ids, encoded = self.prompt_ids(messages, tools, kwargs, force, cancel)
@@ -9226,6 +9237,9 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
                                                "type": "invalid_request_error"}})
+            except EngineClosing as e:                      # 台帳 0589: a request that arrived during the stop
+                self._json(503, {"error": {"type": "server_error", "code": "server_draining", "message": str(e)}},
+                           headers={"Retry-After": 1})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[xestrata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -12732,6 +12746,7 @@ def _main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[xestrata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        svc.begin_drain()                   # 台帳 0589: refuse new requests while the engine is closing
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
