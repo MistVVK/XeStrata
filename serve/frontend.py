@@ -1147,7 +1147,17 @@ def _close_verdict(after: str, final: bool) -> str:
         tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
         if not final and CALL_END.startswith(tail):
             return "hold"                                  # #5040: `</tool_call>` is still arriving
-        return "end"                                       # the call is cut, or it has no wrapper: as before
+        # 台帳 carryover 404b5f45f: `</parameter>` の直後に `</function>` だけがある場合も、
+        # 同じ呼び出しの後にも closing tag が続くなら値の一部として扱う（XML のファイルなど）。
+        if not after.startswith(FUNC_END) or tail.startswith((CALL_START, FUNC_START)):
+            return "end"
+        if not final and (CALL_START.startswith(tail) or FUNC_START.startswith(tail)):
+            return "hold"
+        if PARAM_END in tail or FUNC_END in tail or CALL_END in tail:
+            return "continue"
+        if final or len(tail) > CLOSE_LOOKAHEAD_CHARS:
+            return "end"
+        return "hold"
     rest = after[m.end():].lstrip()
     if not rest:
         return "end" if final else "hold"                  # the usual call: the turn ends right after it
@@ -2130,10 +2140,10 @@ class OutputParser:
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
-                elif not s:
-                    self.ticks = 0
                 else:
-                    self.ticks += line.count("`")
+                    # 台帳 carryover db0c38425（#4923）: inline code は行をまたいで続かない。
+                    # 1 行の孤立した backtick で、その後の tool call が全部引用扱いになる事故を防ぐ。
+                    self.ticks = 0
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line
                 # that is not indented
                 if was_fenced or self.fence:
