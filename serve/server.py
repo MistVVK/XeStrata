@@ -11145,7 +11145,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
-                                getattr(svc.template, "call_form", "qwen"))
+                                getattr(svc.template, "call_form", "qwen"), callable_tools)
             messages, validator = anthropic_prepare_format(req, messages, tools)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
