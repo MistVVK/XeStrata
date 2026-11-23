@@ -5,6 +5,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/core/kv_host_dma.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -3172,6 +3173,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
+                    // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                    // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                    const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -3186,7 +3190,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                            hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                            sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                            sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                        const bool mirror = st.host.present();
+                        const bool mirror = st.host.present() && !host_by_dma;
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
                                   staged ? &sk : nullptr);
@@ -3199,12 +3203,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          &st.host, staged ? &m.stage : nullptr);
+                                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      &st.host, staged ? &m.stage : nullptr);
+                                      host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                     }
+                    if (host_by_dma)
+                        strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                            p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     if (!kva_state_only) {   // KVA: a state-only layer has no queries
                         split_q(m.Qf, m.q, T, m.cs);
                         kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
@@ -5673,6 +5680,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                EPS, cs);
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         const bool staged = st.kv_mode == 1;
+                        // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                        // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                        const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                         if (staged) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -5686,7 +5696,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                                sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                                sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                            const bool mirror = st.host.present();
+                            const bool mirror = st.host.present() && !host_by_dma;
                             kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                       st.k_q, st.k_q, st.k_scale, st.k_scale, cs, mirror ? &hk : nullptr,
                                       staged ? &sk : nullptr);
@@ -5699,12 +5709,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             }
                             if (st.kv_q4)
                                 strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, cs,
-                                                              &st.host, staged ? &m.stage : nullptr);
+                                                              host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                             else
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,
-                                          &st.host, staged ? &m.stage : nullptr);
+                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         }
+                        if (host_by_dma)
+                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                                p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, cs);
                         split_q(m.Qf, m.q, T, cs);
                         kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
                                                EPS, cs);

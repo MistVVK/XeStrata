@@ -280,6 +280,16 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     if (!stream) core::Runtime::get().finish(queue);
 }
 
+void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
+                        const QsaShapes& s, void* stream) {
+    if (b1 <= b0) return;
+    const Runs r = runs_of(stage, host, fmt, s);   // src: the host copy, dst: the staging pool (identity layout both)
+    auto& queue = queue_for(stream);
+    for (int a = 0; a < r.n; ++a)
+        queue.memcpy((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]));
+    if (!stream) core::Runtime::get().finish(queue);
+}
+
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;

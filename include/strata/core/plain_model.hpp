@@ -1223,9 +1223,11 @@ private:
     bool alloc_kv(KvPtrs& p, size_t cells, bool vmm = false);
     /// `n` cells' K and V (n rows of n_head_kv x head_dim, rotated as the format keeps them) at steps[t * kStepCount]
     /// into session `slot`'s pools of attention block a; a streamed layer also writes its host copy, and `stage` (the
-    /// prompt path's staging pool) when given
+    /// prompt path's staging pool) when given; `host_by_dma`: the host copy is left to the caller's DMA from `stage`
+    /// (core/kv_host_dma.hpp)
     void kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr);
+                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr,
+                         bool host_by_dma = false);
     bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;

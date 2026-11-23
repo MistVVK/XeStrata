@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/program/split_rules.hpp - rules for the automatic layer split that do not need a GPU to check.
 //
 // A stage that owns one or two layers holds a handful of expert slots (a 12 GB 3060 with one layer held 512), and
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::program::split_rules {
@@ -136,6 +138,17 @@ inline size_t pick_with_headroom(const std::vector<Placement>& c, double tol) {
 // below that the probe's noise and the formula's fit are the larger effects.
 
 constexpr double kLinkScaleMin = 4.0;
+
+/// XESTRATA_SPLIT_LINK_MIN (opt-in, upstream becf4a3d9a): the gap (the fastest stage's link / this stage's) from which the
+/// miss term is scaled; unset, empty or anything that is not a number >= 1 keeps kLinkScaleMin.  Upstream's 2x RTX 5090 on
+/// a PCIe 4.0 x8 + x2 board (14.1 and 3.6 GB/s probed, a gap of 3.92): auto K=24 read a 4K prompt in 5,950 ms against
+/// 4,270 on the x8 card alone; with the gap read as 3 the split puts fewer layers on the x2 card.
+inline double link_scale_min_resolve(const char* env) {
+    if (env == nullptr || env[0] == '\0') return kLinkScaleMin;
+    char* end = nullptr;
+    const double v = std::strtod(env, &end);
+    return end != env && v >= 1.0 ? v : kLinkScaleMin;
+}
 
 /// Per stage: the factor on its miss term, from the probed H2D GB/s of each stage (<= 0: not probed -> 1.0).
 inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, double min_ratio = kLinkScaleMin) {

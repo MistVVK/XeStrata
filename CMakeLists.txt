@@ -273,6 +273,10 @@ endif()
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE strata_platform)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
+# the opt-out from the kernel's automatic NUMA balancing (upstream 87c9821bb1): header-only, no GPU
+add_executable(numa_balancing_test src/platform/numa_balancing_test.cpp)
+target_include_directories(numa_balancing_test PRIVATE include)
+add_test(NAME numa_balancing_test COMMAND numa_balancing_test)
 set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # ulimit -l below the region
 
 # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.

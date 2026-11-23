@@ -980,7 +980,9 @@ bool PlainModel::split_auto_role(std::string& err) {
         side_ms[(size_t) d] = link_gbps[(size_t) d] > 0.0 && copy_ms >= 0.0
                                   ? copy_ms + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
     }
-    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+    // XESTRATA_SPLIT_LINK_MIN=r (opt-in, upstream becf4a3d9a): the gap from which the scale applies, 4 unless set
+    const std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(
+        link_gbps, strata::program::split_rules::link_scale_min_resolve(strata::env_get("SPLIT_LINK_MIN")));
     std::vector<int> order((size_t) n);
     for (int d = 0; d < n; ++d) order[(size_t) d] = d;
     auto capacity = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
@@ -2437,6 +2439,25 @@ bool PlainModel::open_experts(std::string& err) {
     if (!prompt_dev_.at.empty())
         std::fprintf(stderr, "xestrata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
                      (long long) prompt_dev_T_);
+    // upstream 3220dbc0e0, a5104df5bf (as generate.cpp's): the processor's own graphics (its memory is the system RAM)
+    // with every expert in its tier: the model file's cached pages are a second copy of the tier's bytes in the same
+    // RAM, and are given back; the experts of the slots the prompt path lends keep theirs (their refill reads them).
+    // No output bit changes.  XESTRATA_UMA_DROP_PAGES=0 keeps the pages.
+    if (auto* file = dynamic_cast<FileExpertSource*>(src_own_.get());
+        file != nullptr && tier_whole_ && first() && last() && integrated_gpu(Runtime::get().device()) &&
+        strata::env_auto("UMA_DROP_PAGES") != 0) {
+        const int64_t keep_from = lend_from_ >= 0 ? lend_from_ : INT64_MAX;
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t freed = file->drop_cached_pages([&](int64_t l, int64_t e) {
+            const int32_t sl = res_[(size_t) (l * E + e)];
+            return sl < 0 || sl >= keep_from;   // not in the tier (read from the file), or lent
+        });
+        if (freed > 0)
+            std::fprintf(stderr, "xestrata plain: this GPU shares the system RAM and holds every expert: the model file's "
+                                 "cached pages of %.2f GiB of experts are given back (%.1f ms; XESTRATA_UMA_DROP_PAGES=0 "
+                                 "keeps them)\n", (double) freed / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     free_b_ = free_b;
     return true;
 }
@@ -3177,14 +3198,14 @@ bool PlainModel::kv_trim(int64_t cells, int64_t hold, std::string& err) {
 }
 
 void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                                 strata::gpu::Stream cs, const k::KvHostPools* stage) {
+                                 strata::gpu::Stream cs, const k::KvHostPools* stage, bool host_by_dma) {
     const KvPtrs p = kv_ptrs(a, slot);
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
     // --kv-resident: the host copy gets every cell (the identity layout), the VRAM ring its resident pages, and the
     // prompt's staging pool its copy; the one shared append (kv_q8.hpp), so the cells are bit for bit a fully
     // resident layer's (the individual kv_append_* are its wrappers).  The trellis-coded pools have no host copy.
-    const bool streamed = slot < 0 && kv_streamed(a);
+    const bool streamed = slot < 0 && kv_streamed(a) && !(host_by_dma && stage != nullptr);
     const k::KvHostPools host = streamed ? kv_host_[a] : k::KvHostPools{};
     auto base = [&]() {
         k::KvAppend ap;

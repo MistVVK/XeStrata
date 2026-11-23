@@ -111,6 +111,7 @@
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa_balancing.hpp"
 #include "strata/platform/io_priority.hpp"
 #include <fcntl.h>
 #include <filesystem>
@@ -2388,6 +2389,13 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(__linux__)
+    // upstream 87c9821bb1 (#4866): keep the kernel's NUMA scanner off the memory the GPU reads, before any thread is made
+    // or anything allocated (include/strata/platform/numa_balancing.hpp: it evicted the GPU queues for minutes per start
+    // on a two-socket host).  Both engines: the plain one runs from this main too.
+    if (const std::string numa = strata::platform::numa_balancing::keep_scanner_off(); !numa.empty())
+        std::fprintf(stderr, "%s\n", numa.c_str());
+#endif
     // upstream b89bf5947: not the low disk priority of the program that started this one (a model read at Low is
     // several times slower).  The plain engine runs from this main too (plain_generate.cpp's plain_main).
     strata::platform::restore_normal_io_priority();
@@ -3612,7 +3620,9 @@ int main(int argc, char** argv) {
             copy_ms[(size_t) i] = strata::core::probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = strata::env_get("SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
-        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        // XESTRATA_SPLIT_LINK_MIN=r (opt-in, upstream becf4a3d9a): the gap from which the scale applies, 4 unless set
+        static const double link_min = strata::program::split_rules::link_scale_min_resolve(strata::env_get("SPLIT_LINK_MIN"));
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps, link_min);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
             if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
@@ -4677,6 +4687,8 @@ int main(int argc, char** argv) {
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
 #endif
+        // the memory guard credits the process's own mapped file pages back only when they are not locked (conversation_memory.hpp)
+        strata::core::set_locked_own_file_bytes(ple_table.locked() ? ple_table.table_bytes() : 0);
         if (pio.lock)
             std::fprintf(stderr, "xestrata generate: PLE table %s (%s) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -5383,6 +5395,7 @@ int main(int argc, char** argv) {
             // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
             const uint64_t table_b = ple_table.table_bytes();
             if (ple_table.unlock()) {
+                strata::core::set_locked_own_file_bytes(0);
                 strata::core::detail::HostMemory after;
                 std::string now;
                 if (strata::core::detail::host_available_memory(after)) {
@@ -7838,6 +7851,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (drive.d.remote_count > 0 && o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, *drive.d.remote[0], "serve");
+        // Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (the processor's own graphics, from the device's
+        // report) with every expert in its cache: the pages the start read from the model file are a second copy of the
+        // cache's bytes in the same RAM.  They are given back; the experts of the slots the prompt path borrows keep theirs
+        // (their refill reads them).  The cache holds the same bytes either way, so no output bit changes.
+        // XESTRATA_UMA_DROP_PAGES=0 keeps the pages.
+        if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && strata::core::device_info(0).integrated &&
+            strata::env_auto("UMA_DROP_PAGES") != 0) {
+            const int32_t keep_from = borrow != nullptr && lend_first >= 0 ? lend_first : INT32_MAX;
+            const auto t0 = Clock::now();
+            const uint64_t freed = src.drop_cached_pages([&](int64_t l, int64_t e) {
+                const int32_t sl = xcache.slot_of(l, e);
+                return sl != strata::core::kNotResident && sl >= keep_from;
+            });
+            if (freed > 0)
+                std::fprintf(stderr, "xestrata serve: this GPU shares the system RAM and holds every expert: the model file's "
+                                     "cached pages of %.2f GiB of experts are given back (%.1f ms; the experts the prompt path "
+                                     "borrows keep theirs; XESTRATA_UMA_DROP_PAGES=0 keeps them)\n",
+                             (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
         mem_mark("the head and the prompt path");
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
@@ -8367,6 +8399,7 @@ int main(int argc, char** argv) {
                 strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
                 const auto before = cache_room;
                 if (ple_table.unlock()) {
+                    strata::core::set_locked_own_file_bytes(0);
                     cache_room = strata::core::available_host_bytes();
                     std::fprintf(stderr, "xestrata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the "
                                          "conversation cache, %.1f GiB without it (the table stays cached)\n",
