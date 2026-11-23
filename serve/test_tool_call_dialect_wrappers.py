@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""#6022 (recovery on): the spellings a model falls back to for a declared tool's call that leaked as text with finish "stop":
-- `<invoke name="T">...</invoke>` alone, or inside `<function_calls>` (Claude's dialect without the template's `<tool_call>`);
+"""#6022 (recovery on): the spellings a model falls back to for a declared tool's call that leaked as text with \
+finish "stop":
+- `<invoke name="T">...</invoke>` alone, or inside `<function_calls>` (Claude's dialect without the template's \
+`<tool_call>`);
 - `<function=T>{"k": v}</function>`, a JSON object as the body (it was run with NO arguments).
 An undeclared name, prose, code and recovery off stay as they were.
 
@@ -13,7 +15,8 @@ import unittest
 
 from serve.frontend import OutputParser
 
-TOOLS = [{"name": "bash", "parameters": {"properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}}},
+TOOLS = [{"name": "bash", "parameters": {"properties": {
+    "command": {"type": "string"}, "timeout": {"type": "integer"}}}},
          {"name": "ping", "parameters": {"properties": {}}}]
 INVOKE = '<invoke name="bash">\n<parameter name="command">ls -la</parameter>\n</invoke>'
 
@@ -65,7 +68,8 @@ class Dialect(unittest.TestCase):
             self.assertEqual(answer(evs).strip(), "")
 
     def test_undeclared_prose_and_code_stay_text(self):
-        for t in ('<function_calls>\n<invoke name="TaskCreate">\n<parameter name="subject">x</parameter>\n</invoke>\n</function_calls>',
+        for t in ('<function_calls>\n<invoke name="TaskCreate">\n'
+                  '<parameter name="subject">x</parameter>\n</invoke>\n</function_calls>',
                   "Write <invoke name=\"bash\"> to call it.",
                   "Use `<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>` like this.",
                   "```\n" + INVOKE + "\n```"):
@@ -83,7 +87,9 @@ class JsonBody(unittest.TestCase):
     BODY = '<function=bash>{"command": "ls", "timeout": 5}</function>'
 
     def test_the_object_is_the_arguments(self):
-        for wrapped in (self.BODY, "<tool_call>\n" + self.BODY + "\n</tool_call>", "<tool_call>\n<function=bash>\n{\"command\": \"ls\", \"timeout\": 5}\n</function>\n</tool_call>"):
+        for wrapped in (self.BODY, "<tool_call>\n" + self.BODY + "\n</tool_call>",
+                        "<tool_call>\n<function=bash>\n{\"command\": \"ls\", \"timeout\": 5}\n"
+                        "</function>\n</tool_call>"):
             for piece in (0, 1, 7):
                 evs = run(wrapped, piece=piece, stream=True)
                 self.assertEqual(calls(evs), [("bash", {"command": "ls", "timeout": 5})], (wrapped, piece))

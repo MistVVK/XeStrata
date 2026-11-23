@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 
 TOOLS = [
     {"name": "echo", "description": "Returns the text it is given.",
@@ -116,6 +117,9 @@ class _NoLookupServer(ThreadingHTTPServer):
     """http.server's server_bind also asks socket.getfqdn for the address: a machine whose reverse lookup stalls
     (GitHub's macOS runner: 35 s in every new process) then listens that much later.  This runs as a child process
     per test, so no answer may delay it."""
+
+    restart: Callable[[], None]
+    forget_sessions: bool
 
     def server_bind(self):
         socketserver.TCPServer.server_bind(self)

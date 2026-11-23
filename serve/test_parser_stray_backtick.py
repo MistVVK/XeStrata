@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""#4923: one unpaired backtick in the reasoning hid every tool call after it in the same paragraph (the inline-code count was carried to the
-paragraph's end), so the turn ended with thinking only and no call.  Inline code is a one-line matter: a quoted `<tool_call>` is in a fence
+"""#4923: one unpaired backtick in the reasoning hid every tool call \
+after it in the same paragraph (the inline-code count was carried to the
+paragraph's end), so the turn ended with thinking only and no call.  Inline code is a one-line matter: \
+a quoted `<tool_call>` is in a fence
 or on a line with its own backticks, and those stay text.
 
     python -m unittest serve.test_parser_stray_backtick

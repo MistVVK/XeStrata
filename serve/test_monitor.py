@@ -283,21 +283,23 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
 
-
     SKIPS = [  # noqa: RUF012
         "strata serve: conversation cache: skip parking (12 tokens, below the 512 minimum ...)\n",
         "strata serve: conversation cache: skip parking (snapshot 9000 MiB exceeds available budget)\n",
         ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
-        "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n"),
+         "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n"),
         ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
-        "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest stay parked)\n"),
-        "strata serve: conversation cache: skip parking (RAM floor after capture: 2560 MiB needed, MemAvailable 2000 MiB)\n",
+         "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest "
+         "stay parked)\n"),
+        ("strata serve: conversation cache: skip parking (RAM floor after capture: 2560 MiB needed, "
+         "MemAvailable 2000 MiB)\n"),
         "strata serve: conversation cache: allocation failed; skip parking\n",
         "strata serve: conversation cache: allocation failed; skip parking slot 2\n",
         "strata serve: conversation cache: skip parking (stage CUDA1: invalid session running-state targets)\n",
         "strata serve: conversation cache: skip parking (conversation snapshot: invalid live token/image metadata)\n",
-        ("strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 evictions=2 snapshot_bytes=1 "
-        "reused_kv_bytes=0\n"),
+        ("strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 "
+         "evictions=2 snapshot_bytes=1 "
+         "reused_kv_bytes=0\n"),
     ]
 
     def test_refused_parks_by_reason(self):
@@ -319,7 +321,8 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual((st["refused_total"], st["parks"], st["last_refused"]), (10, 1, "put"))
             st["refused"]["budget"] = 99                    # the caller's copy
             again = c.poll(str(log), 0)
-            self.assertEqual((again["refused"]["budget"], again["refused_total"]), (1, 10))   # nothing new: nothing counted
+            self.assertEqual((again["refused"]["budget"], again["refused_total"]),
+                             (1, 10))  # nothing new: nothing counted
             start = log.stat().st_size
             with open(log, "a", encoding="utf-8") as f:
                 f.write(self.SKIPS[1])

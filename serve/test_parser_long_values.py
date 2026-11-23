@@ -20,9 +20,9 @@ import unittest
 from serve.frontend import OutputParser
 
 TOOLS = [{"name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"},
-                                                                         "content": {"type": "string"}}}},
+                                                                           "content": {"type": "string"}}}},
          {"name": "todo", "parameters": {"type": "object", "properties": {"items": {"type": "array"},
-                                                                        "n": {"type": "integer"}}}}]
+                                                                          "n": {"type": "integer"}}}}]
 
 
 def call(name, **params):
@@ -111,7 +111,8 @@ class LongValues(unittest.TestCase):
                 best = dt if best is None else min(best, dt)
             return best
         small, big = seconds(40000), seconds(160000)
-        self.assertLess(big / small, 8.0, f"4x the value took {big / small:.1f}x the time ({small:.3f} s -> {big:.3f} s)")
+        self.assertLess(big / small, 8.0,
+                        f"4x the value took {big / small:.1f}x the time ({small:.3f} s -> {big:.3f} s)")
 
 
 if __name__ == "__main__":

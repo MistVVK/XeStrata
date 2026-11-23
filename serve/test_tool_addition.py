@@ -138,7 +138,8 @@ class Contract(unittest.TestCase):
         _, tools, _ = anthropic_to_messages(req)
         callable_tools, _ = anthropic_tools(req)
         choice = {"type": "tool", "name": MCP}
-        self.assertEqual(forced_call(choice, tools, callable_tools=callable_tools), CALL_START + f"\n<function={MCP}>\n")
+        self.assertEqual(forced_call(choice, tools, callable_tools=callable_tools),
+                         CALL_START + f"\n<function={MCP}>\n")
         with self.assertRaises(ValueError):
             forced_call(choice, tools)
         with self.assertRaises(ValueError):

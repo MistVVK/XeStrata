@@ -4233,7 +4233,6 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
-
     def test_gpu_refusal_on_responses_sends_retry_after_too(self):
         """台帳 0803（upstream 55ccf8556e）: 同じ 503 が responses でも Retry-After を出す。"""
         self.svc.min_free_vram_mib = 8000
@@ -4253,7 +4252,6 @@ class SharingTheGpu(unittest.TestCase):
                     self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
                 self.assertEqual(self.engine.starts, 0)
 
-
     def _strict_hook(self, code: str):
         self.svc.before_load = [sys.executable, "-c", code]
         self.svc.before_load_strict = True
@@ -4264,10 +4262,12 @@ class SharingTheGpu(unittest.TestCase):
         """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
         status, headers, body = self._strict_hook(
             "import sys; print('checking'); "
-            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB', file=sys.stderr); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: "
+            "the hold needs 76.0 GB', file=sys.stderr); "
             "sys.exit(75)")
         self.assertEqual(status, 503)
-        self.assertEqual(body["error"]["message"], "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertEqual(body["error"]["message"],
+                         "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
         self.assertTrue(int(headers["Retry-After"]) > 0)
         self.assertEqual(self.engine.starts, 0)
 
@@ -4279,7 +4279,8 @@ class SharingTheGpu(unittest.TestCase):
 
     def test_before_load_reason_is_made_safe(self):
         status, _, body = self._strict_hook(
-            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 + '\\n  \\n'); sys.exit(1)")
+            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 "
+            "+ '\\n  \\n'); sys.exit(1)")
         msg = body["error"]["message"]
         self.assertEqual(status, 503)
         self.assertLessEqual(len(msg), 300)
