@@ -407,6 +407,10 @@ class ClientGone(Exception):
     waiting for its turn): nothing is left to answer."""
 
 
+class ServerStopping(RuntimeError):
+    """台帳 0806（upstream ab0f20be0f）: 停止時の drain が要求を取り消した。再試行できる 503 を返す。"""
+
+
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
@@ -10998,6 +11002,11 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
+                elif cancel.is_set() or (done or {}).get("finish") == "cancel":
+                    # 台帳 0806: 最後の event が無い要求を collect() が途中の delta として読むのを防ぐ
+                    if getattr(svc, "draining", False):
+                        raise ServerStopping("this instance is draining; retry against the next instance")
+                    raise ClientGone()
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:
@@ -11005,6 +11014,9 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except ServerStopping as e:
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_draining"),
+                                      retry_after=1)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -11038,6 +11050,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
+            except ServerStopping as e:                      # mid-stream: response.failed, then the stream ends
+                self._responses_failed(asm, str(e), "server_error", send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
