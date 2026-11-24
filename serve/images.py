@@ -163,7 +163,7 @@ from serve import envvars
 from serve import vram_ledger
 from serve import idle_watch
 from serve.tool_parallel import LENT as LENT_LANE
-from serve.image_daemon import START_TIMEOUT_S
+from serve.image_daemon import SILENCE_S, START_TIMEOUT_S
 from serve.model_terms import _qimage
 
 TURBO_STEPS = _qimage().DITS["turbo"][1]
@@ -177,6 +177,10 @@ MAX_N = 16                         # "max_n": the most images one request makes
 BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
 UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
 HELPER_REOPEN_S = 2.0              # an image job closed the text engine's helper: filled again after this long idle
+# An engine the daemon ended as stalled ("silence_s", image_daemon.SILENCE_S) is started again by the next job; after
+# STALL_RESTARTS stalls in STALL_WINDOW_S, not before the first of them is that old (a GPU that stalls every engine).
+STALL_RESTARTS = 3
+STALL_WINDOW_S = 3600.0
 # img2img's strength when a request gives none (a model without edits, an image and no mask), at most: 0.87, lowered
 # for a model of few steps (img2img_strength).  An edit's, and a mask's alone, is 1.0, a full denoise
 STRENGTH_IMG2IMG = 0.87
@@ -2994,6 +2998,9 @@ class ImageEngine:
         self.ended = threading.Event()              # the daemon closed this connection
         self.pid: int | None = None                 # the engine's process (the daemon's READY), what holds its VRAM
         self.found = False                          # the last start found the daemon running (another server's)
+        self.stalls: collections.deque[tuple[float, str]] = collections.deque(maxlen=STALL_RESTARTS)  # (time, why)
+        self.stall_count = 0
+        self.heard: float | None = None             # the last line's time while a request waits for the engine
         # the PART and TILE lines, and STAGE where a request takes no stage callback (ImageGen._engine_progress)
         self.on_progress: Callable[[str], None] | None = None
 
@@ -3063,7 +3070,8 @@ class ImageEngine:
     def _spawn(self, addr: str):
         """Start the daemon (its environment the server's engine's), detached from this server."""
         cmd = [sys.executable, str(Path(__file__).resolve().parent / "image_daemon.py"), "--socket", addr,
-               "--idle", str(float(self.cfg.get("daemon_idle_s") or 1800)), "--log", str(self.log_path), "--",
+               "--idle", str(float(self.cfg.get("daemon_idle_s") or 1800)),
+               "--silence", str(float(self.cfg.get("silence_s", SILENCE_S))), "--log", str(self.log_path), "--",
                *self.command()]
         kw: dict = {"start_new_session": True} if os.name != "nt" else \
             {"creationflags": 0x00000200 | 0x00000008 | 0x01000000}   # its own group, no console, out of the job
@@ -3079,7 +3087,13 @@ class ImageEngine:
 
     def start(self) -> dict:
         """Connect to the image daemon, starting it when there is none, and wait for READY -> its fields.
-        ImageJobFailed when it does not start."""
+        ImageJobFailed when it does not start, or stalled too often (held_until)."""
+        held = self.held_until()
+        if held is not None:
+            at = time.strftime("%H:%M:%S", time.localtime(held))
+            raise ImageJobFailed(f"the image engine stalled {len(self.stalls)} times in {STALL_WINDOW_S / 60:g} "
+                                 f"minutes and is not started again before {at} (the last: {self.stalls[-1][1]}); "
+                                 f"its log: {self.log_path}")
         addr = daemon_address(self.command(), self.env)
         t0 = time.monotonic()
         proc = None
@@ -3116,6 +3130,12 @@ class ImageEngine:
         self.found = proc is None
         return info
 
+    def held_until(self) -> float | None:
+        """When the engine may be started again after STALL_RESTARTS stalls in STALL_WINDOW_S (time.time()), or None."""
+        if len(self.stalls) < STALL_RESTARTS or self.stalls[0][0] + STALL_WINDOW_S <= time.time():
+            return None
+        return self.stalls[0][0] + STALL_WINDOW_S
+
     def _next(self, waited: float, limit: float, cancel: threading.Event | None = None) -> str:
         """The engine's next line; ImageJobFailed when the connection ended or `limit` passed."""
         while True:
@@ -3135,6 +3155,7 @@ class ImageEngine:
             if line is None:
                 self.close()
                 raise ImageJobFailed(f"the image engine ended; its log: {self.log_path}")
+            self.heard = time.monotonic()
             return line
 
     def send(self, line: str) -> None:
@@ -3156,7 +3177,13 @@ class ImageEngine:
         tile) to on_progress whatever the request, and STAGE lines there too where `stage` is not given; at a YIELD
         (UPSV's YIELD:1) `pause` runs, then RESUME goes back.  ImageJobFailed on ERROR."""
         self.send(line)
-        t0 = time.monotonic()
+        t0 = self.heard = time.monotonic()
+        try:
+            return self._answer(want, t0, timeout, cancel, step, stage, preview, pause)
+        finally:
+            self.heard = None
+
+    def _answer(self, want: str, t0: float, timeout: float, cancel, step, stage, preview, pause) -> dict:
         while True:
             got = self._next(time.monotonic() - t0, timeout, cancel)
             if got.startswith("STEP "):
@@ -3189,6 +3216,12 @@ class ImageEngine:
                 why = got[6:]
                 if why.startswith("lora: "):
                     raise LoraRejected(why[6:])
+                if why.startswith("stalled: "):   # the daemon ended the engine and ends (image_daemon.stalled)
+                    self.close()
+                    self.stalls.append((time.time(), why[9:]))
+                    self.stall_count += 1
+                    self.say(f"image engine stalled: {why[9:]}; the next job starts it again")
+                    raise ImageJobFailed(f"{why[9:]}; the next job starts it again; its log: {self.log_path}")
                 raise ImageJobFailed(why or "the image engine failed")
 
     def close(self, shutdown: bool = False) -> None:
@@ -3229,6 +3262,9 @@ class ImageGen:
         reload = self.cfg.get("reload") or "lazy"
         if reload not in ("lazy", "eager"):
             raise ValueError(f'images "reload" must be lazy or eager, not {reload!r}')
+        silence = self.cfg.get("silence_s", SILENCE_S)
+        if isinstance(silence, bool) or not isinstance(silence, (int, float)) or silence < 0:
+            raise ValueError(f'images "silence_s" must be a number of seconds >= 0 (0: no limit), not {silence!r}')
         self.family = self.cfg.get("family") or "qwen-image"
         if _pipeline(self.family) == "latent_chat":   # its edit adapter, as the config or the environment chooses
             self.cfg.update(moss_edit_adapter(self.cfg))
@@ -3445,6 +3481,9 @@ class ImageGen:
                 raise ImageJobFailed("the image engine is not running")
             self.engine.start()
             self._enter_ledger()
+            if not self.engine.alive():   # FREE not answered: a daemon whose engine is busy for another's request
+                raise ImageJobFailed("the image engine did not answer after its start; its log: "
+                                     f"{self.engine.log_path}")
 
     def ledger(self, total_mib: int = 0) -> vram_ledger.Ledger:
         """The image GPU's VRAM ledger (serve/vram_ledger.py), `total_mib` the engine's report of the GPU's memory."""
@@ -4277,7 +4316,17 @@ class ImageGen:
 
     def status(self) -> dict:
         out = {"enabled": True, "model": self.model, "engine": "xestrata-image", "quant": self.cfg.get("quant"),
-               "gpu_policy": self.policy, "running": self.engine.alive(), **self.totals}
+               "gpu_policy": self.policy, "running": self.engine.alive(), **self.totals,
+               "stalls": self.engine.stall_count}
+        heard = self.engine.heard
+        if heard is not None:   # a request waits for the engine: how long it has said nothing (silence_s ends it)
+            out["silent_s"] = round(time.monotonic() - heard, 1)
+        if self.engine.stalls:
+            at, why = self.engine.stalls[-1]
+            out["last_stall"] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(at)), "error": why}
+        held = self.engine.held_until()
+        if held is not None:
+            out["held_until"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(held))
         if self.note():
             out["note"] = self.note()
         if self.cfg.get("turbo_lora"):
