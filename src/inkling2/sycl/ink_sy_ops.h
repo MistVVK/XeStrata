@@ -22,6 +22,7 @@ inline void k_embed_sg16(const InkTensorInfo& eti, const float* norm_w, const in
                          const uint8_t* is_img, const float* img_emb, float* cur_out, int M, int V_padded) {
     const uint8_t* ew = eti.dev_ptr;
     const bool is_bf16 = (eti.fmt == FMT_BF16);
+    const bool is_q8_0 = (eti.fmt == FMT_Q8_0);
     Q().parallel_for(NR(M, 256), [=](sycl::nd_item<1> it) INK_REQD_SG {
         float* sh = lmem<float, 16>(it);
         const int m = (int)it.get_group(0), tid = (int)it.get_local_id(0);
@@ -36,6 +37,13 @@ inline void k_embed_sg16(const InkTensorInfo& eti, const float* norm_w, const in
             for (int d = tid; d < INK_D; d += 256) { float v = bf16_to_f32(row[d]); ss += v * v; }
             const float inv = sycl::rsqrt(wg_sum16(it, ss, sh) / (float)INK_D + INK_RMS_EPS);
             for (int d = tid; d < INK_D; d += 256) cur_out[(size_t)m * INK_D + d] = bf16_to_f32(row[d]) * inv * norm_w[d];
+        } else if (is_q8_0) {
+            const float* rs = reinterpret_cast<const float*>(ew) + (size_t)id * (INK_D / 32);
+            const int8_t* rq = reinterpret_cast<const int8_t*>(ew + (size_t)V_padded * (INK_D / 32) * 4) + (size_t)id * INK_D;
+            auto w = [rs, rq](int d) { return (float)rq[d] * rs[d >> 5]; };
+            for (int d = tid; d < INK_D; d += 256) { float v = w(d); ss += v * v; }
+            const float inv = sycl::rsqrt(wg_sum16(it, ss, sh) / (float)INK_D + INK_RMS_EPS);
+            for (int d = tid; d < INK_D; d += 256) cur_out[(size_t)m * INK_D + d] = w(d) * inv * norm_w[d];
         } else {
             const float sc = reinterpret_cast<const float*>(ew)[id];
             const int8_t* row = reinterpret_cast<const int8_t*>(ew + (size_t)V_padded * 4) + (size_t)id * INK_D;

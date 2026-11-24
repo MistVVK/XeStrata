@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/inkling_kind.py - Inkling-2-Mini's engine as the server starts it (upstream's terminal/serve/inkling_kind.py,
-v0.2.19, without its own program): xestrata-engine with a .strata v1.1 model takes its own short list of options
-(src/inkling2/ink_main.cpp), so the server's other options for the other engines are left out here.
+v0.2.19, without its own program): xestrata-engine with a .strata v1.1 or .gguf model takes its own short list of
+options (src/inkling2/ink_main.cpp), so the server's other options for the other engines are left out here.
 
 The config's keys it reads: "args" (setup's: --native, --max-context, and for Inkling-2-Mini (QSA) --qsa-indexer and
---qsa on), "parallel" (1..64 slots, --slots) and "drafting" ("off" turns DSpark off)."""
+--qsa on), "parallel" (1..64 slots, --slots) and "drafting" (DSpark only with "dspark")."""
 from __future__ import annotations
 
 import json
@@ -52,7 +52,9 @@ def engine_args(cfg: dict, announce: bool = True) -> list[str]:
     par = cfg.get("parallel")
     if isinstance(par, int) and not isinstance(par, bool) and 2 <= par <= MAX_PARALLEL and "--slots" not in args:
         args += ["--slots", str(par)]
-    if cfg.get("drafting") == "off" and "--draft" not in args:
+    # DSpark only when asked for by name ("drafting": "dspark"): on the Arc Pro B70 (2026-11-24, SQ-15, greedy) its
+    # drafts were taken 15 % of the time (upstream's own build alike) and decode fell from 30.7 to 12.5 tok/s
+    if cfg.get("drafting") != "dspark" and "--draft" not in args:
         args += ["--draft", "off"]
     if dropped and announce:
         print(f"[xestrata] Inkling-2-Mini's engine does not take {' '.join(dropped)}: left out", flush=True)

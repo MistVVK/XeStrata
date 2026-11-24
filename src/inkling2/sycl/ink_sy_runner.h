@@ -349,6 +349,10 @@ struct InkSyRunner {
                     k_linear_q8row_dp4a_sg16(ti.dev_ptr, N, K, xq_s8_dev, xsc_dev, Y, M, (int)ti.rows());
                 }
                 break;
+            case FMT_Q8_0:
+                if (!ink_xmx_linear_q8_0(ti.dev_ptr, N, K, X, Y, M, (int)ti.rows()))
+                    k_linear_q8_0_sg16(ti.dev_ptr, N, K, X, Y, M, (int)ti.rows());
+                break;
             case FMT_F32:
                 k_linear_f32_sg16(reinterpret_cast<const float*>(ti.dev_ptr), N, K, X, Y, M);
                 break;

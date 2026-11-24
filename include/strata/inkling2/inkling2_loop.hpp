@@ -80,7 +80,8 @@ void shortconv4_step_f32(
     float* out) noexcept;      // [C]
 
 // Execute one Inkling-2-Mini expert (w13 interleaved even=gate/odd=up + SITU + w2 down) from raw Section 4 bytes.
-// Supports SF4 (code_id=15), MX8 (code_id=16), and S1.5..S8_K (with paired 2-row w2 SB_0..SB_8 & FP16 sq_xd_dn).
+// Supports SF4 (code_id=15), MX8 (code_id=16), a GGUF file's Q8_0 body (GGUF_RAW, code_id=20, interleaved rows) and
+// S1.5..S8_K (with paired 2-row w2 SB_0..SB_8 & FP16 sq_xd_dn).
 void eval_inkling2_expert(
     const uint8_t* body,
     strata::quant::sk::SkCode gu_code,

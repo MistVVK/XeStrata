@@ -75,7 +75,7 @@ public:
             : (24ull << 20) + (size_t)par * 8ull * (qsa_blocks * 128ull + 4ull * (size_t)mc.hidden) * 4ull +
               (size_t)batch_cap * (qsa_blocks + (size_t)opts.qsa_budget + 4ull + 3ull * (size_t)mc.hidden) * 4ull;
         const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est + qsa_est;
-        if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve, opts.vram_reserve_mib)) return false;
+        if (!mod_.load(model, opts.vram_experts_gb, err, extra_reserve, opts.vram_reserve_mib)) return false;
         if (!runner_.init(mod_, par, ctx, batch_cap, opts.enable_dspark, err)) {
             return false;
         }

@@ -272,7 +272,9 @@ inline float situ_act(float g, float u) {
 enum InkFmt : int32_t {
     FMT_S2 = 2, FMT_S3 = 3, FMT_S4 = 4, FMT_S5 = 5, FMT_S6 = 6, FMT_S8 = 8,
     FMT_SF4 = 15, FMT_MX8 = 16,
+    FMT_GGUF_RAW = 20, // native GGUF Q8_0 expert body (0x47475546 header)
     FMT_Q8ROW = 100, FMT_F32 = 101, FMT_BF16 = 102,
+    FMT_Q8_0 = 103,    // a GGUF file's dense Q8_0 rows, split for aligned loads: N * K/32 FP32 scales, then N * K int8
 };
 
 constexpr int sk_sb_bytes(int f) {
@@ -485,6 +487,39 @@ inline bool parse_ink_manifest(const std::string& json_text, InkManifest& m, std
     }
 }
 
+// Convert the adapter's canonical manifest into the SYCL backend's own manifest (the two share
+// the format ids and the geometry, but are separate structs).
+inline bool convert_ink_manifest(const ink2::InkManifest& src, InkManifest& m, std::string& err) {
+    (void)err;
+    const ink2::InkCfg& s = src.c;
+    InkCfg& c = m.c;
+    c.n_phys = s.n_phys; c.hidden = s.hidden; c.inter = s.inter;
+    c.vocab_padded = s.vocab_padded; c.vocab_unpadded = s.vocab_unpadded;
+    c.n_head = s.n_head; c.n_kv = s.n_kv; c.head_dim = s.head_dim;
+    c.d_rel = s.d_rel; c.rel_extent = s.rel_extent; c.swa_win = s.swa_win;
+    c.block_size = s.block_size; c.n_experts = s.n_experts; c.top_k = s.top_k;
+    c.core_start = s.core_start; c.core_end = s.core_end;
+    c.num_passes = s.num_passes; c.gate_rank = s.gate_rank;
+    c.eos_id = s.eos_token_id; c.image_pad_id = s.image_token_id;
+    c.rms_eps = s.rms_eps; c.qk_l2_clip = s.qk_l2_clip; c.rel_l2_clip = s.rel_l2_clip;
+    c.log_scale_floor = s.log_scale_floor; c.log_scale_alpha = s.log_scale_alpha;
+    c.route_scale = s.route_scale; c.logit_softcap = s.logit_softcap;
+    c.is_swa.assign(s.is_swa.begin(), s.is_swa.end());
+    c.n_visits = s.n_visits;
+    c.has_dspark = !src.dspark_tensors.empty();
+    m.build = src.build; m.chat_template = src.chat_template;
+    auto add = [](const auto& from, auto& to) {
+        for (const auto& kv : from) {
+            InkTensorInfo ti;
+            ti.name = kv.first; ti.fmt = kv.second.fmt;
+            ti.shape = kv.second.shape; ti.off = kv.second.off; ti.bytes = kv.second.bytes;
+            to[ti.name] = std::move(ti);
+        }
+    };
+    add(src.trunk, m.T); add(src.dspark_tensors, m.D);
+    return true;
+}
+
 // Multi-slab VRAM + 3x Loop-Weighted Expert Loader for 8/12/16/32 GB Intel Arc GPUs
 struct InkSyclModel {
     InkManifest man;
@@ -529,30 +564,39 @@ struct InkSyclModel {
         dfree(rel_proj_pad_dev);
     }
 
-    bool load(const std::string& p, double vram_experts_gb_override, std::string& err, size_t extra_reserve_bytes,
+    bool load(const ink2::InkModelFile& mf, double vram_experts_gb_override, std::string& err, size_t extra_reserve_bytes,
               int64_t reserve_mib) {
         double t0 = now_s();
+        const std::string& p = mf.path;
         path = p;
-        FILE* fp = std::fopen(p.c_str(), "rb");
-        if (!fp) { err = "cannot open " + p; return false; }
-
-        uint8_t frame[4096];
-        if (std::fread(frame, 1, 4096, fp) != 4096) { std::fclose(fp); err = "short header"; return false; }
-        static const uint8_t kMagic[8] = {'S', 'T', 'R', 'A', 'T', 'A', 0x00, 0x01};
-        if (std::memcmp(frame, kMagic, 8) != 0) { std::fclose(fp); err = "bad .strata magic"; return false; }
-        uint32_t hdr_flags = 0;
-        std::memcpy(&hdr_flags, frame + 8, 4);
-        format_minor = (uint8_t)(hdr_flags & 0xFFu);
-
+        const bool gguf = (mf.kind == ink2::ModelSourceKind::Gguf);
+        FILE* fp = nullptr;
         strata::artifact::StrataSectionEntry secs[6]{};
-        for (int i = 0; i < 6; ++i) std::memcpy(&secs[i], frame + 0x10 + i * 64, 64);
+        const std::vector<uint8_t>* sec1_host = nullptr;   // a GGUF's trunk, as its adapter assembled it
+        if (gguf) {
+            if (!convert_ink_manifest(mf.m, man, err)) return false;
+            sec1_host = &mf.gguf_adapter->sec1_arena;
+        } else {
+            fp = std::fopen(p.c_str(), "rb");
+            if (!fp) { err = "cannot open " + p; return false; }
 
-        std::string mjson;
-        if (!read_section0_zstd(fp, secs[0].file_offset, secs[0].byte_length, mjson, err)) {
-            std::fclose(fp);
-            return false;
+            uint8_t frame[4096];
+            if (std::fread(frame, 1, 4096, fp) != 4096) { std::fclose(fp); err = "short header"; return false; }
+            static const uint8_t kMagic[8] = {'S', 'T', 'R', 'A', 'T', 'A', 0x00, 0x01};
+            if (std::memcmp(frame, kMagic, 8) != 0) { std::fclose(fp); err = "bad .strata magic"; return false; }
+            uint32_t hdr_flags = 0;
+            std::memcpy(&hdr_flags, frame + 8, 4);
+            format_minor = (uint8_t)(hdr_flags & 0xFFu);
+
+            for (int i = 0; i < 6; ++i) std::memcpy(&secs[i], frame + 0x10 + i * 64, 64);
+
+            std::string mjson;
+            if (!read_section0_zstd(fp, secs[0].file_offset, secs[0].byte_length, mjson, err)) {
+                std::fclose(fp);
+                return false;
+            }
+            if (!parse_ink_manifest(mjson, man, err)) { std::fclose(fp); return false; }
         }
-        if (!parse_ink_manifest(mjson, man, err)) { std::fclose(fp); return false; }
 
         // 1. Upload Section 1 (Trunk + DSpark) into <= 3.2 GiB device slabs (safe under Arc 4 GiB max_alloc!)
         // slabs of at most 7/8 of the device's largest allocation (core::max_alloc_bytes, XESTRATA_MAX_ALLOC_MIB applied)
@@ -582,7 +626,13 @@ struct InkSyclModel {
                 for (size_t j = start; j < idx; ++j) {
                     InkTensorInfo* ti = ordered[j];
                     staging.resize(ti->bytes);
-                    if (!seek_abs(fp, secs[1].file_offset + ti->off) || std::fread(staging.data(), 1, ti->bytes, fp) != ti->bytes) {
+                    if (gguf) {
+                        if (ti->off + ti->bytes > sec1_host->size()) {
+                            err = "short read trunk tensor " + ti->name;
+                            return false;
+                        }
+                        std::memcpy(staging.data(), sec1_host->data() + ti->off, ti->bytes);
+                    } else if (!seek_abs(fp, secs[1].file_offset + ti->off) || std::fread(staging.data(), 1, ti->bytes, fp) != ti->bytes) {
                         err = "short read trunk tensor " + ti->name;
                         return false;
                     }
@@ -604,7 +654,7 @@ struct InkSyclModel {
 
         std::unordered_map<std::string, std::vector<uint8_t>> host_tmp;
         if (!upload_tensor_map(man.T, host_tmp) || !upload_tensor_map(man.D, host_tmp)) {
-            std::fclose(fp);
+            if (fp) std::fclose(fp);
             return false;
         }
         prepare_preoriented_tables(host_tmp);
@@ -613,7 +663,15 @@ struct InkSyclModel {
         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
         std::vector<strata::artifact::StrataExpertEntry> ents_by_gid(n_total);
         std::vector<uint16_t> order;
-        if (secs[3].byte_length > 0) {
+        if (gguf) {
+            const auto& dir = mf.expert_directory();
+            for (size_t i = 0; i < std::min(dir.size(), n_total); ++i) {
+                const size_t layer = i / (size_t)man.c.n_experts;
+                const size_t gid = layer * (size_t)man.c.n_experts + dir[i].expert_id;
+                if (gid < n_total) ents_by_gid[gid] = dir[i];
+            }
+            order = mf.vram_load_order;
+        } else if (secs[3].byte_length > 0) {
             std::vector<uint8_t> s3(secs[3].byte_length);
             if (!seek_abs(fp, secs[3].file_offset) || std::fread(s3.data(), 1, s3.size(), fp) != s3.size()) {
                 std::fclose(fp); err = "short read Section 3"; return false;
@@ -646,7 +704,7 @@ struct InkSyclModel {
         // the runner allocates after the load (`extra_reserve_bytes`: KV, ShortConv, DSpark, activations), less the room
         // no plan counts (core::vram_room, or --vram-reserve-mib); --vram-experts-gb sets it outright.
         size_t free_b = 0, gpu_mem = 0;
-        if (!mem_now(free_b, gpu_mem)) { std::fclose(fp); err = "inkling2: the GPU's free memory is unknown"; return false; }
+        if (!mem_now(free_b, gpu_mem)) { if (fp) std::fclose(fp); err = "inkling2: the GPU's free memory is unknown"; return false; }
         const size_t room = reserve_mib >= 0 ? ((size_t)reserve_mib << 20) : (size_t)strata::core::vram_room(gpu_mem);
         size_t vram_budget = free_b > extra_reserve_bytes + room ? free_b - extra_reserve_bytes - room : 0;
         if (vram_experts_gb_override >= 0.0) {
@@ -693,7 +751,12 @@ struct InkSyclModel {
                 for (size_t j = start; j < i; ++j) {
                     const size_t gid = gids[j];
                     const auto& e = ents_by_gid[gid];
-                    if (to_device) {
+                    if (gguf) {
+                        buf.resize(e.body_bytes);
+                        if (!mf.read_expert_body(gid, buf, err)) return false;
+                        if (to_device) { h2d(slab + off, buf.data(), e.body_bytes); wait(); }
+                        else { std::memcpy(slab + off, buf.data(), e.body_bytes); host_body_ptrs[gid] = slab + off; }
+                    } else if (to_device) {
                         buf.resize(e.body_bytes);
                         if (!seek_abs(fp, secs[4].file_offset + e.body_offset) || std::fread(buf.data(), 1, e.body_bytes, fp) != e.body_bytes) {
                             err = "short read expert body"; return false;
@@ -717,10 +780,10 @@ struct InkSyclModel {
         };
 
         if (!populate_experts(vram_gids, true) || !populate_experts(host_gids, false)) {
-            std::fclose(fp);
+            if (fp) std::fclose(fp);
             return false;
         }
-        std::fclose(fp);
+        if (fp) std::fclose(fp);
 
         expert_dev = dalloc<InkSyExpertDev>(n_total);
         h2d(expert_dev, h_ed.data(), n_total * sizeof(InkSyExpertDev));

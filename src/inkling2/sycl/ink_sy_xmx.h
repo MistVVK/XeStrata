@@ -226,6 +226,22 @@ inline void k_dequant_moe_gu_f16_sg16(InkSyExpertDev ed, half* w_f16) {
                     *reinterpret_cast<sycl::vec<half, 8>*>(o + c * 8) = v;
                 }
             }
+        } else if (ed.gu_code == FMT_GGUF_RAW) {
+            const auto* hdr = reinterpret_cast<const strata::quant::sk::GgufExpertHeader*>(body);
+            const float os = (row & 1) ? hdr->up_scale : hdr->gate_scale;
+            const uint8_t* rr = body + 32 + (size_t)row * (72 * 34);
+            for (int b = lane; b < 72; b += 16) {
+                const uint8_t* blk = rr + b * 34;
+                const float d = h2f_bits(ld16(blk)) * os;
+                half* o = dst + b * 32;
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    sycl::vec<half, 8> v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) v[j] = (half)((float)(int8_t)blk[2 + c * 8 + j] * d);
+                    *reinterpret_cast<sycl::vec<half, 8>*>(o + c * 8) = v;
+                }
+            }
         } else {
             const int F = ed.gu_code;
             const int SB = sk_sb_bytes(F);
@@ -323,6 +339,27 @@ inline void k_dequant_moe_dn_f16_sg16(InkSyExpertDev ed, half* w_f16) {
                     *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 32 + c * 8) = v;
                 }
             }
+        } else if (ed.dn_code == FMT_GGUF_RAW) {
+            const auto* hdr = reinterpret_cast<const strata::quant::sk::GgufExpertHeader*>(body);
+            const uint8_t* w0 = body + ed.dn_off + (size_t)(2 * rp) * (36 * 34);
+            const uint8_t* w1 = w0 + 36 * 34;
+            for (int b = lane; b < 36; b += 16) {
+                const uint8_t* b0 = w0 + b * 34;
+                const uint8_t* b1 = w1 + b * 34;
+                const float s0 = h2f_bits(ld16(b0)) * hdr->dn_scale;
+                const float s1 = h2f_bits(ld16(b1)) * hdr->dn_scale;
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    sycl::vec<half, 8> u, v;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        u[j] = (half)((float)(int8_t)b0[2 + c * 8 + j] * s0);
+                        v[j] = (half)((float)(int8_t)b1[2 + c * 8 + j] * s1);
+                    }
+                    *reinterpret_cast<sycl::vec<half, 8>*>(d0 + b * 32 + c * 8) = u;
+                    *reinterpret_cast<sycl::vec<half, 8>*>(d1 + b * 32 + c * 8) = v;
+                }
+            }
         } else {
             const int F = ed.dn_code;
             const int SB = sk_sb_bytes(F);
@@ -370,7 +407,7 @@ inline void k_moe_situ_invsq_f16_sg16(InkSyExpertDev ed, const float* y_gu, int 
     Q().parallel_for(NR(n, 256), [=](sycl::nd_item<1> it) INK_REQD_SG {
         const int i = (int)it.get_group(0), tid = (int)it.get_local_id(0);
         const uint8_t* body = ed.body_ptr;
-        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
         const float* src = y_gu + (size_t)i * 2304;
         half* dst = h_f16 + (size_t)i * 1152;
         for (int r = tid; r < 1152; r += 256) {
@@ -407,6 +444,33 @@ inline bool ink_xmx_linear_bf16(const uint16_t* W, int N, int K, const float* X,
     for (int n0 = 0; n0 < N; n0 += n_step) {
         const int nc = std::min(n_step, N - n0);
         k_bf16_to_f16_rows_sg16(W, n0, nc, K, sc.w_f16);
+        gemm_f16(sc.x_f16, sc.w_f16, Y + n0, M, nc, K, N);
+    }
+    return true;
+}
+
+inline void k_q8_0_to_f16_rows_sg16(const uint8_t* W, int n0, int nc, int K, int N_total, half* dst) {
+    const size_t tot = (size_t)nc * K;
+    const float* sc = reinterpret_cast<const float*>(W) + (size_t)n0 * (K >> 5);
+    const int8_t* q = reinterpret_cast<const int8_t*>(W + (size_t)N_total * (K >> 5) * 4) + (size_t)n0 * K;
+    Q().parallel_for(NR((tot + 255) / 256, 256), [=](sycl::nd_item<1> it) INK_REQD_SG {
+        const size_t i = (size_t)it.get_global_id(0);
+        if (i < tot) dst[i] = (half)((float)q[i] * sc[i >> 5]);
+    });
+}
+
+inline bool ink_xmx_linear_q8_0(const uint8_t* W, int N, int K, const float* X, float* Y, int M, int N_total) {
+    if (!xmx_enabled() || M < 16) return false;
+    auto& sc = xmx_scratch();
+    sc.ensure_w((size_t)std::min<int64_t>((int64_t)N * K, 8388608));
+    sc.ensure_x((size_t)M * K);
+    k_f32_to_f16_sg16(X, sc.x_f16, (size_t)M * K);
+    int n_step = (int)std::min<size_t>((size_t)N, sc.w_cap / (size_t)K);
+    if (n_step >= 64) n_step &= ~63;
+    if (n_step <= 0) return false;
+    for (int n0 = 0; n0 < N; n0 += n_step) {
+        const int nc = std::min(n_step, N - n0);
+        k_q8_0_to_f16_rows_sg16(W, n0, nc, K, N_total, sc.w_f16);
         gemm_f16(sc.x_f16, sc.w_f16, Y + n0, M, nc, K, N);
     }
     return true;

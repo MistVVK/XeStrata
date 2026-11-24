@@ -122,8 +122,8 @@ class FirstModel(unittest.TestCase):
     def test_the_first_this_pc_runs_in_the_users_order(self):
         # the user's order of 2026-11-22: SC117's Swift 1.5 (IQ3_S, else IQ3_XXS, each where it runs with most of its
         # experts on the GPUs), Signal-2 where the RAM holds its peak else Sync, then (2026-11-23 13:17) Inkling-2-Mini
-        # (QSA), SenseNova, Qwen3.5-2B.  Inkling's step takes the plain MoE's rule of size_fits (its file in RAM and
-        # VRAM with 8 GB beside it): no bound of its own until the MODEL check measures one
+        # (QSA), SenseNova, Qwen3.5-2B.  Inkling's step takes a size whose experts all fit the card at 32K (the MODEL
+        # check's INKLING_CARD_GB, 2026-11-24): SQ-10 from 14.3 GiB, SQ-15 from 17.9, SQ-20 from 22.5
         cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB of RAM, a 32 GB card
                  ((123.2, 31.89), ("sc117-swift", "IQ3_S")),     # as an Arc Pro B70 reads
                  ((123.2, 30), ("sc117-swift", "IQ3_XXS")),      # most of IQ3_XXS's experts on it, not of IQ3_S's
@@ -138,9 +138,11 @@ class FirstModel(unittest.TestCase):
                  ((52, 0), ("sync", "Sync-M")),
                  ((32, 12), ("sync", "Sync-S")),
                  ((24, 8), ("sync", "Sync-XS")),
-                 ((20, 16), ("inkling-qsa", "SQ-20")),
-                 ((20, 8), ("inkling-qsa", "SQ-15")),
-                 ((16, 8), ("inkling-qsa", "SQ-10")),
+                 ((20, 24), ("inkling-qsa", "SQ-20")),
+                 ((20, 20), ("inkling-qsa", "SQ-15")),
+                 ((20, 16), ("inkling-qsa", "SQ-10")),
+                 ((20, 12), ("sensenova-loop-qsa", "Q5_K_M")),    # Inkling's experts would run from host memory
+                 ((16, 8), ("qwen35-2b", "Q8_0")),
                  ((12, 8), ("qwen35-2b", "Q8_0")),
                  ((2, 1), ("qwen35-2b", "Q4_K_M"))]               # nothing runs: the last choice
         with with_other_branches():
