@@ -130,6 +130,8 @@ HF_REVISIONS = {
     # 2026-11-23: Inkling-2-Mini's .strata v1.1 files (upstream inkling2's) and the QSA indexer beside them
     "strata-engine/Inkling-2-Mini-Strata": "04996a1e2c45009b6a04f2af126cb6bdb2ba3587",              # 2026-11-23
     "tamanekokoro/Inkling-2-Mini-QSA-Indexer": "389228e3d8c78fda6455f023939d11d29e48555e",          # 2026-11-23
+    # 2026-11-24: Unsloth's GGUF of Inkling-2-Mini (its Mainline_Support folder), the engine's .gguf path beside .strata
+    "unsloth/Inkling-2-Mini-GGUF": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",                      # 2026-11-21
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
     "hiru2005/Sync-XS": "7caf39170ffd473ec37ffc15e853ba9b79f55648",
@@ -211,6 +213,11 @@ MODEL_TERMS: dict[str, dict] = {
     "tamanekokoro/Inkling-2-Mini-QSA-Indexer": {
         "license": "MIT",
         "card": "mit",
+        "texts": [],
+    },
+    "unsloth/Inkling-2-Mini-GGUF": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
         "texts": [],
     },
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": {
@@ -1534,6 +1541,17 @@ INKLING_QSA_FILE = "inkling2-qsa-indexer-v3.bin"
 INKLING_QSA_SIDE = (_INKLING_QSA, INKLING_QSA_FILE, 23601344,
                     "b1d68173617821a7ce4a110c3ce3a4335fdce331b8d217f1d17517302c2725f7")
 INKLING_SIZES = ("SQ-20", "SQ-15", "SQ-10")
+# The card (GiB) that holds every expert of a size at 32K: the engine's device memory at 32K (2026-11-24, Arc Pro B70
+# under XESTRATA_VRAM_LIMIT_MIB: SQ-20 19.49, SQ-15 14.84, SQ-10 11.23, UD-Q4_K_XL 17.98 GiB) and the ~3 GiB it leaves
+# free (core::vram_room).  Below it the rest of the experts run from host memory: decode fell from 26 to 28 tok/s (all
+# in VRAM) to 14 to 21 on a 16 GiB card and to 10 to 13 on a 12 GiB one, so setup offers a size only where it fits.
+INKLING_CARD_GB = {"SQ-20": 22.5, "SQ-15": 17.9, "SQ-10": 14.3, "UD-Q4_K_XL": 21.0}
+# Unsloth's UD-Q4_K_XL in the mainline layout (Mainline_Support's `.gguf_file`, installed under its `.gguf` name): the
+# engine reads it as it is (NVFP4 experts in layers 0..19, Q8_0 in 20..23 and in the dense weights; 2026-11-24, B70:
+# the same speed as SQ-15, about 4 GB more VRAM, no DSpark drafter in the file).  Chosen by hand, never by setup
+# ("by_hand"); the tokenizer and template are strata-engine's, the same 200,058 tokens.
+_INKLING_GGUF = "unsloth/Inkling-2-Mini-GGUF"
+INKLING_GGUF = {"UD-Q4_K_XL": (17629760736, "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3")}
 
 
 def inkling_models(qsa: bool) -> dict:
@@ -1545,12 +1563,20 @@ def inkling_models(qsa: bool) -> dict:
         out[m] = {"repo": _INKLING, "file": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1],
                   "parts": [{"path": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1]},
                             *({"repo": r, "path": p, "size": n, "sha256": h} for r, p, n, h in side)],
-                  "about": INKLING_ABOUT[m]}
+                  "about": INKLING_ABOUT[m], "card_gb": INKLING_CARD_GB[m]}
+    for m, (n, h) in INKLING_GGUF.items():
+        f = f"Inkling-2-Mini-{m}.gguf"
+        out[m] = {"repo": _INKLING_GGUF, "file": f, "size": n, "sha256": h, "quantizer": "unsloth", "by_hand": True,
+                  "parts": [{"path": f"Mainline_Support/Inkling-2-Mini-{m}.gguf_file", "local": f, "size": n,
+                             "sha256": h},
+                            *({"repo": r, "path": p, "size": k, "sha256": x} for r, p, k, x in side)],
+                  "about": INKLING_ABOUT[m], "card_gb": INKLING_CARD_GB[m]}
     return out
 
 
 INKLING_ABOUT = {"SQ-20": "NVFP4 and MXFP8 experts as published, the largest",
-                 "SQ-15": "4- and 5-bit experts, the middle", "SQ-10": "2- and 3-bit experts, the smallest"}
+                 "SQ-15": "4- and 5-bit experts, the middle", "SQ-10": "2- and 3-bit experts, the smallest",
+                 "UD-Q4_K_XL": "Unsloth's GGUF: NVFP4 and Q8_0 experts, no DSpark drafter"}
 
 PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     # Inkling-2-Mini: the text model, on the engine's .strata path (src/inkling2): 1..64 slots and DSpark drafts
@@ -6966,6 +6992,8 @@ def size_fits(family: str, size: str, room: Room) -> bool:
             return bool(fam.get("cpu")) and cpu_ram_gb(fam, cpu_ctx(fam, room.ram)) <= room.ram
         if fam.get("dense"):
             return room.gpu_gb >= dense_vram_gb(fam, d, min(DENSE_MIN_CTX, fam["max_context"]))
+        if d.get("card_gb"):    # Inkling-2-Mini: every expert on one card (INKLING_CARD_GB; plain_vram is its less 5)
+            return room.plain_vram + 5 >= d["card_gb"] and room.ram >= 8
         return room.ram + room.plain_vram >= d["size"] / 1e9 + 8
     d = MODELS[size]
     if family == "sync":
@@ -6994,7 +7022,8 @@ def recommend_size(family: str, room: Room, names: list | None = None) -> str:
     if room.on_cpu and fam.get("default") in names:
         return fam["default"]
     order = sorted(names, key=lambda m: size_quality(family, m))
-    kept = [m for m in order if not (not fam.get("plain") and MODELS[m].get("experimental"))] or order
+    kept = [m for m in order if not (not fam.get("plain") and MODELS[m].get("experimental"))
+            and not (fam.get("plain") and fam["models"][m].get("by_hand"))] or order
     if fam.get("plain"):
         top = [m for m in kept if m not in UNQUANTIZED and
                (PLAIN_TOP not in kept or size_quality(family, m) <= size_quality(family, PLAIN_TOP))]

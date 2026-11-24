@@ -81,11 +81,11 @@ class FirstOffered(unittest.TestCase):
         self.assertIn("passed over", said)
 
     def test_each_closed_step_in_turn(self):
-        # 32 GB of RAM and a 12 GB card: Sync-S; Sync's, Inkling's and SenseNova's repositories closed -> Qwen3.5-2B
-        r = room(32, 12)
+        # 32 GB of RAM and a 16 GB card: Sync-S; Sync's, Inkling's and SenseNova's repositories closed -> Qwen3.5-2B
+        r = room(32, 16)
         self.assertEqual(setup.first_choice(FAMS, r), ("sync", None))
         self.assertEqual(setup.first_choice([f for f in FAMS if f != "sync"], r)[0], "inkling-qsa")
-        got, said = self.offered(closed(setup.SYNC_REPOS["Sync-S"], setup._INKLING, setup.SENSENOVA_QSA_REPO), 32, 12)
+        got, said = self.offered(closed(setup.SYNC_REPOS["Sync-S"], setup._INKLING, setup.SENSENOVA_QSA_REPO), 32, 16)
         self.assertEqual(got[0], "qwen35-2b")
         self.assertIn(setup.SYNC_REPOS["Sync-S"], said)
         self.assertIn(setup.SENSENOVA_QSA_REPO, said)
