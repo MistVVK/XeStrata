@@ -612,9 +612,13 @@ bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bo
 /// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
 void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 (off, upstream 9624759956); "auto": 0 until the
+/// serve start-up sets rank 7 where its rule allows (tail_skip_auto).
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// STRATA_ROUTE_TAIL_SKIP=auto: the serve start-up's rule picks the rank (7, or off with every expert in VRAM, 90% or
+/// more cached, or --batch slots)
+bool tail_skip_auto();
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 /// The routing counts expert_pool_dispatch_multi keeps for layer d.layers (d.usage, or d.route_rec by window), for a
@@ -903,6 +907,14 @@ public:
     }
     /// The page cache's room (see the gate) over the experts' bytes; 0 when unknown.
     double cache_room_ratio() const;
+    /// Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (integrated_gpu: its "VRAM" is the RAM) and
+    /// holds every expert in its cache reads nothing from the files again, and the pages the start read from them are
+    /// a second copy of the cache's bytes.  Gives them back, expert by expert: madvise(MADV_DONTNEED) on the blob's
+    /// whole pages in this source's mappings, then posix_fadvise(DONTNEED) on the same file range (clean pages, no
+    /// root needed; a page shared with a neighbouring blob stays).  `keep(layer, expert)` true keeps that expert's
+    /// pages (the experts of the slots the prompt path borrows: their refill reads them again).  The mappings stay; a
+    /// later read faults the bytes in from the file.  Returns the bytes released (0: nothing, or not Linux).
+    uint64_t drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep);
 
 private:
     /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null

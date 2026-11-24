@@ -464,3 +464,33 @@ class NoServers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HttpSessionRestart(unittest.TestCase):
+    """台帳 0634（upstream 2b81d475ee）: 再起動した server の古い session を 1 度だけ再初期化して再送する。"""
+
+    def check_mode(self, mode):
+        httpd = fake.http_server(0, unknown_session=mode)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        hub = McpHub({"web": {"url": url}}, {"timeout_s": 5.0})
+        try:
+            hub.start(wait=True)
+            hub.routes()
+            self.assertEqual(hub.call("web__echo", {"text": "before"})["text"], "before")
+            old = hub.servers["web"].transport.session
+            httpd.restart()                         # the server forgot the session
+            self.assertEqual(hub.call("web__echo", {"text": "after"})["text"], "after")
+            self.assertNotEqual(hub.servers["web"].transport.session, old)
+        finally:
+            hub.close()
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_404_session(self):
+        self.check_mode("404")
+
+    def test_jsonrpc_error_in_a_200(self):
+        self.check_mode("jsonrpc-200")
+
+    def test_jsonrpc_error_in_a_400(self):
+        self.check_mode("jsonrpc-400")

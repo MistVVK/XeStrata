@@ -471,6 +471,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
         strata::core::diag_pool_fn().store(&diag_active_pool);
         split_.resize((size_t) kMaxSplit);
         split_multi_.resize((size_t) kMaxSplitMulti);
+        dep_.reset(new DepExpert[(size_t) kMaxSplitMulti]);
+        // XESTRATA_POOL_DEP: on unless "0" (bit-exact against the two-phase batch; =0 is the way back to it)
+        dep_on_ = [] { const char* v = strata::env_get("POOL_DEP"); return v == nullptr || v[0] != '0'; }();
     }
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
@@ -659,6 +662,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 7) {
             (*fn_)(fn_offset_ + (int) i);
+        } else if (mode_ == 8) {
+            dep_task((int) i);   // XESTRATA_POOL_DEP: the one-batch native layer call
         } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -721,6 +726,51 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+// XESTRATA_POOL_DEP: task i of a mode-8 batch (DepExpert, pool.hpp): i < nb * k_gu = gate/up rows, then down rows.
+// The calls are run_split_multi_native's two phases', per expert and row range.
+void ExpertPool::dep_task(int i) {
+    const int ngu = dep_nb_ * dep_k_gu_;
+    if (i < ngu) {
+        const int e = i / dep_k_gu_, p = i % dep_k_gu_;
+        const NativeFmt& f = mjobs_[e].fmt != nullptr ? *mjobs_[e].fmt : *nfmt_;
+        const int h = (int) f.n_ff;
+        const int r0 = (int) ((int64_t) h * p / dep_k_gu_), r1 = (int) ((int64_t) h * (p + 1) / dep_k_gu_);
+        SplitBufMulti& sb = split_multi_[(size_t) e];
+        float* ff[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+        native_gu_rows(f, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+        dep_[(size_t) e].gu_left.fetch_sub(1, std::memory_order_release);   // the rows above are visible to whoever sees 0
+        return;
+    }
+    const int j = i - ngu;
+    const int e = j / dep_k_dn_, p = j % dep_k_dn_;
+    const NativeFmt& f = mjobs_[e].fmt != nullptr ? *mjobs_[e].fmt : *nfmt_;
+    const bool q2 = f.d_type == 42 && !canon_layer(f);
+    DepExpert& d = dep_[(size_t) e];
+    while (d.gu_left.load(std::memory_order_acquire) > 0) _mm_pause();   // claimed earlier, so running somewhere
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    int expect = 0;
+    if (d.quant.compare_exchange_strong(expect, 1, std::memory_order_acquire)) {
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            if (q2) act_quant_any(sb.ff[t], (int) f.n_ff, sb.a2[t]);
+            else native_quant_h(f, sb.ff[t], sb.hq[t]);
+        d.quant.store(2, std::memory_order_release);
+    } else {
+        while (d.quant.load(std::memory_order_acquire) != 2) _mm_pause();
+    }
+    const int h = (int) f.n_embd;
+    const int r0 = (int) ((int64_t) h * p / dep_k_dn_), r1 = (int) ((int64_t) h * (p + 1) / dep_k_dn_);
+    if (q2) {
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(mjobs_[e].blob + f.down_off, f.d_row, (int) (f.n_ff / 64), a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    } else {
+        const void* hq[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+        native_down_rows(f, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    }
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
     wait_parked("before a phase");
     mode_ = mode;
@@ -747,6 +797,19 @@ void ExpertPool::run(int n, const std::function<void(int)>& fn) {
         offset += count;
     }
     fn_ = nullptr;
+}
+
+void ExpertPool::run_items(int n, int chunk, int min_items, const std::function<void(int)>& fn) {
+    static const bool on = [] { const char* v = strata::env_get("POOL_ITEMS"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    if (n <= 0) return;
+    chunk = std::max(chunk, 1);
+    if (!on || n_ == 0 || n < min_items || n <= chunk) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    run((n + chunk - 1) / chunk, [&](int p) {
+        for (int i = p * chunk, e = std::min(n, i + chunk); i < e; ++i) fn(i);
+    });
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -819,6 +882,20 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+        if (dep_on_ && n_ > 1) {
+            // XESTRATA_POOL_DEP: the whole layer call as one batch, no barrier between the phases (DepExpert, pool.hpp)
+            dep_nb_ = nb;
+            dep_k_gu_ = (std::max)(1, (std::min)((int) f.n_ff, (phase_tasks((int64_t) nb * f.n_ff) + nb - 1) / nb));
+            dep_k_dn_ = (std::max)(1, (std::min)((int) f.n_embd, (phase_tasks((int64_t) nb * f.n_embd) + nb - 1) / nb));
+            for (int e = 0; e < nb; ++e) {
+                dep_[(size_t) e].gu_left.store(dep_k_gu_, std::memory_order_relaxed);
+                dep_[(size_t) e].quant.store(0, std::memory_order_relaxed);
+            }
+            const auto a = std::chrono::steady_clock::now();
+            run_phase(8, nb * (dep_k_gu_ + dep_k_dn_));
+            ms_multi_gu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+            continue;
+        }
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();

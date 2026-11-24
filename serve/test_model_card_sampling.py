@@ -19,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, model_card_sampling, serve  # noqa: E402
+from serve.server import (ByteTokenizer, MockEngine, Service, StrataEngine, asks_greedy,  # noqa: E402
+                          model_card_sampling, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +53,7 @@ class ModelCardSampling(unittest.TestCase):
 
     def tearDown(self):
         self.svc.model_arch = None
+        self.svc.mtp_greedy = False
 
     def keys(self, **body):
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, **body}
@@ -68,6 +70,17 @@ class ModelCardSampling(unittest.TestCase):
         self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
         self.assertEqual(model_card_sampling(None, True), {})
         self.assertEqual(model_card_sampling("unknown", False), {})
+
+    def test_mtp_greedy_opt_in(self):
+        # "mtp_greedy": true (upstream d353539037, opt-in here): a request naming no sampling stays greedy; one that
+        # names any keeps the card for the rest, as without it
+        self.svc.mtp_greedy = True
+        self.assertNotIn("temperature=1.0", self.keys())
+        k = self.keys(top_p=0.9)
+        self.assertIn("temperature=1.0", k)
+        self.assertIn("top_p=0.9", k)
+        self.svc.sampling_defaults = {"temperature": 0.6}
+        self.assertIn("temperature=0.6", self.keys())
 
     def test_thinking_default(self):
         k = self.keys()
@@ -105,6 +118,34 @@ class ModelCardSampling(unittest.TestCase):
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")
+
+
+class GreedyCard(ModelCardSampling):
+    """台帳 0791（upstream d7ce708baf、issue #69）: temperature 0 ではカードの penalty を落とす。"""
+
+    def test_greedy_gets_no_card_penalty(self):
+        k = self.keys(temperature=0, reasoning_effort="none")
+        self.assertNotIn("penalty_present", k)
+        self.svc.model_arch = "qwen35moe"
+        self.assertNotIn("penalty_present", self.keys(temperature=0))
+        self.assertNotIn("penalty_present", self.keys(temperature=0, reasoning_effort="none"))
+        self.assertIn("penalty_present=1.2", self.keys(temperature=0, presence_penalty=1.2))
+        self.assertIn("penalty_present=1.5", self.keys(temperature=0.3))
+        self.svc.sampling_defaults = {"temperature": 0}
+        self.assertNotIn("penalty_present", self.keys())
+        self.assertIn("penalty_present=1.5", self.keys(temperature=0.7))
+        self.svc.sampling_defaults = {}
+        self.svc.shared = {"temperature": 0}
+        self.assertNotIn("penalty_present", self.keys())
+
+    def test_asks_greedy(self):
+        self.assertTrue(asks_greedy({"temperature": 0}))
+        self.assertTrue(asks_greedy({}, {"temperature": 0.0}))
+        self.assertFalse(asks_greedy({"temperature": 0.5}, {"temperature": 0}))
+        self.assertFalse(asks_greedy({"temperature": None}, {}))
+        self.assertFalse(asks_greedy())
+        self.assertEqual(model_card_sampling("qwen35moe", True, greedy=True),
+                         {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
 
 
 if __name__ == "__main__":

@@ -83,7 +83,10 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
-        self.source = keep_thinking_switch(Path(path).read_text(encoding="utf-8"))
+        # Hugging Face's {% generation %} ... {% endgeneration %} only mark the assistant's tokens for training
+        # (Inkling-2-Mini's template has them): Jinja has no such tag, and rendering needs nothing of them
+        self.source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "",
+                             keep_thinking_switch(Path(path).read_text(encoding="utf-8")))
         self.template = env.from_string(self.source)
         # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
         self.harmony = "<|channel|>" in self.source
@@ -93,6 +96,9 @@ class ChatTemplate:
         # GLM's templates (GLM-5.3-Flash): a call is `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
         # </tool_call>`, read through GlmCallRewriter; the thinking always opened, its effort low, high or max
         self.call_form = "glm" if "<arg_key>" in self.source else "qwen"
+        # Inkling-2-Mini's template: its replies are channel tokens (serve/inkling_dialect.py reads them), its calls'
+        # arguments parsed objects, and no thinking (upstream inkling2's no-thinking mode)
+        self.inkling = "<|content_invoke_tool_json|>" in self.source
         self.caps = self._detect_caps()
         self.thinking = self._thinking_levels()
 
@@ -101,6 +107,8 @@ class ChatTemplate:
         (/health's "thinking", the web page's buttons): GLM-5.3-Flash's low, high and max; Harmony's (llm-jp-4.1's)
         low, medium and high, medium its default; Qwen3.8-Flash-Next's low, medium and high (xhigh); a template that
         only turns its thinking on and off, on; none at all, no levels."""
+        if self.inkling:
+            return {"levels": [], "default": None}
         if self.call_form == "glm":
             return {"levels": ["none", "low", "high", "max"], "default": "max"}
         if self.harmony:
@@ -131,6 +139,9 @@ class ChatTemplate:
                         m.pop("content", None)
                 adjusted.append(m)
             messages = adjusted
+        if self.inkling:
+            from serve import inkling_dialect
+            messages, kwargs = inkling_dialect.prepare_messages(messages), inkling_dialect.template_kwargs(kwargs)
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         if self.call_form == "glm":        # its efforts: low, high and max (the default), taken by name
@@ -320,7 +331,8 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking",
+                                                           "tool_addition")
 
 
 def _check_parts(content, path: str, kinds):
@@ -627,7 +639,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
                               lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
-def tool_arguments(raw) -> dict:
+def tool_arguments(raw, declared=None) -> dict:
     """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
     (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
     number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
@@ -639,6 +651,10 @@ def tool_arguments(raw) -> dict:
         try:
             value = json.loads(raw)
         except ValueError:
+            if declared is None or "arguments" not in declared:
+                cut = cut_arguments(raw)
+                if cut is not None:
+                    return cut
             return {"arguments": raw}
         return value if isinstance(value, dict) else {"arguments": raw}
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
@@ -751,7 +767,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))},
+                calls.append({"function": {"name": fn.get("name"),
+                                           "arguments": tool_arguments(
+                                               fn.get("arguments"),
+                                               declared_parameters(req.get("tools"), fn.get("name")))},
                               "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
@@ -891,8 +910,50 @@ def anthropic_tools(req: dict) -> tuple[list[dict] | None, bool]:
     tool is deferred).  A deferred tool is callable although the prompt does not list it.  A client that defers tools
     (Claude Code) holds back more than it declares - it names the rest in the conversation and runs a call for any of
     them - so with one deferred tool a call for an undeclared name is a call too (OutputParser's `deferred`)."""
-    tools = _tool_list(req.get("tools"), None)
+    tools = _anthropic_callables(req)
     return [_anthropic_tool(t) for t in tools] or None, any(t.get("defer_loading") for t in tools)
+
+
+def _anthropic_callables(req: dict) -> list[dict]:
+    """台帳 0667/0668（upstream 5f5a35b856/398ff4b5a6、#5952）: 要求の tools に加え、system message の
+    tool_addition が足した定義も呼べるようにする。同じ名前は最初の定義一つだけ。「tools」自体は書き換えない。"""
+    tools = list(_tool_list(req.get("tools"), None))
+    names = {t["name"] for t in tools}
+    for d in _tool_additions(req):
+        if d["name"] not in names:
+            names.add(d["name"])
+            tools.append(d)
+    return tools
+
+
+def _tool_addition(block) -> dict | None:
+    """tool_addition の定義。Claude Code がセッションの途中で接続した MCP の工具を
+    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {...}}} で送る形だけ受ける。"""
+    tool = block.get("tool") if isinstance(block, dict) else None
+    if not isinstance(tool, dict) or tool.get("type") != "tool_definition":
+        return None
+    d = tool.get("definition")
+    if (isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"]
+            and isinstance(d.get("input_schema", {}), dict) and isinstance(d.get("description", ""), str)):
+        return d
+    return None
+
+
+def _tool_additions(req: dict) -> list[dict]:
+    """system message の tool_addition が足した定義を順に集める。user/assistant の turn にある
+    同じ block は張り付けた文章などなので、工具としては扱わない。"""
+    out = []
+    messages = req.get("messages")
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        content = m.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_addition":
+                d = _tool_addition(block)
+                if d is not None:
+                    out.append(d)
+    return out
 
 
 def _tool_references(content, deferred: dict):
@@ -917,6 +978,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     declared = _tool_list(req.get("tools"), None)
     # #4663: a `defer_loading` tool stays out of the prompt's tool list until a tool_reference loads it
     deferred = {t["name"]: _anthropic_tool(t) for t in declared if t.get("defer_loading")}
+    # 台帳 0668: すでに prompt の先頭に載っている名前は tool_addition で再掲しない。added な工具は
+    # 呼び出し側と同じ定義（_anthropic_callables）を表示する。
+    shown = {t["name"] for t in declared if t["name"] not in deferred}
+    callable_defs: dict[str, dict] = {}
+    for t in _anthropic_callables(req):
+        callable_defs.setdefault(t["name"], t)
     messages = []
     system = req.get("system")
     if system:
@@ -950,8 +1017,22 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 signed = _signed_thinking(block.get("data"), f"messages[{i}].content[{j}]")
                 if signed is not None:
                     reasoning.append(signed)
+            elif kind == "tool_addition":
+                # 台帳 0667/0668: 定義を足した位置に tool_reference と同じ形で出す。prompt の先頭と cache は不変。
+                d = _tool_addition(block)
+                if d is None or m.get("role") != "system":
+                    LOGGER.debug("messages[%d].content[%d]: tool_addition left out of the prompt", i, j)
+                elif d["name"] not in shown:
+                    shown.add(d["name"])
+                    added = "<tools>\n" + json.dumps(_anthropic_tool(callable_defs[d["name"]]),
+                                                     ensure_ascii=False) + "\n</tools>"
+                    text.append(added)
+                    parts.append({"type": "text", "text": added})
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
+                calls.append({"function": {"name": block.get("name"),
+                                           "arguments": tool_arguments(
+                                               block.get("input"),
+                                               declared_parameters(req.get("tools"), block.get("name")))},
                               "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
@@ -1042,6 +1123,8 @@ class Event:
 THINK_END = "</think>"
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
+FUNCTION_CALLS_START = "<function_calls>"    # 台帳 carryover 20056dbbe（#6022、recover）
+FUNCTION_CALLS_END = "</function_calls>"
 
 
 PARAM_END = "</parameter>"
@@ -1087,7 +1170,17 @@ def _close_verdict(after: str, final: bool) -> str:
         tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
         if not final and CALL_END.startswith(tail):
             return "hold"                                  # #5040: `</tool_call>` is still arriving
-        return "end"                                       # the call is cut, or it has no wrapper: as before
+        # 台帳 carryover 404b5f45f: `</parameter>` の直後に `</function>` だけがある場合も、
+        # 同じ呼び出しの後にも closing tag が続くなら値の一部として扱う（XML のファイルなど）。
+        if not after.startswith(FUNC_END) or tail.startswith((CALL_START, FUNC_START)):
+            return "end"
+        if not final and (CALL_START.startswith(tail) or FUNC_START.startswith(tail)):
+            return "hold"
+        if PARAM_END in tail or FUNC_END in tail or CALL_END in tail:
+            return "continue"
+        if final or len(tail) > CLOSE_LOOKAHEAD_CHARS:
+            return "end"
+        return "hold"
     rest = after[m.end():].lstrip()
     if not rest:
         return "end" if final else "hold"                  # the usual call: the turn ends right after it
@@ -1104,22 +1197,42 @@ def _close_verdict(after: str, final: bool) -> str:
     return "hold"
 
 
-def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
+              split_repeats: bool = False) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
     `<parameter=` or `</function>`, or by the wrapper's `</tool_call>` when the call's `</function>` was left out
     (#4427) - the same text inside a value (a file that documents the call format, #210) is part of the value.
     #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than `</function>` before it), or one
-    followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.  -1: none yet;
+    followed by the same parameter `name` again, is part of the value too, unless `split_repeats` (台帳 0863:
+    a non-string parameter written twice is two writes, later wins).  `text` starts at the value.  -1: none yet;
     -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
         if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            # 台帳 carryover 859f0da47（#5756）: 値の中にある `<parameter=X>...</parameter>` の
+            # 同じ行の閉じは、値自身の閉じが省かれた時に値の終わりになる。
+            if hold and _nested_close(text, at):
+                skip_to = at + len(PARAM_END)
+                nafter = text[skip_to:].lstrip()
+                if nafter.startswith((FUNC_END, CALL_END)):
+                    verdict = _close_verdict(nafter, final)
+                    if verdict == "end":
+                        return skip_to
+                    if verdict == "hold":
+                        return -2
+                elif nafter.startswith(PARAM_START):
+                    gt = nafter.find(">")
+                    if gt < 0:
+                        return skip_to if final else -2
+                    return skip_to
+                elif not nafter and not final:
+                    return -2
             after = text[at + len(PARAM_END):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
                 if gt < 0:
                     return at if final else -2
-                if name is None or after[len(PARAM_START):gt].strip() != name:
+                if split_repeats or name is None or after[len(PARAM_START):gt].strip() != name:
                     return at
             elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
                 verdict = _close_verdict(after, final) if hold else "end"   # hold=False: a bare call keeps its old rule
@@ -1131,6 +1244,22 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                 return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
+
+
+def _nested_close(text: str, at: int) -> bool:
+    """`text[at]` が値の中の `<parameter=X>` の閉じか（台帳 carryover 859f0da47）。値自身の閉じは
+    改行の後にあるので、opener と同じ行にある閉じは入れ子の組の物とみなす。"""
+    opens = [m.start() for m in re.finditer(re.escape(PARAM_START), text[:at])]
+    if len(opens) <= text.count(PARAM_END, 0, at):
+        return False
+    return "\n" not in text[opens[-1]:at]
+
+
+def _close_len(text: str, at: int) -> int:
+    """How much `param_end`'s result consumes (台帳 carryover 859f0da47): 0 when the found close was a nested
+    pair's and the value's own closer was left out."""
+    return 0 if at >= len(PARAM_END) and text.startswith(PARAM_END, at - len(PARAM_END)) \
+        and _nested_close(text, at - len(PARAM_END)) else len(PARAM_END)
 
 
 def call_end(text: str, final: bool = False, hold: bool = True) -> int:
@@ -1156,7 +1285,7 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
             end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold)
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + _close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
@@ -1321,7 +1450,8 @@ def legacy_function_call(choice: dict) -> dict:
     return choice
 
 
-def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen",
+                callable_tools: list[dict] | None = None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  "none" is handled by the caller
@@ -1337,6 +1467,10 @@ def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> st
         # the model writes "<function=NAME>" itself: from a written "<function=", Qwen3.8 went on with names no tool
         # has, and the reply came back as text (upstream d7e555bdb)
         return CALL_START if form == "glm" else CALL_START + "\n"
+    # 台帳 0668: Anthropic の tool_addition が足した工具も tool_choice で指名できる。
+    if kind == "named" and name not in names and any(
+            isinstance(t, dict) and t.get("name") == name for t in callable_tools or []):
+        return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
     if kind == "named" and name in names:
         return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
     if kind == "named":
@@ -1371,7 +1505,7 @@ def function_end(text: str) -> int:
             end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False)  # the old rule
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + _close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             return pos + len(FUNC_END)
         else:
@@ -1422,6 +1556,8 @@ class _Lenient:
 
     def __init__(self, text: str):
         self.s, self.i = text, 0
+        self.cut_ok = False        # 台帳 P6 carryover 0c99fcf85: cut_arguments は途中で終わる文字列も読む
+        self.cut = False
 
     def peek(self) -> str:
         s, n = self.s, len(self.s)
@@ -1441,6 +1577,11 @@ class _Lenient:
             if c == "\\":
                 self.i += 1
                 e = s[self.i:self.i + 1]
+                if self.cut_ok and (not e or (e == "u" and len(s) - self.i - 1 < 4
+                                              and re.fullmatch(r"[0-9a-fA-F]*", s[self.i + 1:]))):
+                    self.i = len(s)
+                    self.cut = True
+                    return "".join(out)
                 if e == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", s[self.i + 1:self.i + 5]):
                     out.append(chr(int(s[self.i + 1:self.i + 5], 16)))
                     self.i += 5
@@ -1451,6 +1592,9 @@ class _Lenient:
             else:
                 out.append(c)
             self.i += 1
+        if self.cut_ok:
+            self.cut = True
+            return "".join(out)
         raise ValueError("string not closed")
 
     def value(self, depth: int = 0):
@@ -1522,6 +1666,66 @@ def lenient_json(text: str):
     if t[r.i:].strip("]}) \t\r\n"):
         raise ValueError("text after the value")
     return v
+
+
+def cut_arguments(text: str):
+    """`max_tokens` で切れた call の引数から読める member を取り出す（台帳 P6 carryover 0c99fcf85）。
+
+    完全な `"key": value` と、文字列の途中で終わっている値はそこまでを採る。数値・配列・
+    オブジェクトが切れた場合と key が切れた場合は落とす。復元できない物は None。"""
+    t = text.strip()
+    if not t.startswith("{") or len(t) > LENIENT_MAX:
+        return None
+    r = _Lenient(t)
+    r.cut_ok = True
+    r.i = 1
+    first = r.peek()
+    if first and first not in ('"', "'"):
+        return None
+    out: dict = {}
+    while True:
+        c = r.peek()
+        if not c or c == "}":
+            break
+        if c == ",":
+            r.i += 1
+            continue
+        if c not in ('"', "'"):
+            break
+        try:
+            key = r.string()
+            if r.cut or r.peek() != ":":
+                break
+            r.i += 1
+            value = r.value()
+        except (ValueError, RecursionError):
+            break
+        if r.cut:
+            if isinstance(value, str):
+                out[key] = value
+            break
+        if r.i >= len(t) and not isinstance(value, str):
+            break
+        out[key] = value
+    return out
+
+
+def declared_parameters(tools, name):
+    """要求が宣言した tool `name` の parameter 名の集合。無ければ空集合、その工具が無ければ None。"""
+    for t in tools if isinstance(tools, list) else ():
+        if not isinstance(t, dict):
+            continue
+        fn = t["function"] if isinstance(t.get("function"), dict) else t
+        if isinstance(t.get("tools"), list):                          # Responses の namespace
+            found = declared_parameters(t["tools"], name)
+            if found is not None:
+                return found
+        if isinstance(name, str) and name and (fn.get("name") == name or
+                                               (isinstance(fn.get("name"), str) and name.endswith("." + fn["name"]))):
+            schema = fn.get("parameters") or fn.get("input_schema")
+            props = schema.get("properties") if isinstance(schema, dict) else None
+            return set(props) if isinstance(props, dict) else set()
+    return None
 
 
 def _json_type(value) -> str:
@@ -1614,6 +1818,10 @@ def param_value(text: str, schema, root=None, notes: list | None = None):
     types, strings = _schema_hints(schema, root)
     if types == {"string"} and (strings is None or text in strings):
         return text
+    # upstream 1aabfb1ce4 (#5979, issue #71): the model's Python spelling of a declared boolean is the boolean.
+    # anyOf/oneOf and nullable booleans are already unioned by _schema_hints; a schema allowing strings keeps text.
+    if types is not None and "boolean" in types and "string" not in types and text.strip().lower() in ("true", "false"):
+        return text.strip().lower() == "true"
     try:
         value = json.loads(text)
     except ValueError:
@@ -1637,6 +1845,25 @@ def param_value(text: str, schema, root=None, notes: list | None = None):
     return value
 
 
+_SKIP = object()          # 台帳 0863: a parameter the model left out; it must not be sent as a written placeholder
+
+
+def _nonstring_type(schema, root=None) -> bool:
+    """Whether the declaration says the parameter is not a string (台帳 0863).  An unknown type keeps the old rule."""
+    types, _ = _schema_hints(schema, root)
+    return types is not None and "string" not in types
+
+
+def _argument_value(text: str, schema, root=None, notes: list | None = None):
+    """A parameter written in a call -> its value, or _SKIP for an empty/null placeholder where no string is allowed
+    (upstream 8426249f01, 台帳 0863).  A declaration that allows null gives null; otherwise the parameter is left out."""
+    types, _ = _schema_hints(schema, root)
+    s = text.strip()
+    if types is not None and "string" not in types and (not s or s.lower() in ("null", "none")):
+        return None if "null" in types else _SKIP
+    return param_value(text, schema, root, notes)
+
+
 def _properties(schema) -> dict:
     """A tool's parameters' properties, {} where the schema has none or is not an object (a boolean schema)."""
     params = schema.get("parameters") if isinstance(schema, dict) else None
@@ -1644,7 +1871,8 @@ def _properties(schema) -> dict:
     return props if isinstance(props, dict) else {}
 
 
-def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None) -> ToolCall:
+def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None,
+                    recover: bool = False) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
@@ -1656,19 +1884,40 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     props = _properties(schema)
     root = schema.get("parameters") if isinstance(schema, dict) else None
     args = {}
+    if recover and rest.lstrip().startswith("{"):
+        # 台帳 carryover 20056dbbe: `<function=T>{"k": v}</function>` の JSON 全体を引数として読む
+        try:
+            value, at = json.JSONDecoder().raw_decode(rest.lstrip())
+            tail = rest.lstrip()[at:].lstrip()
+            if isinstance(value, dict) and (not tail or tail.startswith((FUNC_END, CALL_END))):
+                args.update(value)
+                rest = ""
+        except ValueError:
+            pass
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True, name=pname.strip())
+        declared = props.get(pname)
+        # 台帳 0863: two writes of a non-string parameter are the same parameter; a later write wins.
+        end = param_end(rest, final=True, name=pname.strip(), split_repeats=_nonstring_type(declared, root))
         value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        rest = rest[end + _close_len(rest, end):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = param_value(value, props.get(pname), root, notes)
+        v = _argument_value(value, declared, root, notes)
+        if v is not _SKIP:
+            args[pname] = v
+    if recover and unwrap_arguments(args, props):
+        args = args["arguments"]
     return ToolCall(name=name, arguments=args)
+
+
+def unwrap_arguments(args: dict, props: dict) -> bool:
+    """台帳 carryover c447a2850（#5804）: 単一の <parameter=arguments> に JSON 全体が入った場合に展开する。"""
+    return list(args) == ["arguments"] and isinstance(args["arguments"], dict) and "arguments" not in props
 
 
 # ------------------------------------------------------------------------------------------------ harmony
@@ -1869,6 +2118,9 @@ class OutputParser:
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
+        self.rbare = False           # 台帳 carryover c447a2850: reasoning の裸の call
+        self.dialect_call = False    # 台帳 carryover 20056dbbe: <function_calls>/<invoke> を読み替えた call
+        self.dialect_wrapped = False  # <function_calls> の wrapper を読み替えた
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276: the end of a misspelt opener still arriving (see _opener)
@@ -1988,6 +2240,35 @@ class OutputParser:
             p = self.buf.find(FUNC_START, p + 1)
         return -1, False
 
+    def _rewrite_dialect(self) -> None:
+        """recover: Claude の方言 `<function_calls><invoke name=T>` と `<parameter name=P>` を
+        XeStrata の call 形式に書き換える（台帳 carryover 20056dbbe）。宣言された工具だけを読む。"""
+        if not self.recover or not self.schemas:
+            return
+        text = self.buf
+        if FUNCTION_CALLS_START not in text and FUNCTION_CALLS_END not in text and "<invoke name=" not in text \
+                and "<parameter name=" not in text and "</invoke>" not in text:
+            return
+        had_start, had_end = FUNCTION_CALLS_START in text, FUNCTION_CALLS_END in text
+        wrapped = had_start or had_end
+        if wrapped:
+            text = text.replace(FUNCTION_CALLS_START, CALL_START).replace(FUNCTION_CALLS_END, CALL_END)
+
+        def opener(m):
+            return m.group(1) + (f"<function={m.group(2)}>" if self._callable(m.group(2)) else m.group(0))
+
+        text = re.sub(r'(?m)^(\s*)<invoke name="([^"<>]+)"\s*>', opener, text)
+        text = text.replace("</invoke>", "</function>")
+        text = re.sub(r'<parameter name="([^"<>]+)"\s*>', r'<parameter=\1>', text)
+        self.dialect_wrapped = self.dialect_wrapped or had_start
+        self.dialect_call = True
+        self.buf = text
+
+    def _bare_in_reasoning(self):
+        """reasoning の中の宣言済み工具の裸の <function=NAME> を (位置, 決定済み) で返す。"""
+        b, decided = self._bare_opener()
+        return (b, decided) if b >= 0 else None
+
     @property
     def line(self) -> str:
         """Materialize the current line only for a decision, newline, or state snapshot."""
@@ -2038,8 +2319,14 @@ class OutputParser:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
                 elif not s:
                     self.ticks = 0
+                elif self.ticks % 2:
+                    self.ticks = (self.ticks + line.count("`")) % 2
                 else:
-                    self.ticks += line.count("`")
+                    # 台帳 carryover c447a2850/db0c38425（#4923）: 1 行の孤立した backtick で
+                    # その後の tool call が全部引用扱いにならないようにする。ただし行末の
+                    # backtick や markup の直前の物は行をまたぐ引用として残す。
+                    self.ticks = 1 if line.count("`") % 2 and \
+                        line[line.rfind("`") + 1:].strip()[:1] in ("", "<") else 0
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line
                 # that is not indented
                 if was_fenced or self.fence:
@@ -2122,6 +2409,8 @@ class OutputParser:
 
     def _reset_scan(self):
         self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
+        self._function_end_checked = 0
+        self._scan_parts = []        # consumed call body, kept in chunks until a structural walk or the final call
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
         self.ss = "name"             # name -> between -> str|raw -> ... -> function_done -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
@@ -2130,21 +2419,68 @@ class OutputParser:
         self.sprops = {}             # the streamed call's parameters' schemas
         self.sroot = None            # their reference resolution root (the full parameters schema)
         self.spname = ""             # the parameter being streamed
+        self.sraw_pname = ""         # its unstripped name (台帳 0863)
+        self.sheld: dict = {}        # non-string parameters, sent once at the call's end; a later write wins
         self.svstart = 0             # where its string value starts in self.buf (#4078)
+
+    def _restore_scan_body(self) -> None:
+        """Put the compacted call text back before a structural walk or the final parse (台帳 0869)."""
+        if not self._scan_parts:
+            return
+        prefix = "".join(self._scan_parts)
+        shift = len(prefix)
+        self.buf = prefix + self.buf
+        self.sp += shift
+        if self.ss == "str" and self.sval_started:
+            self.svstart += shift
+        if self._call_end_checked >= 0:
+            self._call_end_checked += shift
+        if self._function_end_checked >= 0:
+            self._function_end_checked += shift
+        self._scan_parts.clear()
+
+    def _compact_scan_body(self) -> None:
+        """Move consumed call text out of the string that grows on every token (台帳 0869, #4686)."""
+        if self.sp < 4096:
+            return
+        cut = self.sp
+        self._scan_parts.append(self.buf[:cut])
+        self.buf = self.buf[cut:]
+        self.sp = 0
+        if self.ss == "str" and self.sval_started:
+            self.svstart -= cut
+        if self._call_end_checked >= 0:
+            self._call_end_checked = max(0, self._call_end_checked - cut)
+        if self._function_end_checked >= 0:
+            self._function_end_checked = max(0, self._function_end_checked - cut)
+
+    def _function_end(self) -> int:
+        """Run the full function walk only when newly appended text contains a possible closer (台帳 0869)."""
+        start = max(0, self._function_end_checked - len(FUNC_END) + 1)
+        if self.buf.find(FUNC_END, start) < 0:
+            self._function_end_checked = len(self.buf)
+            return -1
+        self._restore_scan_body()
+        end = function_end(self.buf)
+        self._function_end_checked = -1 if end >= 0 else len(self.buf)
+        return end
 
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
         # newly appended text plus enough overlap for a tag split across feeds.
         # A literal closing tag inside a value needs structural disambiguation:
-        # once any candidate appears, keep the original full walk for this call.
-        # Recovery can rewrite the buffer, so it always uses the full walk.
-        if not self.recover and self._call_end_checked >= 0:
+        # once a candidate appears, restore the compacted text for the structural walk.  If it was a literal tag
+        # in a value, wait for a newly appended candidate rather than walking the unchanged body on every token.
+        if self._call_end_checked >= 0:
             start = max(0, self._call_end_checked - len(CALL_END) + 1)
             if self.buf.find(CALL_END, start) < 0:
                 self._call_end_checked = len(self.buf)
                 return -1
-            self._call_end_checked = -1
-        return call_end(self.buf, self._final)
+        self._restore_scan_body()
+        end = call_end(self.buf, self._final)
+        pending = end < 0 and not self._final and call_end(self.buf, final=True) >= 0
+        self._call_end_checked = -1 if end >= 0 or pending else len(self.buf)
+        return end
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -2176,18 +2512,37 @@ class OutputParser:
             elif self.ss == "between":
                 stripped = rest.lstrip()
                 self.sp += len(rest) - len(stripped)
+                if self.recover and stripped.startswith("{"):
+                    try:
+                        value, used = json.JSONDecoder().raw_decode(stripped)
+                    except ValueError:
+                        return out
+                    tail = stripped[used:].lstrip()
+                    if isinstance(value, dict) and (not tail or tail.startswith(FUNC_END) or FUNC_END.startswith(tail)):
+                        for k, v in value.items():
+                            self.sheld.pop(k, None)
+                            self.sheld[k] = v
+                        self.sp += used
+                        self.ss = "between"
+                        continue
+                    return out
                 if stripped.startswith("<parameter="):
                     b = stripped.find(">")
                     if b < 0:
                         return out
                     pname = self.spname = stripped[11:b]
-                    args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
-                    self.sfirst = False
+                    self.sraw_pname = pname
                     self.sp += b + 1
+                    held = _nonstring_type(self.sprops.get(pname), self.sroot) or \
+                        (self.recover and pname.strip() == "arguments")
+                    if not held:
+                        args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                        self.sfirst = False
                     if _text_only(self.sprops.get(pname), self.sroot):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
+                        # 台帳 0863: a declared non-string is held until the call closes, so a later write wins
                         self.ss = "raw"
                 elif stripped.startswith("</function>"):
                     self.sp += len("</function>")
@@ -2212,7 +2567,7 @@ class OutputParser:
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(PARAM_END)
+                    self.sp += end + _close_len(rest, end)
                     self.ss = "between"
                     continue
                 # an undecided </parameter> (-2) is held from its start, like a tag still arriving; so is a
@@ -2229,7 +2584,9 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, self._final, name=self.spname.strip())
+                declared = self.sprops.get(self.spname)
+                end = param_end(rest, self._final, name=self.spname.strip(),
+                                split_repeats=_nonstring_type(declared, self.sroot))
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -2237,8 +2594,15 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                args(json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                v = _argument_value(value, declared, self.sroot)
+                if self.sheld is not None and (_nonstring_type(declared, self.sroot)
+                                               or (self.recover and self.sraw_pname.strip() == "arguments")):
+                    if v is not _SKIP:
+                        self.sheld.pop(self.sraw_pname, None)
+                        self.sheld[self.sraw_pname] = v
+                elif v is not _SKIP:
+                    args(json.dumps(v, ensure_ascii=False))
+                self.sp += end + _close_len(rest, end)
                 self.ss = "between"
             else:
                 return out
@@ -2252,7 +2616,21 @@ class OutputParser:
         if self.ss == "str":
             tail += '"'
         elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
+            declared = self.sprops.get(self.spname)
+            v = _argument_value(self.buf[self.sp:].strip("\n"), declared, self.sroot)
+            if _nonstring_type(declared, self.sroot) or (self.recover and self.sraw_pname.strip() == "arguments"):
+                if v is not _SKIP:
+                    self.sheld.pop(self.sraw_pname, None)
+                    self.sheld[self.sraw_pname] = v
+            elif v is not _SKIP:
+                tail += json.dumps(v, ensure_ascii=False)
+        held = self.sheld
+        if self.recover and self.sfirst and unwrap_arguments(held, self.sprops):
+            held = held["arguments"]
+        for k, v in held.items():
+            tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+            self.sfirst = False
+        self.sheld = {}
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
@@ -2338,6 +2716,16 @@ class OutputParser:
             if held:
                 self._held = held
         held = self._prefixed() if self.schemas else None
+        if self.recover and self.schemas:
+            more = self._hold(self.buf, (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>",
+                                         "<parameter name="))
+            part = re.search(r'<(?:invoke|parameter)[^>]*name=?[^>]*$', self.buf)
+            if part:
+                more = max(more, len(self.buf) - part.start())
+            if more:
+                held = self.buf[-more:] + (held or "")
+                self.buf = self.buf[:-more]
+            self._rewrite_dialect()
         out = self._feed()
         if held:
             self.buf += held
@@ -2349,7 +2737,8 @@ class OutputParser:
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
-                body = self.buf[len(CALL_START):]
+                lead = 0 if self.rbare else len(CALL_START)
+                body = self.buf[lead:]
                 end, think = call_end(body, hold=False), body.find(THINK_END)
                 drop = len(CALL_END)
                 # #4427: as in the answer, a following call opener confirms an omitted closer
@@ -2357,33 +2746,35 @@ class OutputParser:
                 if f >= 0 and (end < 0 or f < end) and re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>",
                                                                 body[f:].lstrip()):
                     end, drop = f, 0
+                if self.rbare:
+                    end, drop = f, 0
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         name = self.aliases.get(name, name)
                         if self._callable(name):
-                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes)
+                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes, recover=self.recover)
                             call.name = name
                     except ValueError:
                         pass
-                    raw = self.buf[:len(CALL_START) + end + drop]
+                    raw = self.buf[:lead + end + drop]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
                         out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + drop:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
-                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
+                    out.append(Event("reasoning", self._track(self.buf[:lead + think])))
                     self.buf = body[think:]
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding back
                     out += self._release(False)
                     out.append(Event("reasoning", self._track(self.buf)))
                     self.buf = ""
-                    self.state = "reasoning"
+                    self.state, self.rbare = "reasoning", False
                 else:
                     return out
             elif self.state == "reasoning":
@@ -2396,17 +2787,32 @@ class OutputParser:
                         self.buf = stripped
                     if not self.buf:
                         return out
+                    bare = self._bare_in_reasoning() if self.recover and self.schemas else None
                     if self.buf.startswith(CALL_START):
                         self.state = "rcall"
+                    elif bare is not None and bare[0] == 0:
+                        if not bare[1]:
+                            return out
+                        self.state, self.rbare = "rcall", True
                     elif self.buf.startswith(THINK_END):
                         out += self._release(True)
-                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
+                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf) \
+                            or (bare is None and self.recover and self.schemas and FUNC_START.startswith(self.buf)):
                         return out
                     else:
                         out += self._release(False)
                     continue
                 i = self.buf.find(THINK_END)
                 tool = self.buf.find(CALL_START) if self.schemas else -1
+                bare = self._bare_in_reasoning() if self.recover and self.schemas else None
+                if bare is not None and (i < 0 or bare[0] < i) and (tool < 0 or bare[0] < tool):
+                    if bare[0]:
+                        out.append(Event("reasoning", self._track(self.buf[:bare[0]])))
+                        self.buf = self.buf[bare[0]:]
+                    if not bare[1]:
+                        return out
+                    self.state, self.rbare = "rcall", True
+                    continue
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
                         out.append(Event("reasoning", self._track(self.buf[:tool])))
@@ -2418,7 +2824,10 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    tags: tuple[str, ...] = (
+                        (THINK_END, CALL_START, FUNC_START) if self.recover else (THINK_END, CALL_START)) \
+                        if self.schemas else (THINK_END,)
+                    keep = self._hold(self.buf, tags)
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -2439,6 +2848,8 @@ class OutputParser:
                 self.state, self.lead, self.after_think = "content", True, True
                 self._reset_track()                                # the answer's own text starts here
             elif self.state == "content":
+                if self.recover and self.dialect_wrapped and CALL_END not in self.buf:
+                    return out          # 台帳 carryover 20056dbbe: <function_calls> の終わりまで文を出さない
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
                     if not stripped:
@@ -2477,8 +2888,11 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END) if self.after_think
-                                                   else (CALL_START,))
+                    tags = (CALL_START, THINK_END) if self.after_think else (CALL_START,)
+                    if self.recover and self.schemas:
+                        tags += (FUNCTION_CALLS_START, FUNCTION_CALLS_END, "<invoke name=", "</invoke>",
+                                 "<parameter name=")
+                    j = len(self.buf) - self._hold(self.buf, tags)
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
@@ -2594,7 +3008,7 @@ class OutputParser:
             else:
                 drop = None
                 if self.bare:                       # no wrapper: the call ends at its </function>; a stray
-                    i = function_end(self.buf)      # </tool_call> after it is the wrapper's closer, dropped
+                    i = self._function_end()        # </tool_call> after it is the wrapper's closer, dropped
                     if i >= 0:
                         after = self.buf[i:].lstrip()
                         if after.startswith(CALL_END):
@@ -2606,7 +3020,7 @@ class OutputParser:
                     if i >= 0:
                         drop = len(CALL_END)
                     # Only a following call opener confirms an omitted wrapper closer.
-                    f = function_end(self.buf)
+                    f = self._function_end()
                     nxt = self.buf[f:].lstrip() if f >= 0 else ""
                     if re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>", nxt):
                         i, drop = f, 0
@@ -2627,6 +3041,8 @@ class OutputParser:
                     else:
                         out += self._scan()
                 if i < 0 or drop is None:
+                    if self.stream_tools:
+                        self._compact_scan_body()
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + drop:]
@@ -2646,25 +3062,32 @@ class OutputParser:
         if self.buf and self.state in ("call", "rcall"):
             self._final = True      # #4701: a call held after its closing tags (could a file go on?) is whole now
             out += self.feed("")
+        self._restore_scan_body()   # the final feed may compact a still-incomplete streamed call again
+        self._rewrite_dialect()
+        if self.recover and self.dialect_wrapped and self.buf.rstrip().endswith(FUNC_END):
+            body = self.buf.rstrip()[len(CALL_START):]   # the dialect's wrapper closer was left out (#6022)
+            self.buf, self.state = "", "content"
+            self.dialect_call, self.dialect_wrapped = False, False
+            return out + self._finish_call(body)
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others
-            body = self.buf[len(CALL_START):]
+            body = self.buf[0 if self.rbare else len(CALL_START):]
             f = function_end(body)
             name = body.lstrip()[len(FUNC_START):].split(">", 1)[0].strip() if f >= 0 else ""
             name = self.aliases.get(name, name)
             if f >= 0 and not body[f:].strip() and self._callable(name):
                 try:
-                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes)
+                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes, recover=self.recover)
                     call.name = name
                     self.pending.append([self.buf, call])
-                    self.buf, self.state = "", "reasoning"
+                    self.buf, self.state, self.rbare = "", "reasoning", False
                 except ValueError:
                     pass
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:
-            i = function_end(self.buf)          # recover: a bare call is whole at its </function>
+            i = self._function_end()            # recover: a bare call is whole at its </function>
             body, rest = self.buf[:i], self.buf[i:].strip()
             self.buf = ""
             out += self._finish_call(body)
@@ -2683,12 +3106,25 @@ class OutputParser:
                     tail = json.dumps(rest)[1:-1] + '"'
                 else:
                     value = rest[1:] if rest.startswith("\n") else rest
-                    tail = json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False)
+                    declared = self.sprops.get(self.spname)
+                    v = _argument_value(value, declared, self.sroot)
+                    if (_nonstring_type(declared, self.sroot)
+                            or (self.recover and self.sraw_pname.strip() == "arguments")):
+                        if v is not _SKIP:
+                            self.sheld.pop(self.sraw_pname, None)
+                            self.sheld[self.sraw_pname] = v
+                        tail = ""
+                    else:
+                        tail = json.dumps(v, ensure_ascii=False) if v is not _SKIP else ""
+                for k, v in self.sheld.items():
+                    tail += ("" if self.sfirst else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+                    self.sfirst = False
+                self.sheld = {}
                 out.append(Event("tool_args", tail + "}", call=self.scall))
                 self.ss = "done"
                 call = self.scall
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
-                    call = parse_tool_call(fixed, self.schemas.get(call.name), self.notes)
+                    call = parse_tool_call(fixed, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
                 except ValueError:
                     pass
@@ -2701,7 +3137,7 @@ class OutputParser:
                 out += self._close_scan()
                 call = self.scall
                 try:            # the final event carries the call's arguments, as the one _finish_call sends does
-                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes)
+                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes, recover=self.recover)
                     call.name, call.id = self.scall.name, self.scall.id
                 except ValueError:
                     pass
@@ -2736,7 +3172,7 @@ class OutputParser:
         try:
             if raw_name != raw_name.strip() and name not in self.schemas:
                 raise ValueError("whitespace tool name is not declared")
-            call = parse_tool_call(body, self.schemas.get(name), self.notes)
+            call = parse_tool_call(body, self.schemas.get(name), self.notes, recover=self.recover)
             call.name = name
         except ValueError:
             if not self.recover:

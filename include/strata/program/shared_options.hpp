@@ -61,6 +61,10 @@ struct SharedOptionFields {
     bool spec_window_all = false;   ///< --spec-window all is taken (PlainModel's every-draft window)
     double* spec_min_p = nullptr;
     std::string* window_hashes = nullptr;   ///< --window-hashes PATH: a fingerprint line per verify window
+    /// --serve, --draft-costs FILE / --draft-costs-key TEXT: the window costs' table (strata/spec/draft_policy.hpp,
+    /// DraftCosts) and the server's part of what it is valid for
+    std::string* draft_costs = nullptr;
+    std::string* draft_costs_key = nullptr;
     // memory
     bool* mmap_experts = nullptr;
     int64_t* vram_free_mib = nullptr;
@@ -241,6 +245,8 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         return 1;
     }
     if (a == "--window-hashes" && f.window_hashes) { *f.window_hashes = next(a.c_str()); return 1; }
+    if (a == "--draft-costs" && f.draft_costs) { *f.draft_costs = next(a.c_str()); return 1; }
+    if (a == "--draft-costs-key" && f.draft_costs_key) { *f.draft_costs_key = next(a.c_str()); return 1; }
     if (a == "--mmap-experts" && f.mmap_experts) { *f.mmap_experts = true; return 1; }
     if (a == "--vram-free-mib" && f.vram_free_mib) {
         *f.vram_free_mib = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10));

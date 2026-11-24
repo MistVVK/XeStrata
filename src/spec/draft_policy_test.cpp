@@ -10,12 +10,20 @@
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap;
 //   6. XESTRATA_SPEC_COST's auto runs the plain window below the second context bucket and the cost-aware one
-//      from it.
+//      from it;
+//   7. --draft-costs: a fixed table is not moved by round times; the table file reads back what was written and
+//      refuses another key or a cut file; a table built from real rounds takes over once every size has kCalibN
+//      of them, priced at their median, and a start that reads it uses it at once; a table loaded without real
+//      sizes is held back (live costs) until kCalibReqs requests have run.
 #include "strata/spec/draft_policy.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
+using strata::spec::CostFile;
 using strata::spec::DraftPolicy;
 
 namespace {
@@ -175,6 +183,86 @@ int main() {
         check(r.cost_ms(4) > 60.0, "off: one table at every depth");
         set_cost_env("");
     }
+    {
+        DraftPolicy p(4);
+        const double tab[4] = {20.0, 25.0, 30.0, 35.0};
+        p.set_fixed_costs(tab, 4, 0);
+        for (int i = 0; i < 30; ++i) p.observe(false, 3, 2, 0, 90.0);
+        check(p.fixed() && p.cost_ms(3) == 30.0, "fixed costs: round times move no cost");
+        check(p.cost_ms(4) == 35.0 && p.cost_ms(1) == 20.0, "fixed costs: every size of the table");
+    }
+    const std::string path = (std::filesystem::temp_directory_path() / "xestrata-draft-policy-test" / "t.costs").string();
+    {
+        CostFile c;
+        c.key = "devices B70|args x";
+        c.n[0] = 3;
+        c.table[0][1] = 20.0; c.table[0][2] = 25.5; c.table[0][3] = 31.25;
+        c.reqs = 7;
+        c.real[0] = 1u;
+        c.real_cost[0][1] = 19.5;
+        c.cal[0][2].n = c.cal[0][2].nv = 2;
+        c.cal[0][2].vals[0] = 24.0; c.cal[0][2].vals[1] = 26.0; c.cal[0][2].sum = 50.0;
+        std::string why;
+        check(strata::spec::write_cost_file(path, c, why), "table file: written");
+        CostFile r;
+        const bool ok = strata::spec::read_cost_file(path, c.key, r, why);
+        check(ok && r.n[0] == 3 && r.table[0][3] == 31.25 && r.reqs == 7 && r.real[0] == 1u && r.real_cost[0][1] == 19.5 &&
+                  r.cal[0][2].n == 2 && r.cal[0][2].vals[1] == 26.0 && !r.fresh, "table file: read back as written");
+        check(!strata::spec::read_cost_file(path, "devices RTX|args x", r, why), "table file: another key is refused");
+        std::ifstream in(path);
+        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::ofstream(path, std::ios::trunc) << all.substr(0, all.rfind("end"));
+        check(!strata::spec::read_cost_file(path, c.key, r, why), "table file: a cut file is refused");
+    }
+    {
+        DraftPolicy p(4);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int t = 1; t <= 4; ++t) p.observe(false, t, t - 1, 0, cost(t));   // the live policy's first round of a size
+        CostFile out = cf;
+        std::string rep;
+        p.calibrate(out, rep);
+        check(p.table_held() && !p.fixed() && out.fresh, "built from real rounds: held while sizes lack rounds");
+        p.request_start();
+        for (int i = 0; i < DraftPolicy::kCalibN; ++i)
+            for (int t = 1; t <= 4; ++t) p.observe(false, t, t - 1, 0, cost(t) + (i == 3 ? 4.0 : 0.0) - (i == 5 ? 1.0 : 0.0));
+        p.request_end();
+        const bool wrote = p.calibrate(out, rep);
+        check(wrote && p.fixed() && !p.table_held() && !out.fresh && out.n[0] == 4, "built from real rounds: the table takes over");
+        check(std::fabs(p.cost_ms(3) - cost(3)) < 1e-9, "built from real rounds: a size's price is its rounds' median");
+        p.observe(false, 3, 2, 0, 500.0);
+        check(std::fabs(p.cost_ms(3) - cost(3)) < 1e-9, "built from real rounds: fixed after the take-over");
+        std::string why;
+        check(strata::spec::write_cost_file(path, out, why), "built from real rounds: written");
+        CostFile r;
+        DraftPolicy q(4);
+        if (strata::spec::read_cost_file(path, "k", r, why))
+            for (int k = 0; k < CostFile::kCtxBuckets; ++k)
+                if (r.n[(size_t) k] > 0) q.set_fixed_costs(r.table[(size_t) k].data() + 1, r.n[(size_t) k], k);
+        q.start_calibration(r);
+        bool same = q.fixed() && !q.calibrating();
+        for (int t = 1; t <= 4; ++t) same = same && std::fabs(q.cost_ms(t) - p.cost_ms(t)) < 1e-3;
+        check(same, "built from real rounds: the next start uses the same table at once");
+    }
+    {
+        DraftPolicy p(4);
+        const double tab[4] = {20.0, 25.0, 30.0, 35.0};
+        p.set_fixed_costs(tab, 4, 0);
+        CostFile cf;
+        cf.key = "k";
+        p.start_calibration(cf);
+        check(p.table_held() && !p.fixed(), "a table without real sizes: held back, live costs decide");
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        check(p.fixed() && p.cost_ms(2) == 25.0 && cf.reqs == DraftPolicy::kCalibReqs, "a held table: used after kCalibReqs requests");
+    }
+    std::filesystem::remove_all(std::filesystem::path(path).parent_path());
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

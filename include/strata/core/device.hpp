@@ -37,6 +37,9 @@ struct DeviceInfo {
 
 // Ordinal 0 is the GPU the runtime selected, 1.. the other usable GPUs (src/core/device.cpp, find_devices).
 DeviceInfo device_info(int ordinal = 0);
+/// The engine's devices as one line (each one's backend, name, memory, compute units and driver and runtime versions):
+/// what a table measured on them is valid for (--draft-costs).
+std::string devices_key_text();
 
 /// ONEAPI_DEVICE_SELECTOR's backend-local index, including devices the engine cannot use. Call only in a process
 /// without device filters: a filtered SYCL enumeration cannot recover the original indices.

@@ -17,6 +17,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/inkling2/engine.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/runtime.hpp"
@@ -111,6 +112,7 @@
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa_balancing.hpp"
 #include "strata/platform/io_priority.hpp"
 #include <fcntl.h>
 #include <filesystem>
@@ -578,6 +580,12 @@ struct Options {
     std::string draft_rule = "learn";   ///< --draft-rule df2|mtp|learn: a request without a draft= key (--draft auto)
     std::string draft_fallback = "none";   ///< --draft-fallback none|mtp: with --draft dflash2, load the MTP too
     int draft_mtp_spec = 0;   ///< --draft-mtp-spec N: the MTP's own window when DFlash2 is the primary (0 = --spec)
+    /// --serve, --draft-costs FILE (opt-in; the server passes it with "draft_costs": true): the draft policy's window
+    /// costs become a table built on this machine from its requests and then fixed, so the same request gives the same
+    /// windows on every start (strata/spec/draft_policy.hpp, DraftCosts).  A file built under another key (the devices,
+    /// the driver, the engine, the model, the settings: draft_costs_key) is built again.  --draft-costs-key TEXT: more
+    /// of the key from the server (the engine file's size).
+    std::string draft_costs, draft_costs_key;
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -749,6 +757,9 @@ void usage() {
                  "  --draft-rule df2|mtp|learn  a request without a draft= key under --draft auto (default learn)\n"
                  "  --draft-fallback none|mtp  with --draft dflash2, load the MTP layer too (default none)\n"
                  "  --draft-mtp-spec N   the MTP's own window when DFlash2 is the primary (0 = --spec)\n"
+                 "  --draft-costs FILE   --serve: the window costs a table built on this machine from its requests,\n"
+                 "                       then fixed (the same request, the same windows on every start); off: live\n"
+                 "  --draft-costs-key TEXT  more of what the table is valid for (the server's)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -2388,6 +2399,13 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(__linux__)
+    // upstream 87c9821bb1 (#4866): keep the kernel's NUMA scanner off the memory the GPU reads, before any thread is made
+    // or anything allocated (include/strata/platform/numa_balancing.hpp: it evicted the GPU queues for minutes per start
+    // on a two-socket host).  Both engines: the plain one runs from this main too.
+    if (const std::string numa = strata::platform::numa_balancing::keep_scanner_off(); !numa.empty())
+        std::fprintf(stderr, "%s\n", numa.c_str());
+#endif
     // upstream b89bf5947: not the low disk priority of the program that started this one (a model read at Low is
     // several times slower).  The plain engine runs from this main too (plain_generate.cpp's plain_main).
     strata::platform::restore_normal_io_priority();
@@ -2450,6 +2468,8 @@ int main(int argc, char** argv) {
     }
     for (int i = 1; i + 1 < argc; ++i)   // setup's --gguf: whether the model runs here, no GPU opened
         if (std::strcmp(argv[i], "--check-model") == 0) return check_model(argv[i + 1]);
+    // Inkling-2-Mini's .strata v1.1 file: its own engine (src/inkling2) on the engine's runtime
+    if (const int r = strata::inkling2::inkling_main(argc, argv); r >= 0) return r;
     // a model with one residual stream (Ornith-1.5): plain_generate.cpp runs it
     if (const int r = strata::program::plain_main(argc, argv); r >= 0) return r;
     Options o;
@@ -2480,6 +2500,8 @@ int main(int argc, char** argv) {
     shared.spec_window_given = &o.spec_window_given;
     shared.spec_min_p = &o.spec_min_p;
     shared.window_hashes = &o.window_hashes;
+    shared.draft_costs = &o.draft_costs;
+    shared.draft_costs_key = &o.draft_costs_key;
     shared.mmap_experts = &o.mmap_experts;
     shared.vram_free_mib = &o.vram_free_mib;
     shared.vram_elastic = &o.vram_elastic;
@@ -3612,7 +3634,9 @@ int main(int argc, char** argv) {
             copy_ms[(size_t) i] = strata::core::probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = strata::env_get("SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
-        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        // XESTRATA_SPLIT_LINK_MIN=r (opt-in, upstream becf4a3d9a): the gap from which the scale applies, 4 unless set
+        static const double link_min = strata::program::split_rules::link_scale_min_resolve(strata::env_get("SPLIT_LINK_MIN"));
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps, link_min);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
             if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
@@ -3647,13 +3671,13 @@ int main(int argc, char** argv) {
                        ? copy_ms[(size_t) d] + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
         };
         const bool drafts = !o.mtp.empty();
-        // the CPU's share of the misses left by the route tail skip (STRATA_ROUTE_TAIL_SKIP, rank 7 by default without
-        // --batch, below): the entries at rank >= R of the Ka routed are neither read nor computed, taken as that share
+        // the CPU's share of the misses left by the route tail skip (STRATA_ROUTE_TAIL_SKIP, off by default; =auto is rank 7
+        // without --batch, below): the entries at rank >= R of the Ka routed are neither read nor computed, taken as that share
         // of the missed bytes (#53: one RTX 4070 Ti skipped about 36% of its misses, the ranks 7 to 9 being 30% of the
         // routes, and the misses leaning to the low ranks).  Every placement skips, a helper GPU's experts excepted.
         const int tail_r = [&] {
-            const char* v = strata::env_get("ROUTE_TAIL_SKIP");
-            return v != nullptr ? (int) std::strtol(v, nullptr, 10) : o.batch <= 0 ? 7 : 0;
+            if (strata::core::tail_skip_auto()) return o.batch <= 0 ? 7 : 0;
+            return strata::core::tail_skip_rank();
         }();
         const double tail_keep = tail_r > 0 && tail_r < Ka ? (double) tail_r / (double) Ka : 1.0;
         // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
@@ -4677,6 +4701,8 @@ int main(int argc, char** argv) {
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
 #endif
+        // the memory guard credits the process's own mapped file pages back only when they are not locked (conversation_memory.hpp)
+        strata::core::set_locked_own_file_bytes(ple_table.locked() ? ple_table.table_bytes() : 0);
         if (pio.lock)
             std::fprintf(stderr, "xestrata generate: PLE table %s (%s) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -5383,6 +5409,7 @@ int main(int argc, char** argv) {
             // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
             const uint64_t table_b = ple_table.table_bytes();
             if (ple_table.unlock()) {
+                strata::core::set_locked_own_file_bytes(0);
                 strata::core::detail::HostMemory after;
                 std::string now;
                 if (strata::core::detail::host_available_memory(after)) {
@@ -7838,6 +7865,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (drive.d.remote_count > 0 && o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, *drive.d.remote[0], "serve");
+        // Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (the processor's own graphics, from the device's
+        // report) with every expert in its cache: the pages the start read from the model file are a second copy of the
+        // cache's bytes in the same RAM.  They are given back; the experts of the slots the prompt path borrows keep theirs
+        // (their refill reads them).  The cache holds the same bytes either way, so no output bit changes.
+        // XESTRATA_UMA_DROP_PAGES=0 keeps the pages.
+        if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && strata::core::device_info(0).integrated &&
+            strata::env_auto("UMA_DROP_PAGES") != 0) {
+            const int32_t keep_from = borrow != nullptr && lend_first >= 0 ? lend_first : INT32_MAX;
+            const auto t0 = Clock::now();
+            const uint64_t freed = src.drop_cached_pages([&](int64_t l, int64_t e) {
+                const int32_t sl = xcache.slot_of(l, e);
+                return sl != strata::core::kNotResident && sl >= keep_from;
+            });
+            if (freed > 0)
+                std::fprintf(stderr, "xestrata serve: this GPU shares the system RAM and holds every expert: the model file's "
+                                     "cached pages of %.2f GiB of experts are given back (%.1f ms; the experts the prompt path "
+                                     "borrows keep theirs; XESTRATA_UMA_DROP_PAGES=0 keeps them)\n",
+                             (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
         mem_mark("the head and the prompt path");
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
@@ -8367,6 +8413,7 @@ int main(int argc, char** argv) {
                 strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
                 const auto before = cache_room;
                 if (ple_table.unlock()) {
+                    strata::core::set_locked_own_file_bytes(0);
                     cache_room = strata::core::available_host_bytes();
                     std::fprintf(stderr, "xestrata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the "
                                          "conversation cache, %.1f GiB without it (the table stays cached)\n",
@@ -8995,40 +9042,42 @@ int main(int argc, char** argv) {
         strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         bool pcie_move_decided = false;   // the arena's move into host USM: decided once, after a prompt is read
         std::vector<int64_t> routed_seen;   // the prompts' routings already given to the adaptive tier's counts
-        {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
-            // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
-            // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
-            // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
-            // skip would depend on another's tokens).  A layer split is fine: each stage skips by itself; so is a helper
-            // GPU, whose experts are computed there and only the misses it does not hold are skipped (#53).
-            const char* tse = strata::env_get("ROUTE_TAIL_SKIP");
+        {   // STRATA_ROUTE_TAIL_SKIP: OFF BY DEFAULT (upstream 9624759956, owner 11-19; XeStrata's Q6 measurement 2026-11-23,
+            // RX 9060 XT, SC117 IQ3_XXS, serve's expert cache: rank 7 against 0 teacher-forced KL 0.0777 and top-1 90.1%
+            // against a repeat floor of 0.0190 and 95.3%, decode +12.4%).  A missed expert that every token of a verify
+            // window routes at the rank or lower is neither copied nor computed (answers differ slightly).  =7 turns it
+            // on, 1-9 pick a rank, =auto is the rule of before: rank 7 unless every expert is in VRAM, 90% or more are
+            // cached, or --batch slots mix requests in a window (one request's skip would depend on another's tokens).
+            // A layer split is fine: each stage skips by itself; so is a helper GPU, whose experts are computed there and
+            // only the misses it does not hold are skipped (#53).
+            const bool tail_auto = strata::core::tail_skip_auto();
             const bool all_experts_resident = !host_res.empty() &&
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
             // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
             // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
-            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
+            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line of =auto; 101 = never.
             size_t cached_experts = 0;
             for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
             const char* mcs = strata::env_get("TAIL_SKIP_MAX_CACHED");
             const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
             const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
                                            (double) cached_experts >= max_cached * (double) host_res.size();
-            if (tse == nullptr && nearly_all_cached && o.batch <= 0)
-                std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
-                                     "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
-                                     "it saves; XESTRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
+            if (tail_auto && nearly_all_cached && o.batch <= 0)
+                std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP=auto leaves it off: %.1f%% of the experts are "
+                                     "in the GPU cache, so few are missed and skipping them costs more draft acceptance "
+                                     "than it saves; XESTRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
                              100.0 * (double) cached_experts / (double) host_res.size());
-            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0)
+            if (tail_auto && !all_experts_resident && !nearly_all_cached && o.batch <= 0)
                 strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "xestrata serve: XESTRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert a token routes at rank "
-                                     "%d or lower contributes zero to it (answers differ slightly); "
-                                     "XESTRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
-                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-            // ranks below the default skip experts with larger weights: the answers drift further (rank 4 against 7,
+                                     "%d or lower contributes zero to it (answers differ slightly); it is off when "
+                                     "XESTRATA_ROUTE_TAIL_SKIP is not set or is 0\n", strata::core::tail_skip_rank(),
+                             tail_auto ? " (auto)" : "", strata::core::tail_skip_rank());
+            // ranks below 7 skip experts with larger weights: the answers drift further (rank 4 against 7,
             // IQ3_XXS, 2026-10-31: KL 0.0226 against 0.0066 on an RTX 4070, 0.0293 against 0.0072 on a B70 at 12 GiB)
             if (strata::core::tail_skip_rank() > 0 && strata::core::tail_skip_rank() < 7 && !all_experts_resident)
-                std::fprintf(stderr, "xestrata serve: info: XESTRATA_ROUTE_TAIL_SKIP=%d is below the default 7: the answers' "
+                std::fprintf(stderr, "xestrata serve: info: XESTRATA_ROUTE_TAIL_SKIP=%d is below 7: the answers' "
                                      "quality drops (at rank 4 they drift 3 to 4 times as far as at 7)\n",
                              strata::core::tail_skip_rank());
         }
@@ -9731,12 +9780,12 @@ int main(int argc, char** argv) {
                 M.budget("pool_workers", pool.workers());
                 M.budget("conversation_cache_mib", o.conversation_cache_mib);
                 M.budget("batch_slots", o.batch);
-                // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
-                // only where the configuration allows), not "off"
+                // upstream 9624759956: an unset XESTRATA_ROUTE_TAIL_SKIP is off; =auto skips only where the configuration allows
                 const int tail = strata::core::tail_skip_rank();
                 M.path("experts", "route_tail_skip", tail > 0,
-                       tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
-                                : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
+                       tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail) + (strata::core::tail_skip_auto() ? " (auto)" : "")
+                                : strata::core::tail_skip_auto() ? "XESTRATA_ROUTE_TAIL_SKIP=auto: off in this configuration"
+                                                                 : "XESTRATA_ROUTE_TAIL_SKIP is unset or 0: off (the default)");
                 M.write("ready");
             }
             std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -9753,6 +9802,8 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's costs (swapped in per request)
         bool policy_is_df2 = df2_loaded;   // which drafter's costs `policy` holds
+        strata::spec::DraftCosts dcosts;   // --draft-costs: `policy`'s table, opened at the first request after the start
+        bool dc_tried = o.draft_costs.empty();
         strata::spec::DrafterPolicy drafter_policy;   // --draft auto: MTP or DFlash2 per request (kind x context depth)
         strata::spec::DrafterPolicy gumbel_policy(1.01, 24);    // XESTRATA_SPEC_GUMBEL=auto: off (First) or on (Second)
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
@@ -11534,6 +11585,17 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // --draft-costs: the drafters are settled once the start's measurement has run; with two drafters kept, the
+            // requests swap their policies, and one table cannot follow both
+            if (!dc_tried && !probe_running) {
+                dc_tried = true;
+                if (df2_loaded && use_mtp && mtp.loaded())
+                    std::fprintf(stderr, "xestrata serve: draft costs: off, two drafters are kept (each request picks one)\n");
+                else
+                    std::fprintf(stderr, "xestrata serve: %s\n", dcosts.open(policy, o.draft_costs, strata::spec::draft_costs_key(
+                                     argc, argv, strata::core::devices_key_text(), o.draft_costs_key)).c_str());
+            }
+            dcosts.request_start();
             // --draft auto: this request's drafter (the draft= key, else --draft-rule, else the learned policy)
             const bool req_off = req_draft == "off" || drafting_off;   // no drafter (the suffix lookup may propose)
             if (df2_loaded) {
@@ -12203,12 +12265,27 @@ int main(int argc, char** argv) {
                 return true;
             };
             // --pipeline-windows, testing: STRATA_PIPELINE_SWITCH=<file> (with STRATA_PIPELINE_DEBUG=1) is read at every
-            // request, "pw=<0|1|2> theta=<f> force_miss=<k> short_read=<n>" - an A/B of the pipelined and the serial loops
+            // request, "pw=<0|1|2> theta=<f> lazy=<0|1> run=<0|1> force_miss=<k> short_read=<n>" - an A/B of the pipelined and the serial loops
             // (and forced rollbacks) on one server, with the same expert placement
             int pl_pw = pipe ? o.pipeline_windows : 0;
             float pl_theta = [] {   // a speculative window is launched only when its estimated chance is at least this
                 const char* v = pipe_dbg_env("PIPELINE_THETA");
                 return v ? (float) std::strtod(v, nullptr) : 0.2f;
+            }();
+            // The drafter's chain behind a window runs the steps the outputs before them call for (MtpDrafter::chain_extend:
+            // B's row 0 and drafts one step at a time while GuessGate::extend says B can still be worth it), not every step
+            // it has graphs for.  XESTRATA_PIPELINE_LAZY_CHAIN=1 (opt-in, upstream 9bb5d16b, #5860; unmeasured on two
+            // cards upstream too): that; unset, the whole chain at once.
+            bool pl_lazy = [] {
+                const char* v = strata::env_get("PIPELINE_LAZY_CHAIN");
+                return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+            }();
+            // Behind a lookup's continuation that was on the path the next window is the same lookup's, not the chain's
+            // (upstream's 2x RTX 3090: a 2400-token rewrite +23.5% over the serial loop against +17.9% without, other text
+            // level).  XESTRATA_PIPELINE_LOOKUP_RUN=1 (opt-in, upstream 9bb5d16b, #5860): that; unset, the chain's.
+            bool pl_run = [] {
+                const char* v = strata::env_get("PIPELINE_LOOKUP_RUN");
+                return v != nullptr && std::strtol(v, nullptr, 10) != 0;
             }();
             int pl_force_miss = [] {   // exactness test: every k-th speculative window gets a wrong first token
                 const char* v = pipe_dbg_env("PIPELINE_FORCE_MISS");
@@ -12222,10 +12299,12 @@ int main(int argc, char** argv) {
                     buf[nr] = 0;
                     if (const char* q = std::strstr(buf, "pw=")) pl_pw = std::max(0, std::min(2, (int) std::strtol(q + 3, nullptr, 10)));
                     if (const char* q = std::strstr(buf, "theta=")) pl_theta = (float) std::strtod(q + 6, nullptr);
+                    if (const char* q = std::strstr(buf, "lazy=")) pl_lazy = std::strtol(q + 5, nullptr, 10) != 0;
+                    if (const char* q = std::strstr(buf, "run=")) pl_run = std::strtol(q + 4, nullptr, 10) != 0;
                     if (const char* q = std::strstr(buf, "force_miss=")) pl_force_miss = std::max(0, (int) std::strtol(q + 11, nullptr, 10));
                     if (const char* q = std::strstr(buf, "short_read=")) req_short_read = std::max(0LL, std::strtoll(q + 11, nullptr, 10));
-                    std::fprintf(stderr, "xestrata pipeline switch: pw=%d theta=%.3f force_miss=%d short_read=%lld\n", pl_pw,
-                                 pl_theta, pl_force_miss, (long long) req_short_read);
+                    std::fprintf(stderr, "xestrata pipeline switch: pw=%d theta=%.3f lazy=%d run=%d force_miss=%d short_read=%lld\n",
+                                 pl_pw, pl_theta, pl_lazy ? 1 : 0, pl_run ? 1 : 0, pl_force_miss, (long long) req_short_read);
                 }
             }
             pl_guess.set_theta(pl_theta);
@@ -13053,6 +13132,7 @@ int main(int argc, char** argv) {
                     bool go = false;       // the gate lets it start speculatively (asked once, as it is made)
                     double t_front = 0.0, t_back = 0.0;   // ms_now() at its launch on stage 0, on the last stage
                     bool sfx = false;      // a lookup window (the suffix drafter's drafts)
+                    bool lk = false;       // its drafts are a lookup's continuation, though it was made as a B
                     int sfx_match = 0;
                 };
                 // front stage `st`'s verifier of w's parity, and the last stage's
@@ -13060,6 +13140,7 @@ int main(int argc, char** argv) {
                 auto V1 = [&](const PW& w) -> strata::core::Verifier& { return *PV[1][w.seq & 1]; };
                 auto SDf = [&](const PW& w) { return (void*) PSD[w.seq & 1]; };
                 const int force_miss = pl_force_miss;
+                const bool lazy = pl_lazy, lookup_run = pl_run;
                 static const bool pl_log = pipe_dbg_env("PIPELINE_LOG") != nullptr;
                 // the snapshot of the GDN state window `seq` reads on front stage `st` (overlapped: before its launch
                 // there, on the stage's side stream)
@@ -13085,6 +13166,9 @@ int main(int argc, char** argv) {
                 bool b_done = false;     // B has been made from the chain in flight
                 int chain_n = 0;
                 int64_t pl_spec = 0, pl_on = 0, pl_undo = 0, pl_gate = 0, pl_fm = 0;
+                int64_t pl_chains = 0, pl_steps = 0;   // the drafter's chains and the outputs they were asked for
+                int64_t pl_runs = 0;                   // windows taken from a lookup behind its continuation (no chain)
+                double pl_ext_t = -1.0;                // ms_now() at the last chain_extend, until its output lands
                 std::vector<int32_t> outp(8, 0);
                 bool ending = false;
                 A.T = 1;
@@ -13223,6 +13307,8 @@ int main(int argc, char** argv) {
                         for (int i = 1; i < B.T; ++i) B.prob[i - 1] = 1.0f;
                         B.p_on = pl_lookup_pon;
                         B.go = pl_guess.start(B.p_on);
+                        B.lk = true;
+                        B.sfx_match = match;
                         B.ready = true;
                         B.made = true;
                         b_done = true;   // the chain in flight makes no B for this A
@@ -13350,10 +13436,17 @@ int main(int argc, char** argv) {
                             A.ready = true;
                             early_used = true;
                         }
+                        // XESTRATA_PIPELINE_LAZY_CHAIN: the step chain_extend added has landed: its time is the
+                        // drafter's cost of going on (GuessGate's E)
+                        if (pl_ext_t >= 0.0 && (r == 1 || k_ready >= chain_n)) {
+                            pl_guess.observe_extend(ms_now() - pl_ext_t);
+                            pl_ext_t = -1.0;
+                        }
+                        bool more = false;   // the chain goes on: another step was asked for
                         if (!b_done && (chain_kind == 1 || early_used)) {
                             const int base = A.T - 1;                    // B's row 0: the guess of A's bonus
-                            const bool decided = r == 1 || (k > base && t_decided(op, base + 1, k));
-                            if (decided) {
+                            // the estimate that A is accepted whole (-1: the forced chain disagrees with A's drafts)
+                            auto a_whole = [&]() {
                                 float pa = 1.0f;
                                 if (chain_kind == 1) {
                                     // forced through A's drafts: its outputs there are the drafter's own picks from
@@ -13364,10 +13457,36 @@ int main(int argc, char** argv) {
                                         if (oc[i] != A.tok[i + 1]) agree = false;
                                         pa *= pl_agree ? op[i] : A.prob[i];
                                     }
-                                    if (pl_agree && !agree) { pa = 0.0f; ++pl_disagree; }
+                                    if (pl_agree && !agree) pa = -1.0f;
                                 } else {
                                     for (int i = 0; i + 1 < A.T; ++i) pa *= A.prob[i];
                                 }
+                                return pa;
+                            };
+                            const int chain_cap = strata::kernels::kVerifyNarrowT - 1;   // the outputs a chain has graphs for
+                            bool decided = false;
+                            if (!lazy) {
+                                decided = r == 1 || (k > base && t_decided(op, base + 1, k));
+                            } else if (A.sfx) {
+                                decided = true;   // a lookup window's bonus is not the chain's: nothing more to ask of it
+                            } else if (k > base) {
+                                decided = t_decided(op, base + 1, k) || k >= chain_cap ||
+                                          !pl_guess.extend(std::max(0.0f, a_whole()) * op[base]);
+                            } else if (r == 1) {
+                                // a fresh A that took every draft: B's row 0 is one step on, wanted only while A's own
+                                // chance can still be worth a guess
+                                decided = chain_n >= chain_cap || !pl_guess.extend(std::max(0.0f, a_whole()));
+                            }
+                            if (lazy && !decided && r == 1) {   // every output asked for has landed: the next one
+                                if (!mtp.chain_extend(chain_n + 1, err)) return die(err);
+                                ++chain_n;
+                                ++pl_steps;
+                                pl_ext_t = ms_now();
+                                more = true;
+                            }
+                            if (decided) {
+                                float pa = a_whole();
+                                if (pa < 0.0f) { pa = 0.0f; ++pl_disagree; }
                                 if (!A.sfx) make_b(oc, op, base, k, pa);   // a lookup window's bonus is not the chain's
                                 // stage B now (its PLE rows from the tokens before it as they will be once A is
                                 // committed whole), so its launch behind A is only the graph launch (never while a
@@ -13384,7 +13503,7 @@ int main(int argc, char** argv) {
                                                          "outputs)\n", chain_kind, (long long) A.p, A.T, B.T, B.p_on, k);
                             }
                         }
-                        if (r == 1) chain_kind = 0;
+                        if (r == 1 && !more) chain_kind = 0;
                     }
                     // ---- the front stages: A on its next one (never while a wrong window still holds a front stage's
                     // state)
@@ -13496,7 +13615,7 @@ int main(int argc, char** argv) {
                     const bool last = nf || eos || produced_n >= max_new || stop_req.load();
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.launched) pl_guess.observe_guess(B.p_on, on);
-                    if (!A.sfx) policy.observe_mtp_drafts(A.prob, A.T, a);   // as the serial windows calibrate the drafts
+                    if (!A.sfx && !A.lk) policy.observe_mtp_drafts(A.prob, A.T, a);   // as the serial windows calibrate the drafts
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
@@ -13507,8 +13626,9 @@ int main(int argc, char** argv) {
                     {
                         const double now = ms_now();
                         const int c = A.spec ? 1 : 0;
-                        if (A.sfx) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
-                        if (A.seq > 0 && !last) policy.observe(A.sfx, A.T, a, A.sfx_match, now - last_verdict);
+                        // (a lookup's continuation is a lookup window too: its drafts are the suffix drafter's)
+                        if (A.sfx || A.lk) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
+                        if (A.seq > 0 && !last) policy.observe(A.sfx || A.lk, A.T, a, A.sfx_match, now - last_verdict);
                         cls_ms[c] += now - last_verdict;
                         cls_tok[c] += a + 1;
                         cls_n[c] += 1;
@@ -13522,21 +13642,53 @@ int main(int argc, char** argv) {
                     if (!last && !ajob && !B.launched && !doomed && !pl_adapt()) return die("an adaptive refill failed");
                     if (on && !last) {
                         ++pl_on;
-                        // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
-                        mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyNarrowT - 1, B.T + S_mtp - 1);
-                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
-                            return die(err);
-                        chain_kind = 1;
-                        pl_tr("CL", A.seq, 1);
+                        // XESTRATA_PIPELINE_LOOKUP_RUN: a lookup's continuation (B) was on the path, so the window behind
+                        // it comes from the same lookup - what followed the earlier occurrence, past B's drafts - and
+                        // waits for no chain, so a copied stretch runs window behind window.  The drafter only catches up
+                        // A's cells, as the serial loop does in a round that needs no draft.
+                        PW nB;
+                        if (lookup_run && B.lk && o.suffix_draft > 0 && pl_lookup_pon > 0.0f) {
+                            const int kl = sfx.propose_after(B.tok + 1, B.T - 1, S, pl_sbuf.data());
+                            if (kl >= 1) {
+                                nB.seq = B.seq + 1;
+                                nB.p = B.p + B.T;
+                                nB.T = std::min(S, kl);
+                                for (int i = 0; i < nB.T; ++i) nB.tok[i] = pl_sbuf[(size_t) i];
+                                for (int i = 1; i < nB.T; ++i) nB.prob[i - 1] = 1.0f;
+                                nB.p_on = pl_lookup_pon;
+                                nB.go = pl_guess.start(nB.p_on);
+                                nB.lk = true;
+                                nB.sfx_match = sfx.last_match();
+                                nB.ready = true;
+                                nB.made = true;
+                            }
+                        }
+                        if (nB.made) {
+                            if (!mtp.prefill(V1(A).final_R(0), outp.data(), A.T, A.p, err, false)) return die(err);
+                            chain_kind = 0;
+                            b_done = true;
+                            ++pl_runs;
+                            pl_tr("CD", B.seq, 3, (int) (1000.0f * nB.p_on));
+                        } else {
+                            // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
+                            // (lazy: the forced steps and B's row 0; the steps for its drafts follow while they can be used)
+                            mtp.set_source_R(V1(A).final_R(0));
+                            chain_n = std::min(strata::kernels::kVerifyNarrowT - 1, lazy ? B.T : B.T + S_mtp - 1);
+                            ++pl_chains;
+                            pl_steps += chain_n;
+                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+                                return die(err);
+                            chain_kind = 1;
+                            pl_tr("CL", A.seq, 1);
+                            b_done = false;
+                        }
                         early_used = false;
-                        b_done = false;
                         // A accepted whole: its commit on the front stages B has not reached yet (B, now A, runs there
                         // after it; nothing is in flight there)
                         for (int st = 0; st < pl_nf; ++st)
                             if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(A.T, err)) return die(err);
                         A = B;
-                        B = PW{};
+                        B = nB;
                     } else {
                         // the front stages B never ran on take A's real commit now; those it did run on are undone
                         // (snapshot restored, the commit replayed) once it has stopped
@@ -13553,7 +13705,10 @@ int main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyNarrowT - 1;
+                            // (lazy: A's drafts; B's row 0 and drafts follow a step at a time while they can be used)
+                            chain_n = lazy ? std::max(1, S_mtp - 1) : strata::kernels::kVerifyNarrowT - 1;
+                            ++pl_chains;
+                            pl_steps += chain_n;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
@@ -13593,9 +13748,12 @@ int main(int argc, char** argv) {
                 if (dec_timing) {
                     auto avg = [](double s_, double n_) { return n_ > 0 ? s_ / n_ : 0.0; };
                     std::fprintf(stderr, "xestrata pipeline: %lld windows in %.0f ms (%.2f ms/window): %lld speculative, %lld on "
-                                         "the path, %lld rolled back, %lld below the gate (p_on %.2f)\n",
+                                         "the path, %lld rolled back, %lld below the gate (p_on %.2f); %lld chains, %.2f "
+                                         "outputs each%s; %lld lookup-run windows\n",
                                  (long long) dec_windows, pl_ms, avg(pl_ms, (double) dec_windows), (long long) pl_spec,
-                                 (long long) pl_on, (long long) pl_undo, (long long) pl_gate, pl_guess.threshold(false));
+                                 (long long) pl_on, (long long) pl_undo, (long long) pl_gate, pl_guess.threshold(false),
+                                 (long long) pl_chains, avg((double) pl_steps, (double) pl_chains), lazy ? " (lazy)" : "",
+                                 (long long) pl_runs);
                     std::fprintf(stderr, "xestrata pipeline classes: fresh %.0f windows %.2f ms %.2f tok | speculative %.0f "
                                          "windows %.2f ms %.2f tok | forced-chain disagreements %lld, chain late %lld\n",
                                  cls_n[0], avg(cls_ms[0], cls_n[0]), avg(cls_tok[0], cls_n[0]), cls_n[1],
@@ -14023,6 +14181,7 @@ int main(int argc, char** argv) {
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
                 drafter_policy.observe(req_kind, n, req_df2 ? strata::spec::DrafterPolicy::Df2
                                                             : strata::spec::DrafterPolicy::Mtp, produced_n, decode_ms);
+            if (const std::string m = dcosts.request_end(); !m.empty()) std::fprintf(stderr, "xestrata serve: %s\n", m.c_str());
             if (gumbel_auto && req_kind_g != 0 && decode_ms > 0.0)   // XESTRATA_SPEC_GUMBEL=auto learn: the same speed
                 gumbel_policy.observe(req_kind_g, n, req_gumbel ? strata::spec::DrafterPolicy::Second
                                                                 : strata::spec::DrafterPolicy::First,

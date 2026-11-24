@@ -6,8 +6,8 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.2.13.1")
-set(STRATA_UPSTREAM_COMMIT "628f749")
+set(STRATA_UPSTREAM_VERSION "0.2.20")
+set(STRATA_UPSTREAM_COMMIT "a34979fc")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
@@ -273,6 +273,10 @@ endif()
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE strata_platform)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
+# the opt-out from the kernel's automatic NUMA balancing (upstream 87c9821bb1): header-only, no GPU
+add_executable(numa_balancing_test src/platform/numa_balancing_test.cpp)
+target_include_directories(numa_balancing_test PRIVATE include)
+add_test(NAME numa_balancing_test COMMAND numa_balancing_test)
 set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # ulimit -l below the region
 
 # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
@@ -602,10 +606,19 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
-                                   src/core/plain_inkling.cpp
-                                   src/core/plain_dspark.cpp
-                                   src/core/auto_pick.cpp)
+                                   src/core/auto_pick.cpp
+                                   src/inkling2/ink_main.cpp src/inkling2/sycl/ink_sycl_backend.cpp
+                                   src/inkling2/inkling2_loop.cpp src/artifact/strata_reader.cpp
+                                   src/quant/sk_codecs.cpp)
   target_include_directories(strata_engine PUBLIC include)
+  # Inkling-2-Mini's engine (src/inkling2, upstream's inkling2 on the engine's runtime): its .strata files' manifests
+  # are zstd frames (libzstd, free), its pictures read through stb_image (third_party/main/stb), and its CPU experts
+  # (the hybrid pool's) take the AVX2 forms of the S_K codecs
+  find_library(STRATA_ZSTD_LIB zstd REQUIRED)
+  target_link_libraries(strata_engine PRIVATE ${STRATA_ZSTD_LIB})
+  target_include_directories(strata_engine SYSTEM PRIVATE third_party/main/stb)
+  set_source_files_properties(src/quant/sk_codecs.cpp src/inkling2/inkling2_loop.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
   set_source_files_properties(src/core/plain_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
@@ -617,8 +630,8 @@ if(STRATA_ENABLE_XE)
   if(STRATA_GRAMMAR)
     include(FetchContent)
     FetchContent_Populate(strata_xgrammar QUIET
-      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.8.tar.gz
-      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be
+      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.9.tar.gz
+      URL_HASH SHA256=a653eb2b372d4efe1ed6677b0f2be61b7606196052cc88f4c77ae0ca48f307fb
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-subbuild)
     FetchContent_Populate(strata_dlpack QUIET
@@ -1068,7 +1081,7 @@ if(STRATA_ENABLE_XE)
                  src/image/florence2.cpp src/image/qi_attn_train.cpp
                  APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
-  # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
+  # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.15b): its library for the
   # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256
   # checked) and unpacked beside the build, or STRATA_AOTRITON_ROOT, a folder of its own; the packages carry both.  A
   # ROCm without its build, or an architecture without images, takes XeStrata's own kernel.
@@ -1086,21 +1099,24 @@ if(STRATA_ENABLE_XE)
     endif()
     set(_strata_aot_dir "${STRATA_AOTRITON_ROOT}")
     if(NOT _strata_aot_dir AND (hip_FOUND OR WIN32))
-      set(_strata_aot_base https://github.com/ROCm/aotriton/releases/download/0.14.2b/aotriton-0.14.2b)
-      set(_strata_aot_rocm6.4 35f598d0aabf1fca887fb8428e12f34de9e3ce852dc2aa832b76e318cf4f3940)
-      set(_strata_aot_rocm7.0 98800207360e1b688afc4fccf794b50560ef2b42bdd32ed0b71f90fdc86b0cf6)
-      set(_strata_aot_rocm7.1 d6c86838cb640d4ad1f337d061ffe10121a34424551ae8340eb1e48e55477549)
-      set(_strata_aot_rocm7.2 0b01ec5ccc55ca86059afb20f1f5764fee5edd9d7e7b456167d77dc9f691cdc9)
-      set(_strata_aot_rocm7.14 dc756824b5c63a689179f765c51f2aa747d3d5ee842b17bdd9238adcf237f91b)
-      set(_strata_aot_rocm7.15 6ed840e37b3037fd7e6677e7d29d4ab8fd1578757820ce00b40176bbb51ab053)
-      set(_strata_aot_rocm7.16 02370004391255af58141068d83df1b50786a1046df6ef49d0e2509b9537b61b)
-      set(_strata_aot_gfx110x a54fecf9b4e16425681785eba475912eb9ae761e35a4df3e3579bdbd7c6fe4db)
-      set(_strata_aot_gfx115x e4bda76fd6857a733cd7b4b3eb9ccb21c0f47b565ce304777a61bbb13d12ad6e)
-      set(_strata_aot_gfx120x f173671cc5112897e134f1d209bd6f572ecd507f4d68dc84cb6f07b67e13e851)
-      set(_strata_aot_gfx1250 6a354bf84a18d7689affaef953ea4a2d1f6943569da4a4ca26fd5e6b5eb67a0f)
-      set(_strata_aot_gfx90a 7cc293803aa73bd223554d51a77fab50fd37b0bdb9d5e874f7e2997f4390b9c5)
-      set(_strata_aot_gfx942 eae5d36c974d974f085cfbdecf77760db71324fa9814ed50d8a3fc42bfbe3e41)
-      set(_strata_aot_gfx950 23716cbf855df9df1ca7d480a90e0fb29b0356bb424015c426fc0e5a973f682b)
+      set(_strata_aot_base https://github.com/ROCm/aotriton/releases/download/0.15b/aotriton-0.15b)
+      set(_strata_aot_rocm6.4 e40882633181319f50ed713bd23831e884216c007ea55043c5875d47986273f9)
+      set(_strata_aot_rocm7.0 3588920badfa69dcdcf89c1f056e39764c2dbc96d75ab31a7bccc0efd9b66844)
+      set(_strata_aot_rocm7.1 73188eb425d5e1e519a0236aae269d2aec4c0cebb4726832c6581c01dd31b0e6)
+      set(_strata_aot_rocm7.2 6b70339be879ca7ba03c145f54ec213503ea97b955df3c96755e7f0b3235b6c3)
+      set(_strata_aot_rocm7.14 e5ee9522a7ae0aa43bb92752a8e87edaacde00c4bf357f0423f0ca406389de9e)
+      set(_strata_aot_rocm7.15 4faffe8dd7dcc59c0db16c0a9eb1d88d0cd423df10bc88264dca74ad93870c96)
+      set(_strata_aot_rocm7.16 dce419812204cc11ba4d470c736395efd20dbdd7f509ee89333c70d316131d6e)
+      set(_strata_aot_rocm7.17 5fb6869c5cea979ec512d29949b7a513e9544d377082360f151ec07ca4a6e9af)
+      set(_strata_aot_rocm7.18 5cfeec9dae4b37c8152c0ad75f8c54b94faa517fa6dc9818f348ebeac38a429c)
+      set(_strata_aot_gfx110x 9b1bb0f3bfef08845d2b955a006890f287c46b537c07da497e5e084d90d7be35)
+      set(_strata_aot_gfx115x 352e9e5b99c230d7da854f86bac6d14930ab8a811275d39899eae030c6d161ab)
+      set(_strata_aot_gfx117x bd00d282c743a97d1e94b1593bd9aef81293a381cc0d0c0f4e7bb2382c52f283)
+      set(_strata_aot_gfx120x 4605621b2422e4a3b28b3357d70e60c55ca57de6179df0a9788ef0b487eda64b)
+      set(_strata_aot_gfx1250 230d10fc13aee49aaeb7227bed879bae41a082457fabecfc0a5c97f047875122)
+      set(_strata_aot_gfx90a 42189997e3f44bbcde9d2ce6ebedbeaf373c280299d03ec7933be73e0c6243d3)
+      set(_strata_aot_gfx942 11f5c0fa8c4b13efcd466261adf1fd6b5bdbe00c03ad35bcf3d53e075dd18846)
+      set(_strata_aot_gfx950 5030077f0388bbbf4d68841a7465d91cfa7b652a3134a73e73f5639c45b6df93)
       set(_strata_aot_rocm "rocm${hip_VERSION_MAJOR}.${hip_VERSION_MINOR}")
       if(WIN32 OR DEFINED _strata_aot_${_strata_aot_rocm})
         set(_strata_aot_files "")
@@ -1147,13 +1163,13 @@ if(STRATA_ENABLE_XE)
               -DXZ_TOOL_SCRIPTS=OFF -DXZ_DOC=OFF -DXZ_NLS=OFF -DXZ_THREADS=vista)
           # the release's commit and tree, which its images' signatures carry (the source is its archive, no clone)
           ExternalProject_Add(strata_aotriton_win
-            URL https://github.com/ROCm/aotriton/archive/refs/tags/0.14.2b.tar.gz
-            URL_HASH SHA256=9d64da24c877b6a8f6a7921a178d007232a5e35a908c19695e1d0a6f8c1eb0a5
+            URL https://github.com/ROCm/aotriton/archive/refs/tags/0.15b.tar.gz
+            URL_HASH SHA256=ab7f20c2ede75b68a5cca3c6228765018be16a32859f7a9a53abe2e82ac07b44
             DOWNLOAD_EXTRACT_TIMESTAMP FALSE PREFIX ${CMAKE_BINARY_DIR}/_deps/aotriton/win-build
             PATCH_COMMAND patch -p1 -i
               ${CMAKE_SOURCE_DIR}/third_party/main/aotriton/patches/0001-windows-cross-build.patch
-            CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env AOTRITON_CI_SUPPLIED_SHA1=c11b5b886a10a00f925f74133d38b3505e67ccd9
-              AOTRITON_GIT_TREESHA1=25d66e23104aab7a2492d40d1d326499d224dc88
+            CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env AOTRITON_CI_SUPPLIED_SHA1=ebcd732348ed216d98e71a18c0ae341c7742a935
+              AOTRITON_GIT_TREESHA1=162eacc0555cea7afd748764d51d474b84797f61
               ${CMAKE_COMMAND} -G Ninja -S <SOURCE_DIR> -B <BINARY_DIR> ${_strata_win_ep}
               -DCMAKE_INSTALL_PREFIX=${_strata_aot_dir} -DAOTRITON_NOIMAGE_MODE=ON -DAOTRITON_NO_PYTHON=ON
               -DAOTRITON_HIP_WINDOWS=${_strata_aot_hip_win} -Dliblzma_DIR=${_strata_xz_dir}/lib/cmake/liblzma
@@ -1222,10 +1238,11 @@ if(STRATA_ENABLE_XE)
     # inside a checkout), in which git apply would skip the paths outside its folder without a word
     find_package(Git REQUIRED)
     FetchContent_Populate(strata_kitchen QUIET
-      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.41.tar.gz
-      URL_HASH SHA256=53050948120731ea817581d8f94bcdd79fb69d07ed51447dcf128e8a0a771865
+      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.42.tar.gz
+      URL_HASH SHA256=9e68c366691d62fe4ac6a381d7d5c7f092bb1b8124cf61c0e974f54e3fab21e3
       PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
                     ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0001-wmma-bf16-operands.patch
+                    ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0002-big-tiled-long-k.patch
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-subbuild)
     set(_strata_kitchen_hip ${strata_kitchen_SOURCE_DIR}/comfy_kitchen/backends/hip)
@@ -1299,8 +1316,8 @@ if(STRATA_ENABLE_XE)
     if(_strata_cudnn_inc)
       include(FetchContent)
       FetchContent_Populate(strata_cudnn_fe QUIET
-        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.32.2.tar.gz
-        URL_HASH SHA256=5c8dc0e757fb55efb8145837c1c02b61c0b60c6cd5cfb38c5ca5565d3f30e700
+        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.33.0.tar.gz
+        URL_HASH SHA256=135a2c56c91dc6b1eca6a75369a0c8c8a3747da95c099be31b4f2a9788f91ce6
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
       # built into the kernels' library: the plain models' prompt attention shares the SDPA (kernels::cudnn_sdpa)

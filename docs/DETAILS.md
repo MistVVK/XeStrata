@@ -128,20 +128,25 @@ Set `XESTRATA_DF2_STATIC_TABLE` to a YD1S table for the target model to propose 
 table has no tokenizer identity: the same vocabulary size is not enough. Use a table made for this model's tokenizer.
 The target verifies these proposals too.
 
-In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
-top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
-low is neither read nor computed (`XESTRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their
+With the route tail skip on (`XESTRATA_ROUTE_TAIL_SKIP`, upstream b4e3407b), in the server's decode a missed expert
+(not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the top 10, the smallest weights) contributes
+zero to that token, and one that every token of a verify window routes that low is neither read nor computed.
+It is off by default (as upstream 9624759956): on the RX 9060 XT with SC117's IQ3_XXS and serve's expert cache (46%
+hits), rank 7 against off gave a teacher-forced KL of 0.0777 and 90.1% top-1 agreement (the same setting twice: 0.0190
+and 95.3%), for +12.4% decode. The other experts keep their
 weights (no renormalisation), so the answers differ slightly. Upstream zeroes it only when no other token of the window
 needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
-It does nothing when every expert is in VRAM (nothing is skipped) and with `--batch`; on a layer split each stage skips
-its own. With a helper cache (`--expert-cache-device1..3`) the helper GPU computes the experts it holds, and only those
+It does nothing when every expert is in VRAM (nothing is skipped), and `auto` leaves it off with `--batch`; on a layer
+split each stage skips its own. With a helper cache (`--expert-cache-device1..3`) the helper GPU computes the experts it holds, and only those
 on neither GPU are skipped.
-It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
-skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
+`XESTRATA_ROUTE_TAIL_SKIP=7` turns it on and 1-9 sets the rank. `auto` is the rule of the earlier default: rank 7, but
+not when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the skip costs more draft
+acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
 `XESTRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
-`XESTRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
+Unset or 0 leaves it off; when it is on the start prints one line. Setup takes `--route-tail-skip off|auto|1-9` and
+keeps it in the model's config.
 
-Measured (IQ3_XXS):
+Measured when 7 was the default (IQ3_XXS):
 
 | | B70 | RTX 4070 | RX 9060 XT |
 | --- | --- | --- | --- |
@@ -344,7 +349,7 @@ The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and 
 | UD-Q3_K_XL | 89.5 GB | 56.2 GB | about 80 GB |
 | UD-IQ4_XS | 93.7 GB | 60.4 GB | about 84 GB |
 
-The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
+The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 17 GB).
 With less RAM the experts that do not fit are read from the SSD while it answers.
 setup recommends the largest size whose experts all fit the RAM (UD-Q4_K_XL aside).
 setup asks about images (on by default); the image encoder is the original model's.
@@ -370,8 +375,9 @@ IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
-setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
-36 GiB on a 64 GB PC with a 128K context.
+setup chooses the RAM less 17 GB for N, less the KV cache too when that lives in RAM (upstream 8780e9fdc3; 24 GB before):
+43 GiB on a 64 GB PC with a 128K context.
+On a GPU that shares the RAM (an APU) it keeps 24 GB aside, as the GPU's cache is RAM too.
 The rest come from the SSD while it answers.
 Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 
@@ -640,7 +646,7 @@ The engine's options (added to the settings' `args`):
 | `--pipeline-windows N` | with a layer split, 1 (the default) pipelines the windows a prompt is read through over the stages (an earlier stage computes the next window while a later one computes this one; the rows and their order are the serial ones, so the state is too); 2, with two stages and the MTP layer, the decode too: the first stage computes a guess of the next window while the last checks this one (when this one holds whole and its next token is the draft layer's, the guess is the next window; else the first stage goes back), only where the chance that it holds (the draft layer's probability, scaled by the share of the guesses so far that held) times the first stage's time it saves exceeds the time a guess beside a window adds to it, each time measured over the windows; until they are measured, where that chance is 0.5 or more (Qwen3.8-Flash-Next's default is 0.2). The windows are sized by the serial rule (`--spec-window`). The text is that of the serial windows with the experts in the same places (2 keeps the second verifier's VRAM out of the experts, so their places change, and a text at temperature can change with the CPU's and the GPU's rounding). Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20: a copy reply 187.2 -> 247.2 tokens/s, a story at temperature 0.8 134.5 and 135.7 -> 133.0 and 134.1. Qwen3.8-Flash-Next on the same pair split at layer 24 (the experts not swapped): a story, greedy, serial 65.9 -> 67.2 and 67.5 tokens/s, at temperature 0.8 60.7 -> 60.9 and 64.0 (57.6 and 57.9, 54.7 and 55.1 when `--spec` sized the windows). 0: serial. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 819 tokens with `--prompt-chunk 0`: prefill 108.5 -> 139.3 tokens/s, the same answer. A long prompt read in chunks has its chunks pipelined over the stages the same way (13,506 tokens on the same split: prefill 1,030.8 -> 1,357.9 tokens/s, the same answer) |
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
-| `--device cpu`, `--cpu-threads N` | run a dense Qwen3.5 model (qwen35) or Inkling-2-Mini on the CPU alone ([a PC without a GPU](#a-pc-without-a-gpu); qwen35 runs on the CPU unasked without a GPU that SYCL can use). `--cpu-threads` is the number of threads (default: physical cores, subject to the CPU quota; Inkling-2-Mini: logical CPUs / 8, at least 1) |
+| `--device cpu`, `--cpu-threads N` | run a dense Qwen3.5 model (qwen35) on the CPU alone ([a PC without a GPU](#a-pc-without-a-gpu); qwen35 runs on the CPU unasked without a GPU that SYCL can use). `--cpu-threads` is the number of threads (default: physical cores, subject to the CPU quota) |
 | `--batch N` (`"parallel": N`, `"auto"` by default) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
@@ -1621,6 +1627,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
+  A greedy request is sent without the model card's penalties: a penalty makes the engine sample from its logits, so the answer is no longer greedy, and the MTP drafts (which run only for greedy requests) stop (#2940).
   The web page sends no sampling of its own until you change its Chat settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
   Chat settings takes a min_p too; empty, it is the server's default (the config's `sampling.min_p`).
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.

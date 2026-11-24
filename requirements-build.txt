@@ -3,5 +3,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 # Build helpers for an engine or image-encoder compile (setup.py's cmake_build), installed into .venv only when the
 # PC has none: the packages and serving do not need them.
-cmake==4.4.3
+cmake==4.4.5
 ninja==1.13.2

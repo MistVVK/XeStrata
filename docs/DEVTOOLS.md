@@ -90,7 +90,7 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
   ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  A compiler reads bitcode of its own LLVM or an older one only (ROCm 10.1's device libraries are LLVM 24's, which intel/llvm 7.2.0's LLVM 23 cannot read),
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 10.1's device libraries are LLVM 24's, which intel/llvm 7.2.1's LLVM 23 cannot read),
   so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (ROCm 7.14.1: `amd/device-libs` of ROCm's llvm-project at the commit TheRock's tag `therock-7.14.1` pins, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
   It installs those a SYCL program's AMD code links (`ocml`, `ockl`, `oclc_*`) and `opencl`, whose presence the driver asks for.
   CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are twenty fixes now, for intel/llvm v7.2.0. Of the sixteen v7.1.1 took, libclc's AMD target name is no longer needed, libclc being built otherwise since v7.2.0, and the AMD FMA is fixed in v7.2.0 (2026-10-22).
+  There are twenty-nine fixes now, for intel/llvm v7.2.1 (v7.2.0's twenty-nine apply to it as they are; v7.2.1 has no tag, and the script takes sycl-rel-7_2's commit ea269d5f7, which raised the version to 7.2.1, 2026-11-24). Of the sixteen v7.1.1 took, libclc's AMD target name is no longer needed, libclc being built otherwise since v7.2.0, and the AMD FMA is fixed in v7.2.0 (2026-10-22).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -165,7 +165,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with SubgroupShuffle*INTEL (`hip-group-shuffle`).
   Eighteenth, the HIP adapter answered every virtual memory call (`urVirtualMem*`, `urPhysicalMem*`) with UNSUPPORTED and reported no support, so SYCL's `ext_oneapi_virtual_mem` was not there on AMD GPUs, and `--vram-elastic` and `--kv-grow` fell back to one allocation.
   intel/llvm implemented them after the release (commit c13ad6c7e3, "[UR][HIP] Implement virtual and physical memory management", pull request 22671): with HIP's virtual memory (`hipMemAddressReserve`, `hipMemCreate`, `hipMemMap` and the others) as the CUDA adapter implements them with CUDA's, the support reported as HIP's `hipDeviceAttributeVirtualMemoryManagementSupported` says.
-  The patch applies that commit's diff to v7.2.0 as it is (`hip-virtual-mem`; nothing of XeStrata's in it, and it goes when intel/llvm is raised to a release that has the commit).
+  The patch applies that commit's diff to v7.2.1 as it is (`hip-virtual-mem`; nothing of XeStrata's in it, and it goes when intel/llvm is raised to a release that has the commit).
   Nineteenth, a SYCL kernel that asks for a global id calls `__spirv_BuiltInGlobalOffset`, which the GlobalOffset pass replaces in codegen (with a parameter of the kernel's `_with_offset` clone, or 0).
   The AMDGPU attributor runs before that and took the call as an unknown callee, so every such kernel kept all the implicit inputs, the hostcall buffer among them (14,304 of XeStrata 0.2.2's 32,556 AMD kernels; 0 of 48,084 with v7.1.1).
   HIP launches no kernel with a hostcall buffer on a GPU without PCIe atomics (one passed through to a virtual machine, or in a slot behind a chipset), so the first kernel stopped with `hipErrorIllegalState` (XeStrata's issues #40 and #54).
@@ -241,7 +241,7 @@ It needs three things:
 - lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
 - the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
   They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
-- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.2.0), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
+- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.2.1), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
 
 ```sh
 mkdir -p .tools/xwin

@@ -82,6 +82,17 @@ int main() {
         CHECK(!floors_exceed_minimum(share_floors({0, 0}, L)));
         CHECK(!below_floors({}, 48, {}));
     }
+    {   // upstream becf4a3d9a: PCIe 4.0 x2 (3.6 GB/s) beside x8 (14.1 GB/s) is a gap of 3.92: unscaled by default,
+        // scaled from XESTRATA_SPLIT_LINK_MIN=3
+        const std::vector<double> x2x8 = link_miss_scale({3.6, 14.1});
+        CHECK(x2x8[0] == 1.0 && x2x8[1] == 1.0);
+        const std::vector<double> x2x8s = link_miss_scale({14.1, 3.6}, 3.0);
+        CHECK(x2x8s[0] == 1.0 && x2x8s[1] > 3.9 && x2x8s[1] < 3.93);
+        // the variable's text: unset / empty / not a number / below 1 keep the default
+        CHECK(link_scale_min_resolve(nullptr) == kLinkScaleMin && link_scale_min_resolve("") == kLinkScaleMin);
+        CHECK(link_scale_min_resolve("banana") == kLinkScaleMin && link_scale_min_resolve("0.5") == kLinkScaleMin);
+        CHECK(link_scale_min_resolve("3") == 3.0 && link_scale_min_resolve("2.5") == 2.5);
+    }
     if (failed == 0) std::printf("split_rules_test: ok\n");
     return failed ? 1 : 0;
 }

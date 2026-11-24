@@ -1,0 +1,19 @@
+SPDX-FileCopyrightText: 2025 Comfy Org
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0
+
+long-k-dispatch: keep v0.2.41 dual-M schedule above 8192 bytes of K, where v0.2.42 big-tiled regressed on gfx1200 (measured in deps-d7).
+--- a/comfy_kitchen/backends/hip/ops/gemm_int8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_int8.hip
+@@ -641,7 +641,10 @@
+     }
+     if constexpr (std::is_same_v<OutT, __bf16>) {
+         dim3 grid((N + 255) / 256, (M + 255) / 256);
+-        if (use_nonduplicated_wmma_schedule() && M >= kBigTiledMinM &&
++        // XeStrata (2026-11-24): keep the dual-M kernel for long K. On RX 9060 XT (gfx1200, ROCm 10.1),
++        // K=16384, M=4115, N=3072 took 4.79 ms with it and 5.17 ms with big-tiled (N=16384: 21.5 vs 24.5);
++        // K=12288 and shorter still gain from big-tiled.
++        if (K <= 8192 && use_nonduplicated_wmma_schedule() && M >= kBigTiledMinM &&
+             grid.x * grid.y >= kBigTiledMinRounds * device_wgp_count()) {
+             gemm_int8_big_tiled_kernel<false, Epi><<<grid, 1024, 0, stream>>>(
+                 A, B, C, M, N, K, ldc, epi);

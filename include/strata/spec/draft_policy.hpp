@@ -19,14 +19,67 @@
 // of a 4-token window got different argmaxes (XeStrata's own products and dense kernels, RX 9060 XT, 2026-11-14), so
 // the sizes moving with the measured times move the answer's last bits. A run whose answer must be the same every time
 // fixes them (--spec-window min-p --spec-min-p 0) and turns the suffix drafts off (--suffix-draft 0).
+//
+// Fixed costs (--draft-costs, opt-in; upstream 4079483b6 .. fc66df986): the windows of the cost-aware rule follow the
+// measured round times, so two starts whose times differ choose different windows and print different tokens.  A
+// table of round costs per window size, built on this machine from the rounds of its own requests and kept in a file,
+// replaces them once every size has its own rounds: from then on no round time moves a cost and the same request gives
+// the same windows on every start.  Until then live costs decide, exactly as without the table.  The token statistics
+// keep learning either way.
 #pragma once
 
 #include "strata/kernels/window_limits.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <string>
 
 namespace strata::spec {
+
+/// The real rounds of one window size collected for the table: n rounds, their sum in ms (each clamped to [kCalibLo,
+/// kCalibHi] x the reference cost) and the rounds themselves (up to kVals); the size's price is their median (a cold
+/// first use, a stall or another process moves a mean, not a median).
+struct CalAcc {
+    static constexpr int kVals = 16;
+    int n = 0;
+    double sum = 0.0;
+    int nv = 0;                          ///< how many of vals hold a round (== n when every round is kept)
+    std::array<double, kVals> vals{};
+};
+
+/// The per-machine table file of --draft-costs: text, valid only for the `key` it was built under (the devices, the
+/// driver, the engine, the model and the settings that move a round's cost; the engine builds it).
+///   xestrata-draft-costs 1
+///   key <one line>
+///   bucket <0..2> <ms of T1>,<ms of T2>,...   (the table; none while it is being built: "fresh 1")
+///   reqs <n>                                  (requests that ran while the table was held back)
+///   fresh 1                                   (no table yet: the rounds of the sizes are being collected)
+///   real <bucket> <mask>                      (bit t-1: size t is priced by its real rounds)
+///   rc <bucket> <size> <ms>                   (the price of a real size)
+///   cal <bucket> <size> <n> <sum> <ms of round 1> ... <ms of round n>
+///   end
+struct CostFile {
+    static constexpr int kMaxT = strata::kernels::kWindowMaxT;
+    static constexpr int kCtxBuckets = 3;
+    std::string key;
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> table{};   ///< [bucket][size]; 0 = none
+    std::array<int, kCtxBuckets> n{};                                 ///< the length of each bucket's table (0 = none)
+    int reqs = 0;
+    bool fresh = false;
+    std::array<unsigned, kCtxBuckets> real{};
+    std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal{};
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> real_cost{};
+};
+/// false (with `why` for the log) when the file is missing, unreadable, malformed or cut short, or was built under
+/// another key: the caller then builds a new table.  Never throws.
+bool read_cost_file(const std::string& path, const std::string& key, CostFile& out, std::string& why);
+/// Writes the file whole or not at all (a temporary file beside it, then renamed over it); makes the folder.
+bool write_cost_file(const std::string& path, const CostFile& f, std::string& why);
+/// What a table is valid for: `devices` (the engine's description of its devices and driver), the cost-aware rule's
+/// setting (XESTRATA_SPEC_COST) and the engine's command line (a file argument by its name and size, so a moved install
+/// keeps its table and another model file does not), without the table's own options, then `extra` (the server's).
+std::string draft_costs_key(int argc, char** argv, const std::string& devices, const std::string& extra);
 
 class DraftPolicy {
 public:
@@ -41,6 +94,42 @@ public:
     static constexpr int kCostBucket = 1;
 
     explicit DraftPolicy(int max_t, double margin = 0.03);
+
+    // ---- fixed costs (--draft-costs; see the file comment and CostFile)
+    /// Fixed costs for `bucket` (round ms of the windows of 1..n rows): they replace whatever was measured, and from now
+    /// on no round time changes a cost, no size is probed for its cost and no size goes stale.  A bucket without a table
+    /// takes the nearest bucket's at set_context, fixed too.  ms == nullptr or n <= 0: fixed at the built-in shape.
+    /// XESTRATA_SPEC_FIXED=1 (+ XESTRATA_SPEC_FIXED_TABLE="T1,T2,...", every bucket) applies it in the constructor.
+    void set_fixed_costs(const double* ms, int n, int bucket = 0);
+    bool fixed() const { return fixed_; }
+    /// The real rounds of a size become its price at kCalibN rounds (their median, clamped to [kCalibLo, kCalibHi] x the
+    /// reference: the learned cost, or the live one while the table is being built); a median outside [kCalibOkLo,
+    /// kCalibOkHi] x a learned cost means a disturbed stretch, and its rounds are collected again.  Only the first
+    /// kFreshS seconds of a busy run count (a GPU that has been busy for long runs slower and unevenly by size, upstream's
+    /// M5 Max measurement; a request kIdleS or more after the last one starts a new busy run).  Until every size up to the
+    /// table's length is real, or kCalibReqs requests have run, the table is held back and live costs decide.
+    static constexpr int kCalibN = 16;
+    static constexpr int kCalibReqs = 100;
+    static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
+    static constexpr double kFreshS = 6.0, kIdleS = 0.5;
+    /// A table file as read (start_calibration: its learned table is set by set_fixed_costs first) ...
+    void start_calibration(const CostFile& cf);
+    /// ... or a file with no table yet (or none at all: `cf` holds only the key): the table of bucket 0 for windows
+    /// 1..n is built from the rounds of the requests, live costs deciding meanwhile; at the take-over a size never
+    /// reached is priced at the live cost of that moment.
+    void start_passive(const CostFile& cf, int n);
+    bool passive() const { return passive_; }
+    bool calibrating() const { return calib_on_; }
+    bool table_held() const { return held_table_; }
+    /// The request boundaries: they place each round in its busy run (only its first kFreshS seconds count).
+    void request_start();
+    void request_end();
+    /// At a request's end: the sizes with kCalibN real rounds get their price, the table takes over when it is due, and
+    /// `cf` gets the table, the marks and the rounds collected so far; `report` says what changed.  True when `cf`
+    /// should be written.
+    bool calibrate(CostFile& cf, std::string& report);
+    /// The largest window size (the table is built up to it).
+    int top_size() const { return max_t_; }
 
     struct Pick {
         bool lookup = false;
@@ -105,6 +194,13 @@ private:
     double draft_q_mean() const;           // the mean acceptance of a tested draft
     bool mtp_step_pays(int t, double held, double q, double expected) const;
     void add_cost(int t, double round_ms);
+    // fixed costs: see set_fixed_costs and start_calibration
+    void calib_add(int bucket, int t, double ms);
+    void apply_table();
+    void hold_table();
+    void use_table();
+    void take_over_passive();
+    void fill_bucket(int b);   // a bucket with no cost yet starts from the nearest one that has (fixed when that is)
 
     int max_t_;
     double margin_;
@@ -119,6 +215,35 @@ private:
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round each size was last measured
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double dq_ok_ = 0, dq_p_ = 0, dq_n_ = 0;               // MTP drafts tested: accepted, their probabilities, count
+    bool fixed_ = false;                                   // set_fixed_costs / use_table: no round time changes a cost
+    bool calib_on_ = false, calib_dirty_ = false;
+    bool passive_ = false;                                 // start_passive: no learned table before the take-over
+    bool held_table_ = false;                              // a table is loaded but not used yet: live costs decide
+    bool live_saved_ = false;
+    std::array<int, kCtxBuckets> fixed_n_{};               // the length of each bucket's table
+    std::array<unsigned, kCtxBuckets> real_{};
+    std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> learned_{}, real_cost_{};   // the table as set; real prices
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> live_cost_{}, live_n_{};    // the live costs when it was set
+    int reqs_ = 0;
+    bool seen_request_ = false;
+    std::chrono::steady_clock::time_point busy_since_{}, last_end_{};
+};
+
+/// --draft-costs in an engine's serve loop (both engines): the table file of one DraftPolicy.  open() once the policy
+/// is the one the requests use, then request_start() / request_end() around every request.  The texts are for the log.
+class DraftCosts {
+public:
+    std::string open(DraftPolicy& p, const std::string& path, const std::string& key);
+    bool on() const { return p_ != nullptr; }
+    void request_start() { if (p_ != nullptr) p_->request_start(); }
+    /// The request's rounds priced, the table taken over when it is due, the file written: "" when nothing changed.
+    std::string request_end();
+
+private:
+    DraftPolicy* p_ = nullptr;
+    std::string path_;
+    CostFile file_;
 };
 
 }  // namespace strata::spec

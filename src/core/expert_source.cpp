@@ -4,6 +4,7 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/auto_pick.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/remote_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -355,14 +356,17 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     std::ifstream info(meminfo);
     std::string line;
     uint64_t bytes = 0;
+    std::optional<uint64_t> mem_total;   // a limit below it is a container's (its /proc/meminfo is the host's)
     while (std::getline(info, line)) {
         std::istringstream fields(line);
         std::string key, unit;
         uint64_t value = 0;
         if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
+        else if (key == "MemTotal:" && unit == "kB" && value <= std::numeric_limits<uint64_t>::max() / 1024) mem_total = value * 1024;
     }
     if (bytes == 0) return false;
+    const bool inactive_only = strata::core::mem_credit_inactive_only(strata::env_get("MEM_CREDIT_INACTIVE"));
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -400,6 +404,13 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                     if (!read_cgroup_memory_stat(path, current, stat)) return false;
                     uint64_t cgroup_available = 0;
                     if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    // a container's limit: the memory guard's file-list credit (no shmem, no locked pages), this margin kept
+                    std::ifstream stat_file(path / "memory.stat");
+                    std::ostringstream stat_text;
+                    if (stat_file) stat_text << stat_file.rdbuf();
+                    const strata::core::ArenaCgroupRoom room =
+                        strata::core::arena_cgroup_room(cap, current, stat_text.str(), mem_total, inactive_only);
+                    if (room.applies) cgroup_available = room.room;
                     bytes = std::min(bytes, cgroup_available);
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
                 } catch (...) { return false; }
@@ -1822,6 +1833,47 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+uint64_t FileExpertSource::drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep) {
+#if defined(__linux__)
+    if (!direct_.empty()) return 0;   // unbuffered reads: no page cache to give back
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    uint64_t released = 0;
+    // the whole pages of [p, p + n): a page that also holds a neighbouring blob stays (that neighbour may be kept)
+    auto drop = [&](const uint8_t* p, uint64_t n, int fd, uint64_t off) {
+        if (p == nullptr) return;
+        const uint64_t a = ((uint64_t) (uintptr_t) p + page - 1) & ~(page - 1);
+        const uint64_t b = ((uint64_t) (uintptr_t) p + n) & ~(page - 1);
+        if (b <= a) return;
+        if (madvise((void*) (uintptr_t) a, (size_t) (b - a), MADV_DONTNEED) != 0) return;
+        if (fd >= 0) (void) posix_fadvise(fd, (off_t) (off + (a - (uint64_t) (uintptr_t) p)), (off_t) (b - a), POSIX_FADV_DONTNEED);
+        released += b - a;
+    };
+    const auto& layout = strata::kernels::cpu::expert_layout();
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (keep && keep(l, e)) continue;
+            if (!role_ptr_.empty()) {   // the GGUF in place: the three role slices
+                for (int r = 0; r < 3; ++r) {
+                    const size_t i = (size_t) (3 * l + r);
+                    if (i >= role_ptr_.size() || role_ptr_[i] == nullptr) continue;
+                    const uint64_t per = role_bytes_[i];
+                    const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * per);
+                    const size_t f = (size_t) role_file_[i];
+                    if (f >= maps_.size() || maps_[f].base == nullptr) continue;
+                    drop(p, per, maps_[f].fd, (uint64_t) (p - maps_[f].base));
+                }
+            } else if (const uint8_t* b = mapped_blob(l, e)) {   // experts.bin
+                const uint64_t n = layout.mixed() ? layout.blob_bytes(l, e) : layer_blob_bytes_[(size_t) l];
+                drop(b, n, fd_, (uint64_t) (b - base_));
+            }
+        }
+    return released;
+#else
+    (void) keep;
+    return 0;
+#endif
+}
+
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
@@ -3086,8 +3138,8 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
 }
 
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
-// skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
-// default where it applies.
+// skipped (upstream b4e3407b).  The environment value is read once: unset, 0 or anything but 1-9 is off (upstream
+// 9624759956); "auto" is off here too, and the serve start-up (generate.cpp) sets rank 7 where the rule allows.
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
 int tail_skip_rank() {
@@ -3101,6 +3153,10 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+bool tail_skip_auto() {
+    const char* v = strata::env_get("ROUTE_TAIL_SKIP");
+    return v != nullptr && std::strcmp(v, "auto") == 0;
+}
 
 void expert_pool_count(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k) {
     if (!d.usage.empty() && d.usage_by_window && !d.route_rec.empty() && d.layers < d.route_rec_layers &&

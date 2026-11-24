@@ -151,8 +151,7 @@ inline uint64_t tier_window_bytes(int64_t max_t, int64_t k, int64_t n_embd, uint
     return (uint64_t) max_t * (uint64_t) k * (uint64_t) n_embd * 4 * 3 + 16 * max_blob + (64ull << 20);
 }
 
-/// A VRAM tier's room, for every engine that fills one from the free memory (PlainModel's rule; Inkling-2-Mini's
-/// tier takes it too).  Of `free_b` (counted_free's) on a device of `total_b`: less `window_b` and less the reserve -
+/// A VRAM tier's room, for every engine that fills one from the free memory (PlainModel's rule).  Of `free_b` (counted_free's) on a device of `total_b`: less `window_b` and less the reserve -
 /// what is allocated after the tier (the products' libraries, the graphs) and the driver's margin, --vram-reserve-mib
 /// (`reserve_mib` >= 0) or the room of the device's memory (core::vram_room, its floor kTierRoomLeast, its 768 MiB
 /// ceiling past 24 GiB).  `per_layer_b`: one expert of every layer the tier holds; `max_slots`: --expert-cache N over

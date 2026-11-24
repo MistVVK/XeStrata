@@ -50,7 +50,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
 
 - **free**（`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
-  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.0）で確かめています（[setup](#setup) を参照）。
+  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.1）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
@@ -68,7 +68,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
-  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.2.0 で、sm_89 向けのビルドが通ることを確かめています。
+  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.2.1 で、sm_89 向けのビルドが通ることを確かめています。
   RTX 4070（sm_89）で動くことを確かめています。
   エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
   そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます

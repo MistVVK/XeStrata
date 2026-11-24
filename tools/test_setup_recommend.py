@@ -121,7 +121,9 @@ class FirstModel(unittest.TestCase):
 
     def test_the_first_this_pc_runs_in_the_users_order(self):
         # the user's order of 2026-11-22: SC117's Swift 1.5 (IQ3_S, else IQ3_XXS, each where it runs with most of its
-        # experts on the GPUs), Signal-2 where the RAM holds its peak else Sync, SenseNova, Qwen3.5-2B
+        # experts on the GPUs), Signal-2 where the RAM holds its peak else Sync, then (2026-11-23 13:17) Inkling-2-Mini
+        # (QSA), SenseNova, Qwen3.5-2B.  Inkling's step takes a size whose experts all fit the card at 32K (the MODEL
+        # check's INKLING_CARD_GB, 2026-11-24): SQ-10 from 14.3 GiB, SQ-15 from 17.9, SQ-20 from 22.5
         cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB of RAM, a 32 GB card
                  ((123.2, 31.89), ("sc117-swift", "IQ3_S")),     # as an Arc Pro B70 reads
                  ((123.2, 30), ("sc117-swift", "IQ3_XXS")),      # most of IQ3_XXS's experts on it, not of IQ3_S's
@@ -136,15 +138,34 @@ class FirstModel(unittest.TestCase):
                  ((52, 0), ("sync", "Sync-M")),
                  ((32, 12), ("sync", "Sync-S")),
                  ((24, 8), ("sync", "Sync-XS")),
-                 ((20, 16), ("sensenova-loop-qsa", "Q8_0")),
-                 ((20, 10), ("sensenova-loop-qsa", "Q5_K_M")),
-                 ((20, 9), ("sensenova-loop-qsa", "Q4_K_M")),
-                 ((20, 8), ("qwen35-2b", "Q8_0")),
+                 ((20, 24), ("inkling-qsa", "SQ-20")),
+                 ((20, 20), ("inkling-qsa", "SQ-15")),
+                 ((20, 16), ("inkling-qsa", "SQ-10")),
+                 ((20, 12), ("sensenova-loop-qsa", "Q5_K_M")),    # Inkling's experts would run from host memory
+                 ((16, 8), ("qwen35-2b", "Q8_0")),
+                 ((12, 8), ("qwen35-2b", "Q8_0")),
                  ((2, 1), ("qwen35-2b", "Q4_K_M"))]               # nothing runs: the last choice
         with with_other_branches():
             for (ram, vram), expected in cases:
                 with self.subTest(ram=ram, vram=vram):
                     self.assertEqual(self.first(ram, vram), expected)
+
+    def test_sensenova_where_inkling_does_not_run(self):
+        # the ladder's step after Inkling-2-Mini (QSA): where it is not offered, SenseNova, then Qwen3.5-2B
+        fams = [f for f in self.fams if f != "inkling-qsa"] + list(OTHER_BRANCHES["FAMILIES"])
+        with with_other_branches():
+            for (ram, vram), expected in [((20, 16), ("sensenova-loop-qsa", "Q8_0")),
+                                          ((20, 10), ("sensenova-loop-qsa", "Q5_K_M")),
+                                          ((20, 9), ("sensenova-loop-qsa", "Q4_K_M")),
+                                          ((20, 8), ("qwen35-2b", "Q8_0"))]:
+                with self.subTest(ram=ram, vram=vram):
+                    self.assertEqual(self.first(ram, vram, fams), expected)
+
+    def test_inkling_qsa_is_the_ladders_and_plain_inkling_is_not(self):
+        steps = [f for f, *_ in setup.FIRST_CHOICE]
+        self.assertEqual(steps.index("inkling-qsa"), steps.index("sync") + 1)
+        self.assertEqual(steps.index("sensenova-loop-qsa"), steps.index("inkling-qsa") + 1)
+        self.assertNotIn("inkling", steps)
 
     def test_sc117_needs_most_of_its_experts_on_the_gpus(self):
         self.assertTrue(setup.gpu_holds_most("IQ3_S", room(128, 31.16)))
@@ -166,8 +187,9 @@ class FirstModel(unittest.TestCase):
             self.assertEqual(self.first(62.7, 16, fams), ("sync", "Sync-M"))   # 64 GB installed
 
     def test_a_family_not_registered_is_passed_over(self):
-        # a tree without Signal-2's and SenseNova's entries, whatever this one registers: SC117, Sync, Qwen3.5-2B
-        gone = ("signal2", "sensenova-loop-qsa")
+        # a tree without Signal-2's, Inkling's (QSA) and SenseNova's entries, whatever this one registers: SC117, Sync,
+        # Qwen3.5-2B
+        gone = ("signal2", "inkling-qsa", "sensenova-loop-qsa")
         self.assertTrue(set(gone) <= {f for f, *_ in setup.FIRST_CHOICE})
         with without_families(*gone):
             fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]

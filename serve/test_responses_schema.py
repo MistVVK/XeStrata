@@ -272,3 +272,32 @@ class ResponsesSchemaHTTP(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CutStructuredAnswer(unittest.TestCase):
+    """台帳 0805: max_output_tokens で切れた JSON 形式の答えは検証せず incomplete で返す。"""
+
+    def test_the_text_so_far_is_an_incomplete_message(self):
+        asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
+        asm.json_text = ['{"a": "bcdefgh']
+        called = []
+
+        def validate(text, finish):
+            called.append(text)
+            raise AssertionError("a cut answer must not be validated")
+
+        events = asm.finish({"finish": "length", "completion_tokens": 8}, validate)
+        self.assertEqual(called, [])
+        self.assertEqual(asm.response["status"], "incomplete")
+        self.assertEqual(asm.response["incomplete_details"], {"reason": "max_output_tokens"})
+        self.assertIsNone(asm.response["error"])
+        self.assertEqual(asm.response["output"][0]["status"], "incomplete")
+        self.assertEqual(asm.response["output"][0]["content"][0]["text"], '{"a": "bcdefgh')
+        self.assertEqual(events[-1]["type"], "response.incomplete")
+
+    def test_a_complete_answer_is_still_validated(self):
+        asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
+        asm.json_text = ['{"a": 1}']
+        events = asm.finish({"finish": "stop", "completion_tokens": 3}, lambda text, finish: text)
+        self.assertEqual(asm.response["status"], "completed")
+        self.assertEqual(events[-1]["type"], "response.completed")

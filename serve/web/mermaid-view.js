@@ -61,7 +61,8 @@
     try {
       return (await root.mermaid.render(`xs-mermaid-${++seq}`, code)).svg;
     } catch (_) {
-      for (const junk of document.querySelectorAll(`[id^="dxs-mermaid-"]`)) junk.remove();   // its error box
+      // mermaid takes away its own temporary node (i<id> or d<id>). Removing every dxs-mermaid-* node here also
+      // removes the node of another render still in flight, which makes all the other charts fail as well.
       return null;
     }
   }

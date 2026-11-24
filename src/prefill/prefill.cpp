@@ -5,6 +5,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/core/kv_host_dma.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -160,6 +161,24 @@ inline double cpu_share_env();
 inline int64_t stream_all_min() {
     const int mode = strata::core::cpu_share_staged_3k_mode();
     return cpu_share_env() != 0.0 && mode != 0 ? 3073 : 2048;
+}
+// XESTRATA_PREFILL_EQUAL (upstream 7104c8b8e, 51e5e7adc, idea own-prompt-plan): a prompt longer than its chunk is read
+// in n = ceil(tokens / chunk) chunks of equal size (the first n - 1 of ceil(tokens / n) tokens) instead of full chunks
+// and a remainder (20,931 tokens at 10,240: 3 x 6,977, not 10,240 + 10,240 + 451): the same number of chunks, and no
+// short last chunk under the stream floor, whose staged walk costs close to a full pass where most experts stream.
+// Upstream measured 0.923-1.001 of the time at 14,000-32,000 tokens (RTX 5070 12 GB); a chunk more than needed was
+// slower, so the count stays.  Only on one GPU (a layer split's stages and a helper GPU keep the cut: evening out a
+// short tail added a full pass there, two RTX 4090: 25% slower), and only where the equal chunk is at or above the
+// stream floor.  Opt-in here (1; unset and 0: full chunks and a remainder): this path's short tail is staged with the
+// CPU share, cheaper than the full pass the equal cut gives it.  Measured 2026-11-23, Qwen3.8-Flash-Next IQ3_XXS, 3
+// alternating rounds: RTX 4070, 16,999 tokens in 2 chunks 17,947 ms cut as today against 18,983 ms equal (+5.8%; the
+// tail of 615 tokens took 1,371 experts on the CPU); B70, 33,500 tokens 16,679 against 16,652 ms (equal).  The cut
+// changes the answer's bits (the chunks' rows differ), so neither A/B kept the same greedy text.
+inline int64_t equal_step(int64_t n, int64_t cap, bool one_gpu) {
+    static const core::Pick pick = core::pick_from_env("PREFILL_EQUAL");
+    if (pick != core::Pick::On || !one_gpu || cap <= 0 || n <= cap) return cap;
+    const int64_t c = (n + cap - 1) / cap, step = (n + c - 1) / c;
+    return step >= stream_all_min() ? step : cap;
 }
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
@@ -2588,6 +2607,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    // XESTRATA_PREFILL_EQUAL: the chunks this prompt is read in (equal_step); m.T stays the buffers' size
+    const int64_t step = equal_step(n, m.T, next_ == nullptr && hand_in_ == nullptr && !helper_);
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
     const KvaConfig& kva = kva_config();
@@ -2656,8 +2677,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0, step](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(step, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -2681,7 +2702,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += step) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (strata::env_get("TRACE")) {   // the stage and the time, one clock for the process (upstream 14d076ee2, 3a2675302)
             static const Clock::time_point t0 = Clock::now();
@@ -2690,7 +2711,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
             std::fflush(stderr);
         }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t T = std::min(step, n - c0), p0 = pos0 + c0;
         // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
         const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
         const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
@@ -2824,9 +2845,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
             // (upstream #1996)
             if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);
-            if (c0 + m.T < n) {
+            if (c0 + step < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + step, b = ple_buf ^ 1] {
                     strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
@@ -3152,6 +3173,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
+                    // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                    // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                    const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -3166,7 +3190,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                            hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                            sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                            sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                        const bool mirror = st.host.present();
+                        const bool mirror = st.host.present() && !host_by_dma;
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
                                   staged ? &sk : nullptr);
@@ -3179,12 +3203,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          &st.host, staged ? &m.stage : nullptr);
+                                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      &st.host, staged ? &m.stage : nullptr);
+                                      host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                     }
+                    if (host_by_dma)
+                        strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                            p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     if (!kva_state_only) {   // KVA: a state-only layer has no queries
                         split_q(m.Qf, m.q, T, m.cs);
                         kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
@@ -3725,11 +3752,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto t0 = std::chrono::steady_clock::now();
                                 if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
                                 std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
-                                for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
-                                for (int64_t t = 0; t < T; ++t) {
-                                    if (!need[(size_t) t]) continue;
-                                    strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
+                                std::vector<int32_t> toks;
+                                for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) {
+                                    const int32_t t = m.src_host[(size_t) p];
+                                    if (!need[(size_t) t]) { need[(size_t) t] = 1; toks.push_back(t); }
                                 }
+                                // upstream 431a26db1: each token's activation quantized on the pool, 32 tokens a piece
+                                pool->run_items((int) toks.size(), 32, 64, [&](int i) {
+                                    const int64_t t = toks[(size_t) i];
+                                    strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
+                                });
                                 for (auto& j : m.cpu_jobs)
                                     for (int r = 0; r < j.nt; ++r) {
                                         const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;
@@ -4544,7 +4576,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % m.T;
+        const int64_t last = (n - 1) % step;
         std::fprintf(stderr, "xestrata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
@@ -4586,7 +4618,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              "in %lld of %lld chunks, mode %s%s%s\n",
                      kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
                      (long long) kva_positions, (long long) n, (long long) kva_chunks,
-                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
+                     (long long) (n > 0 && step > 0 ? (n + step - 1) / step : 0), mode, only,
                      kva.capture ? ", capturing the late layers' inputs" : "");
         if (kva_positions > 0) {
             // What a later turn does with this state (serve): it continues from the live session or a checkpoint of
@@ -5648,6 +5680,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                EPS, cs);
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         const bool staged = st.kv_mode == 1;
+                        // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                        // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                        const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                         if (staged) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -5661,7 +5696,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                                sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                                sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                            const bool mirror = st.host.present();
+                            const bool mirror = st.host.present() && !host_by_dma;
                             kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                       st.k_q, st.k_q, st.k_scale, st.k_scale, cs, mirror ? &hk : nullptr,
                                       staged ? &sk : nullptr);
@@ -5674,12 +5709,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             }
                             if (st.kv_q4)
                                 strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, cs,
-                                                              &st.host, staged ? &m.stage : nullptr);
+                                                              host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                             else
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,
-                                          &st.host, staged ? &m.stage : nullptr);
+                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         }
+                        if (host_by_dma)
+                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                                p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, cs);
                         split_q(m.Qf, m.q, T, cs);
                         kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
                                                EPS, cs);

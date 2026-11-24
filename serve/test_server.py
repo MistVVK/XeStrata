@@ -2663,6 +2663,41 @@ class DesktopVramNote(unittest.TestCase):
             self.assertFalse(server.linux_desktop({}))
 
 
+class DraftCosts(unittest.TestCase):
+    """"draft_costs": true in the config: --draft-costs <folder>/<model>-<hash>.costs and the engine file's size as
+    --draft-costs-key; off without the key or with false (the default on every GPU); an engine program seen without
+    the option is not given it (upstream bb21ee1f5, a32d1b368, 1b11a76e8)."""
+
+    def run_args(self, **cfg):
+        from serve import server
+        base = {"args": ["--native", "m.gguf", "--spec", "4"], "model_name": "qwen3.8/iq3",
+                "session_save_reclaim": False, "expert_profile_save": False}
+        base.update(cfg)
+        return server.engine_args(base)
+
+    def test_off_by_default(self):
+        self.assertNotIn("--draft-costs", self.run_args())
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=False))
+
+    def test_on_names_a_file_per_model_and_arguments(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "xestrata-engine"
+        exe.write_bytes(b"\0 --draft-costs FILE \0")
+        with mock.patch.dict(os.environ, {"XESTRATA_DRAFT_COSTS_DIR": str(d / "dc")}):
+            got = self.run_args(draft_costs=True, exe=str(exe))
+            other = self.run_args(draft_costs=True, exe=str(exe), args=["--native", "m.gguf", "--spec", "6"])
+        i = got.index("--draft-costs")
+        self.assertTrue(got[i + 1].startswith(str(d / "dc" / "qwen3.8-iq3-")) and got[i + 1].endswith(".costs"))
+        self.assertEqual(got[i + 2:i + 4], ["--draft-costs-key", f"engine file {exe.stat().st_size} bytes"])
+        self.assertNotEqual(other[other.index("--draft-costs") + 1], got[i + 1])
+
+    def test_an_engine_without_the_option_is_not_given_it(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "old-engine"
+        exe.write_bytes(b"\0 --draft-rule \0")
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=True, exe=str(exe)))
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
     begins from it when it is a profile of the same model; without the key expert-profile-<model>.bin, and false
@@ -4233,6 +4268,84 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """台帳 0803（upstream 55ccf8556e）: 同じ 503 が responses でも Retry-After を出す。"""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
+    def _strict_hook(self, code: str):
+        self.svc.before_load = [sys.executable, "-c", code]
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        return self._raw_chat()
+
+    def test_before_load_refusal_carries_the_commands_own_reason(self):
+        """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        status, headers, body = self._strict_hook(
+            "import sys; print('checking'); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: "
+            "the hold needs 76.0 GB', file=sys.stderr); "
+            "sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"],
+                         "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_refusal_without_output_keeps_the_generic_sentence(self):
+        status, _, body = self._strict_hook("import sys; sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertIn("the before_load command failed (it exited with code 75)", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_reason_is_made_safe(self):
+        status, _, body = self._strict_hook(
+            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 "
+            "+ '\\n  \\n'); sys.exit(1)")
+        msg = body["error"]["message"]
+        self.assertEqual(status, 503)
+        self.assertLessEqual(len(msg), 300)
+        self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "\u200b" for c in msg), repr(msg[:60]))
+        from serve.server import hook_reason
+        self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
+        self.assertEqual(hook_reason(""), "")
+        self.assertEqual(hook_reason(None), "")
+        self.assertEqual(hook_reason("x" * 300), "x" * 300)
+        self.assertEqual(len(hook_reason("y" * 301)), 300)
+
+    def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
+        status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_before_load_stderr_line_wins_over_stdout(self):
+        # 台帳 0821: stdout と stderr を分けて読み、stderr の最後の非空行を理由にする
+        from serve.server import hook_reason, hook_text
+        self.assertEqual(hook_reason(b"progress\nlater progress\n", stderr=b"no room for 76G of RAM\n"),
+                         "no room for 76G of RAM")
+        self.assertEqual(hook_reason(b"progress\n", stderr=b"  \n"), "progress")
+        self.assertEqual(hook_text(b"\xff\xfe"), "\ufffd\ufffd")   # never raises on a bad byte
+        status, _, body = self._strict_hook(
+            "import sys; print('done checking', flush=True); "
+            "print('no room for 76G of RAM', file=sys.stderr, flush=True); sys.exit(1)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room for 76G of RAM")
+
 
 class ThinkingEngine(MockEngine):
     """Thinks THOUGHT, then answers; a prompt that already ends its thinking (the budget's wrap-up) gets the answer
@@ -5105,6 +5218,29 @@ class ModelAliases(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class IntelTelemetry(unittest.TestCase):
+    """A card with a product name in udev's PCI database is not named by the die in pci.ids."""
+
+    def test_name(self):
+        from serve import hardware, telemetry
+        with tempfile.TemporaryDirectory() as d:
+            dev = Path(d) / "0000:03:00.0"
+            dev.mkdir()
+            (dev / "vendor").write_text("0x8086\n")
+            (dev / "device").write_text("0xe223\n")
+            db = Path(d) / "pci.hwdb"
+            db.write_text("pci:v00008086d0000E223*\n ID_MODEL_FROM_DATABASE=Battlemage G31 [Arc Pro B70]\n")
+            ids = Path(d) / "pci.ids"
+            ids.write_text("8086  Intel Corporation\n\te223  Battlemage G31 [Intel Graphics]\n")
+            g = telemetry._XeGpu.__new__(telemetry._XeGpu)
+            g.dev, g.pci = str(dev), "0000:03:00.0"
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", (str(db),)):
+                self.assertEqual(g.name(), "Intel Arc Pro B70 at 0000:03:00.0")
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", ()), \
+                    mock.patch.object(telemetry, "PCI_IDS", (str(ids),)):
+                self.assertEqual(g.name(), "Intel Battlemage G31 [Intel Graphics] at 0000:03:00.0")
 
 
 class AmdTelemetry(unittest.TestCase):

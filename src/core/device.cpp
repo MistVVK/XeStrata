@@ -1410,6 +1410,16 @@ int device_selector_index(int ordinal) {
     throw DeviceError("the GPU is not in the SYCL platform list");
 }
 
+std::string devices_key_text() {
+    std::string k = "engine " STRATA_VERSION "|devices " + std::to_string(Runtime::count());
+    for (int i = 0; i < Runtime::count(); ++i) {
+        const DeviceInfo d = device_info(i);
+        k += "|" + d.backend + " " + d.name + " " + std::to_string(d.total_bytes >> 20) + " MiB cu " +
+             std::to_string(d.compute_units) + " driver " + d.driver_version + " runtime " + d.platform_version;
+    }
+    return k;
+}
+
 DeviceInfo device_info(int ordinal) {
     if (ordinal < 0 || ordinal >= Runtime::count())
         throw DeviceError("no engine device " + std::to_string(ordinal));

@@ -13,7 +13,7 @@
 // Where a streamed layer's copy reads from is measured when streaming starts, once a process (Source):
 //   - the file's pages themselves, when the GPU's copies from pageable memory run near its copies from page-locked
 //     memory (the runtime stages them well): nothing is held in RAM for the layers.  Not measured where the GPU's
-//     copies cannot read the file's pages at all (gpu::copies_read_mapped_files: Level Zero);
+//     copies cannot read the file's pages at all (gpu::copies_read_mapped_files: Level Zero, HIP);
 //   - else page-locked memory: the layer's own copy in host USM (its home), filled on its first pass and kept while
 //     streaming lasts, so the later passes are a DMA alone;
 //   - else (no home) a page-locked relay of the largest layer per slot, filled on several threads from the file's
@@ -27,7 +27,8 @@
 // A pass through the relay reads the RAM three times (the memcpy's read and write, the DMA's read), and RAM bandwidth
 // is what bounds it: on the development machine (DDR4-3200, B70) the relay passed 10-11 GB/s where a DMA from
 // page-locked memory runs at 27 GB/s, and the B70's copies from the file's pages ran at 4.7 GB/s; the RX 9060 XT's ran
-// at 25 GB/s from the file's pages, 26 from page-locked memory (2026-10-28).
+// at 25 GB/s from the file's pages, 26 from page-locked memory (2026-10-28), but stalled for minutes under RAM
+// pressure (gpu::copies_read_mapped_files).
 #pragma once
 
 #include "strata/core/gpu.hpp"

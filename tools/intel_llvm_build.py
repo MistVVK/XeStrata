@@ -44,7 +44,10 @@ OUT, BUILD, INSTALL, RECORD = BASE, BASE / "build", BASE / "install", BASE / "in
 REPO = "https://github.com/intel/llvm.git"
 # The release this script builds: one with the Arc Pro B70 in the runtime's matrix table (v7.0.0 or later).  Raised by
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
-TAG = "v7.2.0"
+TAG = "v7.2.1"
+# Releases intel/llvm has raised its version to without a tag yet, at the commit taken: v7.2.1 is sycl-rel-7_2's head
+# of 2026-11-13 (its version raised by 5fd7ee455; untagged and unreleased on 2026-11-24).
+UNTAGGED = {"v7.2.1": "ea269d5f7189ab7ade0ada0706d973c5f5ee5f65"}
 
 # ROCm's device libraries (ocml, ockl and the others; the University of Illinois/NCSA license), which the AMD code
 # links: built with the toolchain, into install/amdgcn/bitcode, since a clang reads bitcode of its own LLVM or older
@@ -330,19 +333,21 @@ def fix_sources() -> None:
 
 
 def prepare_source(tag: str) -> None:
-    """The clone at `tag`, with the patches."""
+    """The clone at `tag` (an untagged release at its commit, UNTAGGED), with the patches."""
     BASE.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
-    if (SRC / ".git").exists():
-        have = subprocess.run(["git", "-C", str(SRC), "describe", "--tags", "--exact-match"], capture_output=True,
-                              text=True).stdout.strip()
-        if have != tag:
-            run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", "tag", tag])
-            # the patched files back to the release first
+    ref = UNTAGGED.get(tag, tag)
+    if not (SRC / ".git").exists():
+        run(["git", "init", "-q", SRC])
+        run(["git", "-C", SRC, "remote", "add", "origin", REPO])
+    have = [subprocess.run(["git", "-C", str(SRC), *cmd], capture_output=True, text=True).stdout.strip()
+            for cmd in (["rev-parse", "HEAD"], ["describe", "--tags", "--exact-match"])]
+    if ref not in have:
+        run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", *([] if tag in UNTAGGED else ["tag"]), ref])
+        # the patched files back to the release first
+        if have[0] != "HEAD":
             restore_release()
-            run(["git", "-C", SRC, "checkout", "--detach", tag])
-    else:
-        run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
+        run(["git", "-C", SRC, "checkout", "--detach", ref])
     fix_sources()
 
 

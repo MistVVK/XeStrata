@@ -36,9 +36,6 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream, float a 
 /// `y[i] = f16(x[i])`, round-to-nearest-even, using the shared conversion in `f16_bits.hpp`.
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);
 
-/// Split each value into its FP16 high part and an FP16 residual scaled by 1024.
-void f32_split_f16(const float* x, uint16_t* hi, uint16_t* lo, int64_t n, void* stream);
-
 /// *seq = v in MAPPED PINNED memory - THE DOORBELL.  A KERNEL and not cudaEventRecord, because round 199
 /// found that an event record inside a capture is SILENTLY DROPPED while a kernel is captured normally, and
 /// round 209 measured the host seeing this one's result 0.050 ms into a 39.8 ms graph.

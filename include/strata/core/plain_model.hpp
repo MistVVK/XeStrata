@@ -67,7 +67,6 @@ namespace strata::core {
 
 class RemoteExperts;
 class PlainCpu;
-class PlainInkling;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -117,8 +116,8 @@ struct PlainOptions {
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
-    /// --device cpu: the dense Qwen3.5 or Inkling-2-Mini forward on the CPU alone, no GPU opened; `cpu_threads` is
-    /// the thread count (0: physical cores, subject to the CPU quota; Inkling-2-Mini: logical CPUs / 8, at least 1)
+    /// --device cpu: the dense Qwen3.5 forward on the CPU alone, no GPU opened; `cpu_threads` is the thread count (0:
+    /// physical cores, subject to the CPU quota)
     bool cpu = false;
     int cpu_threads = 0;
     /// --gpu-layers N (the dense models: qwen35, plamo3): the first N blocks and the head on the GPU, the other blocks
@@ -259,6 +258,9 @@ struct PlainOptions {
     /// cannot give up their room later (not --vram-elastic), so the start can measure them; 0: none
     int draft_windows_wide = 0;
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
+    /// --serve, --draft-costs FILE: the window costs' table (as generate.cpp's); draft_costs_key: the server's part of
+    /// its key on the command line, the whole key (strata::spec::draft_costs_key) once the devices are up
+    std::string draft_costs, draft_costs_key;
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
     /// chosen at load from each GPU's free memory.  Empty and false: one GPU, the current one.
@@ -368,10 +370,6 @@ public:
                    const strata::kernels::SamplerParams* sp, int T, int32_t* drafts, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
-    const float* inkling_tap_dev() const;
-    // Check a DSpark block against the target. Only matched rows enter the target state.
-    bool dspark_step(int32_t anchor, int64_t pos, int count, const std::vector<int32_t>& eos,
-                     int32_t* out, float* logits, int& emitted, int& accepted, std::string& err);
 
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
@@ -426,6 +424,8 @@ public:
     /// --serve: a request's prompt reads the residency table again, so the windows are not where a switch that changes
     /// when a swap is applied can be measured against the prompt's rounding (auto_pick.hpp).
     void set_serve(bool on) { for (PlainModel* st : chain()) st->serve_ = on; }
+    /// The draft policy of the MTP's windows (--draft-costs fixes its costs, strata::spec::DraftCosts)
+    strata::spec::DraftPolicy& draft_policy() { return policy_; }
     /// The PCIe share of the missed experts for this request (setup's calibration, pcie_frac=); < 0: the engine's own
     void set_pcie_frac(double f);
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
@@ -1114,8 +1114,6 @@ private:
     std::unique_ptr<GgufModel> model_;
     // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
     std::unique_ptr<PlainCpu> cpu_;
-    /// inkling2_loop's CPU reference forward (--device cpu); the GPU path is not implemented in this stage.
-    std::unique_ptr<PlainInkling> inkling_;
     /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
     /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
     bool auto_gpu_layers(std::string& err);
@@ -1223,9 +1221,11 @@ private:
     bool alloc_kv(KvPtrs& p, size_t cells, bool vmm = false);
     /// `n` cells' K and V (n rows of n_head_kv x head_dim, rotated as the format keeps them) at steps[t * kStepCount]
     /// into session `slot`'s pools of attention block a; a streamed layer also writes its host copy, and `stage` (the
-    /// prompt path's staging pool) when given
+    /// prompt path's staging pool) when given; `host_by_dma`: the host copy is left to the caller's DMA from `stage`
+    /// (core/kv_host_dma.hpp)
     void kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
-                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr);
+                         strata::gpu::Stream cs, const strata::kernels::KvHostPools* stage = nullptr,
+                         bool host_by_dma = false);
     bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
