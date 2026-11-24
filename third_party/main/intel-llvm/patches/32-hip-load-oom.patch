@@ -1,0 +1,58 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-load-oom: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+A module the GPU has no room for is refused by hipModuleLoadDataEx as hipErrorNoBinaryForGpu (ROCm 10.1 on
+an RX 9060 XT, with every block of its memory taken), which the HIP adapter passed on as a build failure.
+The SYCL runtime keeps a failed build in its program cache and throws it again for every later use of the
+program, so the kernels of a program first used while the GPU was full never ran in that process, also
+after the memory was free again (an image engine started beside a text model whose expert cache held the
+VRAM: every image job failed, "The program was built for 1 devices").  Out of device memory is not kept:
+the runtime drops its cache and builds the program again at the next use.  Fixed, a load refused as having
+no binary or no memory while the device has less than 256 MiB and twice the binary free is reported as out
+of device memory.
+---
+--- a/unified-runtime/source/adapters/hip/program.cpp
++++ b/unified-runtime/source/adapters/hip/program.cpp
+@@ -5,6 +5,7 @@
+ // Exceptions. See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ // Modified 2026 by MistVVK and the XeStrata contributors: HIP exit cleanup.
++// Modified 2026 by MistVVK and the XeStrata contributors: HIP load OOM.
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -249,8 +250,29 @@
+   Options[3] = hipJitOptionErrorLogBufferSizeBytes;
+   OptionVals[3] = (void *)(long)MAX_LOG_SIZE;
+ 
+-  UR_CHECK_ERROR(hipModuleLoadDataEx(&Module, static_cast<const void *>(Binary),
+-                                     NumberOfOptions, Options, OptionVals));
++  const hipError_t Loaded =
++      hipModuleLoadDataEx(&Module, static_cast<const void *>(Binary),
++                          NumberOfOptions, Options, OptionVals);
++  // A module the device has no room for (its code and data are placed in
++  // VRAM) is refused as hipErrorNoBinaryForGpu, which reads as a build
++  // failure: the SYCL runtime caches that for the program, and its kernels
++  // never ran in the process, even once the memory was free again.  Out of
++  // device memory, which the SYCL runtime does not cache, when the device is
++  // that full (ROCm 10.1, RX 9060 XT: a module with 64 MiB of data while every
++  // block was taken; an image engine started beside a text model holding the
++  // VRAM)
++  if (Loaded == hipErrorNoBinaryForGpu || Loaded == hipErrorOutOfMemory) {
++    size_t Free = 0, Total = 0;
++    if (hipMemGetInfo(&Free, &Total) == hipSuccess &&
++        Free < (size_t(256) << 20) + 2 * BinarySizeInBytes) {
++      UR_LOG(ERR,
++             "HIP module load: {} with {} MiB of device memory free: "
++             "out of device memory",
++             hipGetErrorName(Loaded), Free >> 20);
++      throw UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
++    }
++  }
++  UR_CHECK_ERROR(Loaded);
+   watchProcessExit();
+ 
+   BuildStatus = UR_PROGRAM_BUILD_STATUS_SUCCESS;

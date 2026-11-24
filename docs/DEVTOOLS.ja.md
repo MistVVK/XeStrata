@@ -187,6 +187,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   23 番目: intel/llvm の `urPhysicalMemCreate`（18 番目のコミット）は、自分のデバイスを今のデバイスにしないまま `hipMemCreate` を呼びます。
   `hipMemCreate` は、プロパティーがどのデバイスを指していても今のデバイスからメモリを取る（ROCm 7.1.1・10.1）ので、AMD の GPU が 2 枚ある PC では、今のデバイスがもう 1 枚のスレッドがそちらのメモリを取ります。
   修正後は、先に自分のデバイスを今のデバイスにします（`hip-physical-mem-device`）。
+  24 番目: GPU に置き場のないモジュールを、`hipModuleLoadDataEx` は `hipErrorNoBinaryForGpu` で断り（ROCm 10.1、RX 9060 XT のメモリの塊をすべて取った状態）、HIP のアダプタはそれをビルドの失敗として返していました。
+  SYCL のランタイムは失敗したビルドをプログラムのキャッシュに残し、そのプログラムを使うたびに同じ例外を投げるので、GPU が埋まっている間に初めて使ったプログラムのカーネルは、メモリが空いた後もそのプロセスでは動きませんでした（文章のモデルのエキスパートのキャッシュが VRAM を埋めている横で立ち上がった画像のエンジンで、どの画像の仕事も "The program was built for 1 devices" で失敗した）。
+  デバイスのメモリ不足ならキャッシュに残らず、ランタイムはキャッシュを捨て、次に使うときにビルドし直します。
+  修正後は、バイナリがない・メモリがないと断られたときに、デバイスの空きが 256 MiB とバイナリの 2 倍の和より少なければ、デバイスのメモリ不足として返します（`hip-load-oom`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正と `amdgpu-global-offset-hostcall` は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch`・`l0-static-graph`・`offload-nordc-archive` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
