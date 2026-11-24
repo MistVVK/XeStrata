@@ -505,7 +505,10 @@ void LayerStream::worker() {
         {
             std::unique_lock<std::mutex> l(mu_);
             cv_.wait(l, [this] { return stop_ || !queue_.empty(); });
-            if (stop_) return;
+            // a layer still queued at the stop is filled first: the destructor's drop() waits for the queue to drain
+            // (the prefetch the last begin() queued, not yet taken by this thread when the stop came, hung it: the
+            // parallel CTest's moss_text_parity, 2026-11-24)
+            if (stop_ && queue_.empty()) return;
             i = queue_.front();
             const int k = slot_of(i);
             s = k >= 0 ? &slots_[k] : nullptr;
