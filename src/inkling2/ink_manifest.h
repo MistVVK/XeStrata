@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/inkling2/ink_manifest.h - Inkling-2-Mini's .strata v1.1 manifest, configuration, tensor table and SHA-256 check.
-// XeStrata reads the .strata file alone: upstream's GGUF and safetensors adapters (whose tensors only its CPU backend
-// read) are not taken.
+// XeStrata reads the .strata v1.1 file and Unsloth / community .gguf files through the
+// GgufAdapter below; the upstream safetensors adapter is not taken.
 #pragma once
 
 #include <algorithm>
@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ink_gguf_loader.h"
 #include "ink_json.h"
 #include "strata/artifact/strata_reader.hpp"
 #include "strata/quant/sk_codecs.hpp"
@@ -424,9 +425,13 @@ struct Sha256 {
     }
 };
 
-// The model file (.strata v1.1), shared by the CPU and GPU backends.
+enum class ModelSourceKind : uint8_t { Strata = 0, Gguf = 2 };
+
+// The model file (.strata v1.1 or .gguf), shared by the CPU and GPU backends.
 struct InkModelFile {
     std::string path;
+    ModelSourceKind kind = ModelSourceKind::Strata;
+    std::unique_ptr<ink2::GgufAdapter> gguf_adapter;
     strata::artifact::StrataFileReader rd;
     InkManifest m;
     // Direct lookup: dir_index_of[phys_layer * n_experts + expert_id] -> index in expert_directory()
@@ -437,9 +442,16 @@ struct InkModelFile {
     bool open(const std::string& file_path, std::string& err, bool keep_tokenizer = false,
               const std::string& explicit_dspark = "") {
         path = file_path;
+        gguf_adapter.reset();
         dir_index_of.clear();
         vram_load_order.clear();
-        (void)explicit_dspark;   // the drafter is in the .strata file
+        if (GgufAdapter::is_gguf_path(file_path)) {
+            kind = ModelSourceKind::Gguf;
+            gguf_adapter = std::make_unique<GgufAdapter>();
+            return gguf_adapter->open_into<InkManifest, TInfo>(
+                file_path, m, dir_index_of, vram_load_order, err, keep_tokenizer, explicit_dspark);
+        }
+        kind = ModelSourceKind::Strata;
         if (!rd.open(file_path, err)) return false;
         if (!parse_manifest(rd.manifest_json(), m, err, keep_tokenizer)) return false;
         const auto& dir = rd.expert_directory();
@@ -479,18 +491,23 @@ struct InkModelFile {
     }
 
     const std::vector<strata::artifact::StrataExpertEntry>& expert_directory() const {
+        if (kind == ModelSourceKind::Gguf && gguf_adapter) return gguf_adapter->expert_dir;
         return rd.expert_directory();
     }
 
     bool read_section1(std::vector<uint8_t>& out, std::string& err) const {
+        if (kind == ModelSourceKind::Gguf && gguf_adapter) return gguf_adapter->read_section1(out, err);
         return rd.read_section(1, out, err);
     }
 
     bool read_expert_body(size_t dir_index, std::vector<uint8_t>& out, std::string& err) const {
+        if (kind == ModelSourceKind::Gguf && gguf_adapter)
+            return gguf_adapter->read_expert_body(dir_index, m.c.n_experts, out, err);
         return rd.read_expert_body(dir_index, out, err);
     }
 
     bool verify_sections(std::string& err, bool verify_section4 = true) const {
+        if (kind != ModelSourceKind::Strata) return true;   // a GGUF was bounds-checked at open
         std::vector<uint8_t> chunk(8 * 1024 * 1024);
         for (int sid = 0; sid < strata::artifact::STRATA_NUM_SECTIONS; ++sid) {
             if (sid == 4 && !verify_section4) continue;

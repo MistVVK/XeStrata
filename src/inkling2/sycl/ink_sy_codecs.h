@@ -88,6 +88,41 @@ inline void k_linear_bf16_sg16(const uint16_t* W, int N, int K, const float* X, 
     });
 }
 
+// GGUF Q8_0 rows (FMT_Q8_0: the N * K/32 block scales, then the int8 weights) for any M: a sub-group per output
+// row, four weights a lane from one 32-bit load, FP32 products (the activations are not quantized)
+inline void k_linear_q8_0_sg16(const uint8_t* W, int N, int K, const float* X, float* Y, int M, int N_total) {
+    const int nb = K >> 5, K4 = K >> 2;
+    const float* scales = reinterpret_cast<const float*>(W);
+    const int32_t* qw4 = reinterpret_cast<const int32_t*>(W + (size_t)N_total * nb * 4);
+    Q().parallel_for(NR((N + 15) / 16, 256), [=](sycl::nd_item<1> it) INK_REQD_SG {
+        const int sg = (int)it.get_local_id(0) >> 4;
+        const int lane = (int)it.get_local_id(0) & 15;
+        const int row_any = (int)it.get_group(0) * 16 + sg;
+        const bool live = row_any < N;   // no early return: every lane reaches the sums
+        const int row = live ? row_any : N - 1;
+        const float* sc = scales + (size_t)row * nb;
+        const int32_t* wp = qw4 + (size_t)row * K4;
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int mm = sycl::min(4, M - m0);
+            float a[4] = {0, 0, 0, 0};
+            for (int k = lane; k < K4; k += 16) {
+                const int32_t v = wp[k];
+                const float d = sc[k >> 3];
+                const float w0 = (float)(int8_t)(v & 0xff) * d, w1 = (float)(int8_t)((v >> 8) & 0xff) * d;
+                const float w2 = (float)(int8_t)((v >> 16) & 0xff) * d, w3 = (float)(int8_t)(v >> 24) * d;
+                for (int i = 0; i < mm; ++i) {
+                    const float* xp = X + (size_t)(m0 + i) * K + 4 * k;
+                    a[i] += w0 * xp[0] + w1 * xp[1] + w2 * xp[2] + w3 * xp[3];
+                }
+            }
+            for (int i = 0; i < mm; ++i) {
+                const float s = sg_sum(it, a[i]);
+                if (lane == 0 && live) Y[(size_t)(m0 + i) * N + row] = s;
+            }
+        }
+    });
+}
+
 // BF16 SG16 Tiled GEMM for M >= 16 (BM=32, BN=64, BK=16, 128 threads = 8 SG16)
 inline void k_gemm_bf16_sg16(const uint16_t* W, int N, int K, const float* X, float* Y, int M) {
     const int nbm = (M + 31) / 32, nbn = (N + 63) / 64;
@@ -349,7 +384,7 @@ inline void k_moe_gu_situ_sg16(
         const int e = uexp[y], off = uoff[y], n = ucnt[y];
         const InkSyExpertDev ed = ex_layer[e];
         const uint8_t* body = ed.body_ptr;
-        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8);
+        const bool is_sk_dn = (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8 && ed.dn_code != FMT_GGUF_RAW);
         const float inv_sq = is_sk_dn ? (1.0f / h2f_bits(ld16(body + 2 * r))) : 1.0f;
 
         for (int t0 = 0; t0 < n; t0 += 4) {
@@ -401,6 +436,27 @@ inline void k_moe_gu_situ_sg16(
                         float dg = 0.0f, du = 0.0f;
                         for (int j = 0; j < 32; ++j) { dg += e4m3_to_f32(bg[j]) * xp[j]; du += e4m3_to_f32(bu[j]) * xp[j]; }
                         ag[i] += dg * scg; au[i] += du * scu;
+                    }
+                }
+            } else if (ed.gu_code == FMT_GGUF_RAW) {
+                const auto* hdr = reinterpret_cast<const strata::quant::sk::GgufExpertHeader*>(body);
+                const uint8_t* gu = body + 32;
+                constexpr size_t kRowBytes = 72u * 34u;
+                const uint8_t* rg = gu + (size_t)(2 * r) * kRowBytes;
+                const uint8_t* ru = gu + (size_t)(2 * r + 1) * kRowBytes;
+                for (int b = lane; b < 72; b += 16) {
+                    const float dg = h2f_bits(ld16(rg + b * 34)) * hdr->gate_scale;
+                    const float du = h2f_bits(ld16(ru + b * 34)) * hdr->up_scale;
+                    const uint8_t* pg = rg + b * 34 + 2;
+                    const uint8_t* pu = ru + b * 34 + 2;
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = x_in + (size_t)tk[i] * 2304 + b * 32;
+                        float vg = 0.0f, vu = 0.0f;
+                        for (int j = 0; j < 32; ++j) {
+                            vg += (float)(int8_t)pg[j] * xp[j];
+                            vu += (float)(int8_t)pu[j] * xp[j];
+                        }
+                        ag[i] += vg * dg; au[i] += vu * du;
                     }
                 }
             } else {
@@ -507,6 +563,27 @@ inline void k_moe_dn_sg16(
                         float d0 = 0.0f, d1 = 0.0f;
                         for (int j = 0; j < 32; ++j) { d0 += e4m3_to_f32(b0[j]) * xp[j]; d1 += e4m3_to_f32(b1[j]) * xp[j]; }
                         a0[i] += d0 * sc0; a1[i] += d1 * sc1;
+                    }
+                }
+            } else if (ed.dn_code == FMT_GGUF_RAW) {
+                const auto* hdr = reinterpret_cast<const strata::quant::sk::GgufExpertHeader*>(body);
+                const uint8_t* dnb = body + ed.dn_off;
+                constexpr size_t kRowBytes = 36u * 34u;
+                const uint8_t* r0 = dnb + (size_t)(2 * rp) * kRowBytes;
+                const uint8_t* r1 = dnb + (size_t)(2 * rp + 1) * kRowBytes;
+                for (int b = lane; b < 36; b += 16) {
+                    const float s0 = h2f_bits(ld16(r0 + b * 34)) * hdr->dn_scale;
+                    const float s1 = h2f_bits(ld16(r1 + b * 34)) * hdr->dn_scale;
+                    const uint8_t* p0 = r0 + b * 34 + 2;
+                    const uint8_t* p1 = r1 + b * 34 + 2;
+                    for (int i = 0; i < mm; ++i) {
+                        const float* xp = h_act + (size_t)pid[i] * 1152 + b * 32;
+                        float v0 = 0.0f, v1 = 0.0f;
+                        for (int j = 0; j < 32; ++j) {
+                            v0 += (float)(int8_t)p0[j] * xp[j];
+                            v1 += (float)(int8_t)p1[j] * xp[j];
+                        }
+                        a0[i] += v0 * s0; a1[i] += v1 * s1;
                     }
                 }
             } else {

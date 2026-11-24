@@ -159,8 +159,8 @@ int cmd_generate(const InkModelFile& mf, InkBackend& backend, const ServeConfig&
 
 int usage(int rc) {
     std::fprintf(rc ? stderr : stdout,
-                 "%s: Inkling-2-Mini from its .strata v1.1 file\n"
-                 "  --native FILE.strata       the model (SQ-20, SQ-15 or SQ-10)\n"
+                 "%s: Inkling-2-Mini from its .strata v1.1 or .gguf file\n"
+                 "  --native FILE.strata|gguf  the model (SQ-20/15/10 or UD-Q4_K_XL)\n"
                  "  --serve                    the engine's line protocol on stdin/stdout (serve/server.py)\n"
                  "  --tokens IDS --max-new N   the command line's prompt and the tokens to generate (16)\n"
                  "  --temperature T --seed S   sampling (greedy without --temperature)\n"
@@ -188,7 +188,7 @@ int inkling_main(int argc, char** argv) {
     std::string native;
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], "--native") == 0) native = argv[i + 1];
-    if (native.empty() || !is_strata_file(native)) return -1;
+    if (native.empty() || (!is_strata_file(native) && !GgufAdapter::is_inkling_gguf(native))) return -1;
 
     ServeConfig cfg;
     cfg.model_path = native;

@@ -196,6 +196,18 @@ void eval_inkling2_expert(
     eval_inkling2_expert_batch(body, gu_code, dn_code, dn_offset, x_in, 1, hidden, inter, y_out);
 }
 
+namespace {
+// A raw GGUF expert body's Q8_0 row (the adapter's GGUF_RAW, rows interleaved like SF4's) as FP32 times `scale`.
+void dequant_q8_0_row(const uint8_t* src, float scale, float* dst, size_t n) {
+    for (size_t b = 0; b < n / 32; ++b, src += 34) {
+        uint16_t bits;
+        std::memcpy(&bits, src, 2);
+        const float d = fp16_bits_to_f32(bits) * scale;
+        for (size_t j = 0; j < 32; ++j) dst[b * 32 + j] = static_cast<float>(static_cast<int8_t>(src[2 + j])) * d;
+    }
+}
+}  // namespace
+
 void eval_inkling2_expert_batch(
     const uint8_t* body,
     SkCode gu_code,
@@ -211,7 +223,16 @@ void eval_inkling2_expert_batch(
     std::vector<float> act(m * inter);
 
     // 1. w13 projection [2*inter, hidden] (interleaved: even rows = gate, odd rows = up)
-    if (gu_code == SkCode::SF4) {
+    if (gu_code == SkCode::GGUF_RAW) {
+        GgufExpertHeader hdr{};
+        std::memcpy(&hdr, body, sizeof(hdr));
+        const size_t row_b = hidden / 32 * 34;
+        std::vector<float> wrow(hidden);
+        for (size_t r = 0; r < 2 * inter; ++r) {
+            dequant_q8_0_row(body + sizeof(hdr) + r * row_b, (r & 1u) ? hdr.up_scale : hdr.gate_scale, wrow.data(), hidden);
+            for (size_t t = 0; t < m; ++t) gu[t * (2 * inter) + r] = dot_f32(wrow.data(), x_in + t * hidden, hidden);
+        }
+    } else if (gu_code == SkCode::SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w13_outer = hdr[0] / hdr[1];
@@ -270,7 +291,16 @@ void eval_inkling2_expert_batch(
     }
 
     // 3. w2 projection [hidden, inter]
-    if (dn_code == SkCode::SF4) {
+    if (dn_code == SkCode::GGUF_RAW) {
+        GgufExpertHeader hdr{};
+        std::memcpy(&hdr, body, sizeof(hdr));
+        const size_t row_b = inter / 32 * 34;
+        std::vector<float> wrow(inter);
+        for (size_t r = 0; r < hidden; ++r) {
+            dequant_q8_0_row(body + dn_offset + r * row_b, hdr.dn_scale, wrow.data(), inter);
+            for (size_t t = 0; t < m; ++t) y_out[t * hidden + r] = dot_f32(wrow.data(), act.data() + t * inter, inter);
+        }
+    } else if (dn_code == SkCode::SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w2_outer = hdr[2] / hdr[3];

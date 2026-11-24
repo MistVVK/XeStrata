@@ -76,6 +76,7 @@ inline void k_dspark_init_block_sg16(const InkTensorInfo& eti, const float* norm
                                      float* cur_out, int anchor_tok, int V_padded) {
     const uint8_t* ew = eti.dev_ptr;
     const bool is_bf16 = (eti.fmt == FMT_BF16);
+    const bool is_q8_0 = (eti.fmt == FMT_Q8_0);
     Q().parallel_for(NR(8, 256), [=](sycl::nd_item<1> it) INK_REQD_SG {
         float* sh = lmem<float, 16>(it);
         const int b = (int)it.get_group(0), tid = (int)it.get_local_id(0);
@@ -87,6 +88,13 @@ inline void k_dspark_init_block_sg16(const InkTensorInfo& eti, const float* norm
                 for (int d = tid; d < INK_D; d += 256) { float v = bf16_to_f32(row[d]); ss += v * v; }
                 const float inv = sycl::rsqrt(wg_sum16(it, ss, sh) / (float)INK_D + INK_RMS_EPS);
                 for (int d = tid; d < INK_D; d += 256) dst[d] = bf16_to_f32(row[d]) * inv * norm_w[d];
+            } else if (is_q8_0) {
+                const float* rs = reinterpret_cast<const float*>(ew) + (size_t)anchor_tok * (INK_D / 32);
+                const int8_t* rq = reinterpret_cast<const int8_t*>(ew + (size_t)V_padded * (INK_D / 32) * 4) + (size_t)anchor_tok * INK_D;
+                auto w = [rs, rq](int d) { return (float)rq[d] * rs[d >> 5]; };
+                for (int d = tid; d < INK_D; d += 256) { float v = w(d); ss += v * v; }
+                const float inv = sycl::rsqrt(wg_sum16(it, ss, sh) / (float)INK_D + INK_RMS_EPS);
+                for (int d = tid; d < INK_D; d += 256) dst[d] = w(d) * inv * norm_w[d];
             } else {
                 const float sc = reinterpret_cast<const float*>(ew)[anchor_tok];
                 const int8_t* row = reinterpret_cast<const int8_t*>(ew + (size_t)V_padded * 4) + (size_t)anchor_tok * INK_D;
