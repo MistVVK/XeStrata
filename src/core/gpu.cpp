@@ -656,7 +656,7 @@ bool kernels_read_host(const void* p) {
 
 bool kernels_read_registered() { return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero; }
 
-bool copies_read_mapped_files() { return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero; }
+bool copies_read_mapped_files() { return rt().device().get_backend() == sycl::backend::ext_oneapi_cuda; }
 
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
