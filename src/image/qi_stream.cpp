@@ -300,7 +300,8 @@ void LayerStream::choose_source(Slot& s) {
         }
         check(gpu::event_record(relay_free_[0], copy_), "an event");
         // the file's pages when their copies run within a fifth of page-locked memory's: nothing held in RAM for a
-        // little speed (the RX 9060 XT: 25 against 26 GB/s; the B70: 4.7 against 27)
+        // little speed (the B70: 4.7 against 27; the RX 9060 XT: 25 against 26, before gpu::copies_read_mapped_files
+        // left HIP out)
         g_from_file = file <= 1.25 * locked ? 1 : 0;
         std::fprintf(stderr, "image engine (layers): a streamed layer's copy from the file's pages %.1f GB/s, from "
                              "page-locked memory %.1f GB/s: %s\n", (double) l.bytes / file / 1e9,
