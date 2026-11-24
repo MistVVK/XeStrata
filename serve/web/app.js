@@ -159,6 +159,12 @@ async function loadHealth() {
       $("tab-btn-images").hidden = !health.image_generation;
       $("img-note").hidden = !health.image_note;
       $("img-note").textContent = health.image_note || "";
+      // before the first /metrics poll: /health's short line has no volume path in it
+      if (health.disk_warning && $("disk-note")) {
+        $("disk-note").hidden = false;
+        $("disk-note").dataset.level = health.disk_warning.startsWith("Disk is critically") ? "danger" : "warn";
+        $("disk-note").textContent = health.disk_warning;
+      }
       imgModels();
       thinkingButtons();
       if (["#images", "#tools"].includes(location.hash) && health.image_generation) showTab(location.hash.slice(1));
@@ -287,6 +293,7 @@ function setMetric(key, value, unit, sub) {
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let failureSeen = null;   // issue #10: the engine failure already shown as a toast (its time)
+let diskSeenAt = 0;       // the last disk warning/recovery event shown as a toast
 let metricsEpoch = 0;
 // After Load or Unload returns, a poll that started earlier can still say the opposite. Hold the POST's state until a later
 // poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
@@ -543,8 +550,37 @@ $("unload-btn").onclick = async () => {
   }
 };
 
+// /metrics' disk block: a standing note while space is short, one toast per event (the server repeats danger events).
+function renderDisk(d) {
+  const el = $("disk-note");
+  if (!el) return;
+  const short = d && d.measured && (d.level === "warn" || d.level === "danger");
+  if (!short) {
+    el.hidden = true;
+    const event = d && (d.event_at || d.at);
+    if (event && event !== diskSeenAt && d.level === "ok") {
+      diskSeenAt = event;
+      toast("info", tr("disk.recovered", "Disk space recovered"), "", 6000);
+    }
+    return;
+  }
+  const vars = {free: fmt(d.free_gib, 1), total: fmt(d.total_gib, 1), volume: d.volume || "volume"};
+  const title = d.level === "danger" ? tr("disk.danger", "Disk is critically full")
+                                     : tr("disk.warn", "Disk is nearly full");
+  const detail = tr("disk.detail", "{free} GiB free of {total} GiB on {volume}.", vars);
+  el.hidden = false;
+  el.dataset.level = d.level;
+  el.textContent = title + " \u2014 " + detail;
+  const event = d.event_at || d.at;
+  if (event && event !== diskSeenAt) {
+    diskSeenAt = event;
+    toast(d.level === "danger" ? "error" : "warn", title, detail, 12000);
+  }
+}
+
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+  renderDisk(m.disk);
   const last = (m.requests || []).find((r) => r.kind !== "image");   // the chat's last request (image jobs aside)
   // the header pill. modelOp and a local load win over "N queued": with parallel requests, queued stays up through
   // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text

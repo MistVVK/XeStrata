@@ -15,6 +15,9 @@ main { flex: 1; min-height: 0; display: flex; }
 .small { font-size: var(--st-fs-xs); }
 .card-title { font-weight: var(--st-fw-bold); font-size: var(--st-fs-base); color: var(--st-ink); }
 .st-header { position: relative; z-index: 2; flex: none; }
+.st-disk-note { flex: none; padding: 8px var(--st-s-6); border-bottom: 1px solid var(--st-warn); background: var(--st-warn-tint);
+                color: var(--st-warn-text); font-size: var(--st-fs-sm); font-weight: var(--st-fw-bold); }
+.st-disk-note[data-level="danger"] { border-bottom-color: var(--st-danger); background: var(--st-danger-tint); color: var(--st-danger-text); }
 .st-header .st-tabs { margin-left: var(--st-s-4); }
 #unload-btn { min-width: 7.75rem; }   /* About: Load and Unloading… keep one width */
 .st-header--clip #pill-text { display: none; }

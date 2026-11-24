@@ -162,6 +162,7 @@ from serve import loras as lora_api
 from serve import envvars
 from serve import vram_ledger
 from serve import idle_watch
+from serve import disk_watch
 from serve.tool_parallel import LENT as LENT_LANE
 from serve.image_daemon import SILENCE_S, START_TIMEOUT_S
 from serve.model_terms import _qimage
@@ -3071,7 +3072,9 @@ class ImageEngine:
         """Start the daemon (its environment the server's engine's), detached from this server."""
         cmd = [sys.executable, str(Path(__file__).resolve().parent / "image_daemon.py"), "--socket", addr,
                "--idle", str(float(self.cfg.get("daemon_idle_s") or 1800)),
-               "--silence", str(float(self.cfg.get("silence_s", SILENCE_S))), "--log", str(self.log_path), "--",
+               "--silence", str(float(self.cfg.get("silence_s", SILENCE_S))), "--log", str(self.log_path),
+               "--disk-paths", json.dumps([[label, str(p)] for label, p in
+                                           disk_watch.image_paths(self.cfg, self.log_path)]), "--",
                *self.command()]
         kw: dict = {"start_new_session": True} if os.name != "nt" else \
             {"creationflags": 0x00000200 | 0x00000008 | 0x01000000}   # its own group, no console, out of the job

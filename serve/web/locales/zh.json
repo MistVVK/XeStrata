@@ -1088,5 +1088,9 @@
   "trn.more": "上下文和术语表",
   "trn.placeholder": "要翻译的文字",
   "trn.swap": "交换语言和文字",
-  "trn.to": "目标语言"
+  "trn.to": "目标语言",
+  "disk.warn": "磁盘空间即将用尽",
+  "disk.danger": "磁盘空间严重不足",
+  "disk.detail": "{volume} 上 {total} GiB 中剩余 {free} GiB。",
+  "disk.recovered": "磁盘空间已恢复"
 }

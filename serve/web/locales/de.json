@@ -1088,5 +1088,9 @@
   "trn.more": "Kontext und Glossar",
   "trn.placeholder": "Zu übersetzender Text",
   "trn.swap": "Sprachen und Texte tauschen",
-  "trn.to": "Nach"
+  "trn.to": "Nach",
+  "disk.warn": "Die Festplatte wird fast voll",
+  "disk.danger": "Die Festplatte ist kritisch voll",
+  "disk.detail": "{free} GiB frei von {total} GiB auf {volume}.",
+  "disk.recovered": "Festplattenspeicher wieder frei"
 }

@@ -109,6 +109,7 @@ from serve import translate as translate_mod  # noqa: E402
 from serve import translate_api  # noqa: E402
 from serve import vram_ledger  # noqa: E402
 from serve import idle_watch  # noqa: E402
+from serve import disk_watch  # noqa: E402
 from serve import line_process  # noqa: E402
 from serve import reader_room  # noqa: E402
 from serve.line_process import end_gpu_process, popen  # noqa: E402
@@ -4701,6 +4702,7 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.config_path = None                         # #564: the run config the web page's Settings view edits
+        self.disk_paths: list[tuple[str, Path]] = []    # the folders the disk watcher reads, from the run config
         self.engine_exe: str | None = None              # the engine's file (About > Licenses: the parts beside it)
         self.terms_fetch = model_terms.TermsFetch()                 # About > Model terms: the texts not fetched yet
         self.config_lock = threading.Lock()
@@ -5628,7 +5630,9 @@ class Service:
                 "image_aux": image_aux.every(),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
-                "engine_failure": self.engine_failure, "xe_kernel": self.xe_kernel}
+                "engine_failure": self.engine_failure, "xe_kernel": self.xe_kernel,
+                # the disk watcher runs in this process, not in an engine that can die: /metrics stays 200 then
+                "disk": disk_watch.view()}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -8830,6 +8834,8 @@ def make_handler(svc: Service):
                                  "thinking": getattr(svc.template, "thinking", None),
                                  # a streamed chat reply can be kept past its connection (xestrata_reply)
                                  "kept_replies": True,
+                                 # the page shows this before its first /metrics poll; no volume path is exposed
+                                 "disk_warning": disk_watch.warning_line(),
                                  "debug_chat_log": svc.debug_log is not None,
                                  "translation": tr_status,
                                  "loaded": svc.loaded(), "service": "strata"})
@@ -12842,6 +12848,7 @@ def _main() -> int:
                               getattr(svc.images, "gpu_pci", None), getattr(svc.images, "helper_card", ""))
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    svc.disk_paths = disk_watch.paths(cfg, a.config)    # the folders the watcher reads, from this run's config
     if cfg.get("exe"):
         svc.engine_exe = os.path.abspath(os.path.join(cfg.get("cwd") or ".", str(cfg["exe"])))
     try:                                                # the user's settings: the keys every model shares (runconfig)
@@ -12921,6 +12928,8 @@ def _main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    disk_watch.start(svc.disk_paths,
+                     say=lambda line: print(f"[xestrata] {disk_watch.severity(line)}: {line}", flush=True))
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_vision_idle()

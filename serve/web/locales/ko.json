@@ -1088,5 +1088,9 @@
   "trn.more": "문맥과 용어집",
   "trn.placeholder": "번역할 글",
   "trn.swap": "언어와 글을 맞바꾸기",
-  "trn.to": "대상 언어"
+  "trn.to": "대상 언어",
+  "disk.warn": "디스크가 거의 찼습니다",
+  "disk.danger": "디스크가 위험 수준으로 찼습니다",
+  "disk.detail": "{volume}에 {total} GiB 중 {free} GiB 남았습니다.",
+  "disk.recovered": "디스크 공간이 회복되었습니다"
 }
