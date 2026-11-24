@@ -116,7 +116,8 @@ public:
     void start_calibration(const CostFile& cf);
     /// ... or a file with no table yet (or none at all: `cf` holds only the key): the table of bucket 0 for windows
     /// 1..n is built from the rounds of the requests, live costs deciding meanwhile; at the take-over a size never
-    /// reached is priced at the live cost of that moment.
+    /// reached is priced between the nearest sizes with real rounds (the end's price past either end), so a wider
+    /// window never costs less than a narrower one.
     void start_passive(const CostFile& cf, int n);
     bool passive() const { return passive_; }
     bool calibrating() const { return calib_on_; }

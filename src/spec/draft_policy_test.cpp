@@ -14,7 +14,9 @@
 //   7. --draft-costs: a fixed table is not moved by round times; the table file reads back what was written and
 //      refuses another key or a cut file; a table built from real rounds takes over once every size has kCalibN
 //      of them, priced at their median, and a start that reads it uses it at once; a table loaded without real
-//      sizes is held back (live costs) until kCalibReqs requests have run.
+//      sizes is held back (live costs) until kCalibReqs requests have run;
+//   8. at the take-over a size without real rounds is priced between the nearest real sizes, monotone up to the ends,
+//      and a context bucket with no table of its own copies a monotone one.
 #include "strata/spec/draft_policy.hpp"
 
 #include <cmath>
@@ -261,6 +263,67 @@ int main() {
             p.calibrate(cf, rep);
         }
         check(p.fixed() && p.cost_ms(2) == 25.0 && cf.reqs == DraftPolicy::kCalibReqs, "a held table: used after kCalibReqs requests");
+    }
+    {
+        // A live stretch priced size 3 above the measured size 4 (B70 33.66 / 33.50 ms, RTX 66.88 / 60.28 ms):
+        // a take-over must not put that guess in the table.  Sizes 2 and 4 have real rounds; 1, 3, 5 and 6 do not.
+        set_cost_env("");
+        DraftPolicy p(6);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int i = 0; i < 20; ++i) {
+            p.observe(false, 2, 1, 0, 30.0);
+            p.observe(false, 4, 3, 0, 50.0);
+        }
+        for (int i = 0; i < 5; ++i) p.observe(false, 3, 2, 0, 120.0);   // live, not real
+        for (int i = 0; i < 5; ++i) p.observe(false, 5, 4, 0, 200.0);
+        for (int i = 0; i < 5; ++i) p.observe(false, 6, 5, 0, 250.0);
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        check(p.fixed() && !p.table_held() && !cf.fresh && cf.n[0] == 6, "take-over: the table is used and saved");
+        bool mono = true, live_mono = true;
+        for (int t = 1; t < 6; ++t) {
+            mono &= cf.table[0][(size_t) t + 1] >= cf.table[0][(size_t) t];
+            live_mono &= p.cost_ms(t + 1) >= p.cost_ms(t);
+        }
+        check(mono, "take-over: costs do not fall as the window grows");
+        check(live_mono, "take-over: the policy's fixed costs do not fall as the window grows");
+        check(std::fabs(cf.table[0][3] - 40.0) < 1e-6, "take-over: an unmeasured size interpolates its real neighbours");
+        check(std::fabs(cf.table[0][1] - 30.0) < 1e-6, "take-over: below the first real size takes its price");
+        check(std::fabs(cf.table[0][5] - 50.0) < 1e-6 && std::fabs(cf.table[0][6] - 50.0) < 1e-6,
+              "take-over: past the last real size takes its price");
+        p.set_context(70000);   // auto: this bucket has no table of its own and copies the nearest one
+        bool filled_mono = true;
+        for (int t = 1; t < 6; ++t) filled_mono &= p.cost_ms(t + 1) >= p.cost_ms(t);
+        check(filled_mono, "a filled bucket keeps the table monotone");
+    }
+    {
+        // No size reached 16 real rounds: every price is a live guess.  The guesses fell with the window; the table
+        // still starts at a price and never falls.
+        DraftPolicy p(6);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int t = 1; t <= 3; ++t)
+            for (int i = 0; i < 3; ++i) p.observe(false, t, t - 1, 0, 40.0 - 10.0 * (t - 1));
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        bool mono = cf.table[0][1] > 0.0;
+        for (int t = 1; t < 6; ++t) mono &= cf.table[0][(size_t) t + 1] >= cf.table[0][(size_t) t];
+        check(mono, "take-over with no real sizes: a priced first size and no fall");
+        check(std::fabs(cf.table[0][1] - 40.0) < 1e-6 && std::fabs(cf.table[0][6] - 40.0) < 1e-6,
+              "take-over with no real sizes: guesses are clamped to the highest one");
     }
     std::filesystem::remove_all(std::filesystem::path(path).parent_path());
     std::printf(g_fail ? "FAIL\n" : "PASS\n");

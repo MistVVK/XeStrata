@@ -38,6 +38,38 @@ constexpr double kStaleRounds = 300.0;
 constexpr double kDraftPrior = 0.7;
 constexpr double kProbeHeld = 0.5;
 
+// Price a table whose sizes were not all reached by real rounds.  A wider window cannot cost less than a narrower
+// one: a size without real rounds is priced on the straight line between the nearest real sizes around it, and the
+// sizes past either end take that end's price.  A guess made from one stretch of live rounds used to be able to price
+// size 3 above the measured size 4 (B70 and RTX 4070, 2026-11-24), which made the fixed table choose narrower windows
+// than live costs did.  With no real size at all, keep the live guesses but still stop them from falling.
+void monotone_prices(double* v, int n, unsigned real) {
+    if (n <= 0) return;
+    int first = 0, last = 0;
+    for (int t = 1; t <= n; ++t)
+        if ((real >> (t - 1) & 1u) && v[t] > 0.0) {
+            if (first == 0) first = t;
+            last = t;
+        }
+    if (first == 0) {
+        for (int t = 1; t <= n; ++t) {
+            if (!(v[t] > 0.0)) v[t] = t > 1 ? v[t - 1] : 1.0;
+            if (t > 1) v[t] = std::max(v[t], v[t - 1]);
+        }
+        return;
+    }
+    for (int t = 1; t < first; ++t) v[t] = v[first];
+    for (int t = last + 1; t <= n; ++t) v[t] = v[last];
+    int prev = first;
+    for (int t = first + 1; t <= last; ++t) {
+        if ((real >> (t - 1) & 1u) && v[t] > 0.0) { prev = t; continue; }
+        int next = t;
+        while (next <= last && !((real >> (next - 1) & 1u) && v[next] > 0.0)) ++next;
+        v[t] = v[prev] + (v[next] - v[prev]) * double(t - prev) / double(next - prev);
+    }
+    for (int t = 2; t <= n; ++t) v[t] = std::max(v[t], v[t - 1]);   // two real sizes can also be inverted
+}
+
 // XESTRATA_SPEC_FIXED=1 and XESTRATA_SPEC_FIXED_TABLE="T1,T2,.." (round ms of windows of 1, 2, .. rows): an expert's
 // fixed table for every context bucket, read once per process (the table of --draft-costs is the normal source)
 struct FixedEnv {
@@ -598,6 +630,7 @@ void DraftPolicy::take_over_passive() {
             if (!(v > 0.0)) v = t > 1 ? learned_[(size_t) k][(size_t) t - 1] : 1.0;
             learned_[(size_t) k][(size_t) t] = v;
         }
+        monotone_prices(learned_[(size_t) k].data(), fixed_n_[(size_t) k], real_[(size_t) k]);
     }
     passive_ = false;
 }
