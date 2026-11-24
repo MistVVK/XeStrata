@@ -3489,6 +3489,23 @@ for (const r of imgRanges) r.addEventListener("input", () => {
   if (f.tagName === "SELECT") f.dispatchEvent(new Event("change", {bubbles: true}));
 });
 for (const f of ["img-form", "tool-form", "vid-form"]) $(f).addEventListener("input", (e) => { if (!imgRanges.includes(e.target)) imgSliders(); });
+// Before a form's submit the browser checks its fields' limits (min, max, step) and stops at one that fails, pointing at
+// it - but a field it cannot point at stops the job with nothing shown (the console's "An invalid form control ... is
+// not focusable").  A field this page hides keeps the value typed while it showed, and its limits can change with the
+// model (/health's defaults: Turbo's steps_fixed hides the steps and raises their least to 8), yet a request leaves it
+// out; at the submit button's click, before the check, such a field is taken out of it (disabled until the click is
+// over, its value kept for when it shows again).  A field in a closed section is the user's to fix: its section opens.
+function formCheckShown(form) {
+  const off = [];
+  for (const c of form.elements) {
+    if (!c.willValidate || c.checkValidity()) continue;
+    if (c.closest("[hidden]")) { c.disabled = true; off.push(c); continue; }
+    for (let d = c.closest("details:not([open])"); d; d = d.parentElement.closest("details:not([open])")) d.open = true;
+  }
+  if (off.length) setTimeout(() => { for (const c of off) c.disabled = false; });
+}
+for (const [f, go] of [["img-form", "img-go"], ["tool-form", "tool-go"], ["vid-form", "vid-go"]])
+  $(go).addEventListener("click", () => formCheckShown($(f)));
 // the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
 // fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
 // the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
