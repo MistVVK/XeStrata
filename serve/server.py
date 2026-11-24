@@ -10165,6 +10165,10 @@ def make_handler(svc: Service):
                 if moved:
                     figures["gpu"] = moved
                 print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+                auto = figures.get("gpu") or {}
+                if auto.get("card") == "auto":
+                    print(f"[xestrata] image: auto put it on {auto['name']} ({auto['pci']}), "
+                          f"{auto['free_mib']} MiB free for {auto['need_mib']} MiB", flush=True)
                 body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
             except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
                 self._json(400, {"error": {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
@@ -12678,6 +12682,9 @@ def _main() -> int:
                 svc.images.lend_cfgs = (icfgs, ilog, gpu_select.scope(icfgs[0]["exe"], text_env, text_pci))
                 svc.images.lend_pci = str(text_pci or "").lower() or None
             svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
+            if not str((cfg.get("images") or {}).get("gpu_pci") or ""):
+                # no named card: an "auto" job may pick an unused card at request time (images_api.auto_pick)
+                svc.images.auto_cfgs = (icfgs, ilog, text_env)
         except ValueError as e:
             raise SystemExit(f"[xestrata] config: {e}")
         gone = svc.images.missing()

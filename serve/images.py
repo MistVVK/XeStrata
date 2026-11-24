@@ -86,8 +86,10 @@ resident with the VAE in one piece), and the config's "gpu_policy" says what hap
   shrink  - an engine started with --vram-elastic gives the image job VRAM from its expert cache and takes it back
             afterwards (POST /v1/vram's mechanism; the conversation stays in the engine)
   unload  - its conversation is saved to a session file, the engine is stopped, and the next start restores it
-  auto    - (default) keep when the image fits beside it at full speed, else shrink when the engine can, else keep
-            when the image fits at all (its layers streamed), else unload
+  auto    - (default) with no "gpu_pci" named in the config and no GPU named in the request, first look for a card no
+            text engine takes that has room for the job's NEED and run it there (separate's turn, so the chat goes
+            on); without one, keep when the image fits beside the text engine at full speed, else shrink when the
+            engine can, else keep when the image fits at all (its layers streamed), else unload
   separate - not a value of "gpu_policy": the policy of every job on a card of its own (above)
 After a job the image engine keeps what it holds (the next image starts warm) only under keep or separate with VRAM to
 spare;
@@ -1742,17 +1744,104 @@ def card_of(svc, gpu) -> str:
     raise ImageRequestError(f"gpu: {gpu!r} makes no images here{where}")
 
 
+# "auto" may put a job on a card no text engine takes when the config names no "gpu_pci" and the request names no
+# GPU.  place sets this per request; on_free_gpu asks the card's engine for NEED before moving the job there.  An
+# auto-distributed card never lends itself back to the text engine (unlike a named separate card's use_text_gpu).
+AUTO_DIST: contextvars.ContextVar[bool] = contextvars.ContextVar("xestrata_auto_dist", default=False)
+AUTO_CARD: contextvars.ContextVar[dict | None] = contextvars.ContextVar("xestrata_auto_card", default=None)
+
+
+def auto_cards(svc, gen: ImageGen) -> list[dict]:
+    """Cards no text engine of this server uses, with their free VRAM in MiB; the roomiest first.  Both facts are read
+    now: the unfiltered device list (a card the environment hides from the text engine still counts) and the device's
+    own report.  An empty list when either cannot be read, so "auto" stays with its present co-residence decision."""
+    from serve import gpu_select, telemetry
+    rows = gpu_select.selectors(str(gen.cfg.get("exe") or ""), gen.engine.env)
+    if not rows:
+        return []
+    used = set()
+    for c in getattr(svc, "gpu_roles", None) or []:
+        # every card this server already uses: a text card, its helper, a translation's or another image engine's
+        used.add(str(c.get("pci") or "").lower())
+    for pci in (getattr(svc, "gpu_pci", None), getattr(svc, "split_pci", None)):
+        for p in pci if isinstance(pci, list) else [pci]:
+            if p:
+                used.add(str(p).lower())
+    models = getattr(svc, "images", None)
+    if isinstance(models, ImageModels):
+        used.add(str(models.gpu_pci or "").lower())
+    used.discard("")
+    seen, out = set(), []
+    for row in rows:
+        pci = str(row.get("pci") or "").lower()
+        if pci in seen or pci in used or pci in ("?", "") or row.get("backend") not in gpu_select.BACKENDS:
+            continue
+        if row.get("integrated"):   # shared RAM is not a card with its own VRAM to give an image job
+            continue
+        seen.add(pci)
+        free = telemetry.free_vram_mib(pci)
+        if free is None or free <= 0:
+            continue
+        out.append({"pci": pci, "free_mib": free, "backend": row["backend"], "name": card_name(svc, pci)})
+    return sorted(out, key=lambda c: (-c["free_mib"], c["pci"]))
+
+
+def fits_auto_card(need: dict, reserve: int) -> bool:
+    """Whether the card's NEED (asked of that card's engine, so its free_mib is the card's) fits with the image
+    engine's reserve left aside: the same room separate_turn gives an image job on its own card."""
+    room = int(need.get("free_mib") or 0) + int(need.get("held_mib") or 0) - reserve
+    return room >= int(need.get("least_mib") or 0)
+
+
+def auto_pick(svc, gen: ImageGen, job: dict) -> tuple[dict, ImageGen, dict] | None:
+    """The roomiest unused card when the job's NEED, asked of that card's engine, fits there.  Nothing when there is no
+    such card, or the card could not be opened: the caller then runs the job where it would have without auto.  The
+    engine's NEED is the real estimate (size, steps, adapters and the card's free VRAM together), not the config's."""
+    cards = auto_cards(svc, gen)
+    if not cards:
+        gen._say("image job: auto found no unused card with VRAM to read; staying with the text engine's card")
+        return None
+    for card in cards:
+        models = getattr(svc, "images", None)
+        other = None
+        try:
+            if not isinstance(models, ImageModels):
+                return None
+            other = models.auto_card(card["pci"]).gens.get(gen.model)
+            if other is None:
+                gen._say(f"image job: auto cannot use {card['name']} for this image model")
+                return None
+            need = other.need(job)
+            if fits_auto_card(need, other.reserve):
+                gen._say(f"image job: auto: {card['name']} has {need['free_mib']} MiB free for this job's "
+                         f"{need['least_mib']} MiB; running it there, separate from the text engine")
+                return card, other, need
+            gen._say(f"image job: auto: {card['name']} has {need['free_mib']} MiB free for this job's "
+                     f"{need['least_mib']} MiB; staying with the text engine's card")
+            other.release(True)
+        except Exception as e:   # noqa: BLE001 - a card that cannot be used is one fewer card, not a failed job
+            gen._say(f"image job: auto cannot use {card['name']} ({e}); staying with the text engine's card")
+            if other is not None:
+                with contextlib.suppress(Exception):
+                    other.release(True)
+    return None
+
+
 def place(svc, gen: ImageGen, gpu) -> tuple[ImageGen, dict | None]:
     """The image model `gen` on the GPU a request chose (parse_gpu's `gpu`) -> (its engine there, what the answer says
     of the card when the job leaves the image GPU: {"card": "text", "name", "pci", and with "auto" "busy": "video" and
     "busy_name", "left_s"}; None on the image GPU).  "text" where the images share the text model's card is that card;
     where its GPU cannot be lent (its helper card) an ImageRequestError.  "auto" takes the text model's GPU while a
     video job holds the image GPU (the user's decision, 2026-11-19: neither a refusal nor a wait for the video's end),
-    and the image GPU else - where none can be lent, the refusal it gives (LongJobBusy)."""
+    and the image GPU else - where none can be lent, the refusal it gives (LongJobBusy).  A named card, in the config
+    or the request, is never moved by auto: only an unnamed "auto" job on the text engine's card may be."""
     models = getattr(svc, "images", None)
+    AUTO_DIST.set(False)
     if not isinstance(models, ImageModels) or getattr(gen, "owner", None) is not models:
         return gen, None   # a model of the lent GPU's already, or a server without image models (tests)
     card = card_of(svc, gpu)
+    AUTO_DIST.set(card == "auto" and gen.policy == "auto" and not models.separate
+                  and not models.gpu_pci and bool(getattr(models, "auto_cfgs", None)))
     lend = can_lend(models)
     if card == "text":
         if not models.separate:
@@ -1793,13 +1882,63 @@ class ImageGpuTaken(ImageJobFailed):
         super().__init__(f"the image GPU has {why.get('free_mib')} MiB for this job, which needs {why.get('need_mib')}")
 
 
+class AutoCardNoFit(ImageJobFailed):
+    """The card auto picked has less room than this job's real NEED: run it on the text engine's card instead, with
+    the current auto policy (keep, shrink, unload), as if no card had been found."""
+
+
+def _with_gpu_word(got, moved: dict):
+    if moved:
+        if isinstance(got, tuple) and len(got) == 3 and isinstance(got[1], dict):
+            got[1]["gpu"] = moved
+        elif isinstance(got, dict):
+            got["gpu"] = moved
+    return got
+
+
 def on_free_gpu(fn):
-    """An image job's entry (make_images, image_regions' segment and matte): with "auto" on the image GPU (AUTO_LEND),
-    run where the job's VRAM is (the user's decision, 2026-11-19: the text model's GPU, as one GPU, rather than a wait
-    or a failure while the image GPU's memory is taken) - on the image GPU when its NEED fits there, else again on the
-    text model's GPU, the answer saying so (its figures' or result's "gpu")."""
+    """An image job's entry (make_images, image_regions' segment and matte): with an unnamed "auto" job (AUTO_DIST),
+    ask the roomiest unused card's engine for NEED and run there when it fits; else keep the current GPU decision.
+    With "auto" on the image GPU (AUTO_LEND), run where the job's VRAM is (the user's decision, 2026-11-19: the text
+    model's GPU, as one GPU, rather than a wait or a failure while the image GPU's memory is taken) - on the image GPU
+    when its NEED fits there, else again on the text model's GPU, the answer saying so (its figures' or result's
+    "gpu").  A named card is never moved by either path."""
     @functools.wraps(fn)
     def run(svc, gen, *a, **kw):
+        job = a[0] if a else kw.get("job")
+        if AUTO_DIST.get() and isinstance(job, dict) and getattr(gen, "owner", None) is getattr(svc, "images", None):
+            picked = auto_pick(svc, gen, job)
+            if picked is not None:
+                card, other, need = picked
+                moved = {"card": "auto", "pci": card["pci"], "name": card["name"],
+                         "free_mib": int(need.get("free_mib") or 0), "need_mib": int(need.get("least_mib") or 0)}
+                auto, dist = AUTO_CARD.set(moved), AUTO_DIST.set(False)
+                try:
+                    try:
+                        got = fn(svc, other, *a, **kw)
+                    except AutoCardNoFit:
+                        with contextlib.suppress(Exception):
+                            other.release(True)
+                        gen._say(f"image job: {card['name']} lost the room this job needs; "
+                                 "falling back to the text engine's card")
+                        moved = None
+                        got = fn(svc, gen, *a, **kw)
+                finally:
+                    AUTO_CARD.reset(auto)
+                    AUTO_DIST.reset(dist)
+                if moved:
+                    _with_gpu_word(got, moved)
+                    last = got[1] if isinstance(got, tuple) and len(got) == 3 else got if isinstance(got, dict) \
+                        else None
+                    if isinstance(last, dict):
+                        # /v1/status reads the server's (named) models, not the auto card's: show the job there too
+                        gen.last = last
+                        totals = getattr(gen, "totals", None)
+                        if isinstance(totals, dict) and isinstance(getattr(other, "totals", None), dict):
+                            for k, v in other.totals.items():
+                                if isinstance(v, (int, float)):
+                                    totals[k] = totals.get(k, 0) + v
+                return got
         lend = AUTO_LEND.get()
         if lend is None or getattr(gen, "owner", None) is not getattr(svc, "images", None):
             return fn(svc, gen, *a, **kw)
@@ -1815,11 +1954,7 @@ def on_free_gpu(fn):
         gen._say(f"image job: {lend['busy_name']} has {why['free_mib']} MiB for it, it needs {why['need_mib']}: "
                  f"on {lend['name']}, the text model's GPU, instead")
         got = fn(svc, svc.images.lent().gens[gen.model], *a, **kw)
-        if isinstance(got, tuple) and len(got) == 3 and isinstance(got[1], dict):
-            got[1]["gpu"] = moved
-        elif isinstance(got, dict):
-            got["gpu"] = moved
-        return got
+        return _with_gpu_word(got, moved)
     return run
 
 
@@ -1827,6 +1962,9 @@ def place_words(moved: dict | None) -> str:
     """What a tool's result says of place's card (the chat's model tells the user)."""
     if not moved:
         return ""
+    if moved.get("card") == "auto":
+        return (f" Made on {moved['name']}, a free card auto picked for this job; the chat engine was left alone. "
+                "Tell the user so in a few words.")
     why = {"video": lambda: f"A video job has {moved['busy_name']}, the image GPU, for about {moved['left_s']} s more",
            "server": lambda: f"Another XeStrata server's image job has {moved['busy_name']}, the image GPU",
            "vram": lambda: f"{moved['busy_name']}, the image GPU, has {moved['free_mib']} MiB free for this job, which "
@@ -4181,6 +4319,11 @@ class ImageModels:
         self.lend_pci: str | None = None   # that GPU's address (server.py, with lend_cfgs)
         self._lent: ImageModels | None = None
         self._lent_lock = threading.Lock()
+        # the same models on a card no text engine takes, for an unnamed "auto" job: the configs, log and unscoped
+        # text environment (server.py sets it when the config names no gpu_pci); the engines are made on first use
+        self.auto_cfgs: tuple | None = None
+        self._auto_cards: dict[str, ImageModels] = {}
+        self._auto_lock = threading.Lock()
         # a long job's state while it holds this GPU's image engine (videos.upscale's; also svc.long_job, the chat's):
         # another job asked of this GPU is refused (refuse_during_long_job), one of "auto" goes to the lent GPU (place)
         self.long_job: dict | None = None
@@ -4209,6 +4352,23 @@ class ImageModels:
                 cfgs, log, env = self.lend_cfgs
                 self._lent = ImageModels(cfgs, log=log, env=env, separate=False)
             return self._lent
+
+    def auto_card(self, pci: str) -> "ImageModels":
+        """The models' engines scoped to an unused card `pci`, made once and kept warm for the next "auto" job.
+        They run on a card of their own (separate_turn), but cannot lend it to the text engine: auto chose it because
+        the text engine does not use it, not to put the job back on the text engine's card later."""
+        if self.auto_cfgs is None:
+            raise ImageRequestError("auto: the images have no unnamed card to move to")
+        with self._auto_lock:
+            got = self._auto_cards.get(pci)
+            if got is None:
+                from serve import gpu_select
+                cfgs, log, env = self.auto_cfgs
+                got = ImageModels(cfgs, log=log, env=gpu_select.scope(str(cfgs[0]["exe"]), env, pci),
+                                  separate=True)
+                got.gpu_pci = pci
+                self._auto_cards[pci] = got
+            return got
 
     def __getattr__(self, name):
         return getattr(self.current, name)
@@ -6523,6 +6683,12 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
                 gen.totals["failed"] += 1
                 raise
             check_room(need, ram_available_mib(), job)
+            auto = AUTO_CARD.get()
+            if auto is not None:   # an auto-picked card, checked again with this job's real NEED
+                room = int(need.get("free_mib") or 0) + int(need.get("held_mib") or 0) - gen.reserve
+                if int(need.get("least_mib") or 0) > room:
+                    raise AutoCardNoFit(f"{auto['name']} has {room} MiB free for this job, which needs "
+                                        f"{need['least_mib']}")
             if LEND_RETRY.get() and AUTO_LEND.get() is not None:   # "auto": the job's VRAM here, else the text GPU
                 room = int(need.get("free_mib") or 0) + int(need.get("held_mib") or 0) - gen.reserve
                 if int(need.get("least_mib") or 0) > room:
@@ -6542,7 +6708,7 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
                 helper_return_later(svc, models, lambda m: gen._say("image jobs done: " + m))
     except BaseException as e:
         error = str(e) or type(e).__name__
-        moved_on = isinstance(e, ImageGpuTaken)
+        moved_on = isinstance(e, (ImageGpuTaken, AutoCardNoFit))
         raise
     finally:
         if held:
