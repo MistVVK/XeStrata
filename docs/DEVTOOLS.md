@@ -187,6 +187,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Twenty-third, intel/llvm's `urPhysicalMemCreate` (the eighteenth's commit) calls `hipMemCreate` without making its device current.
   `hipMemCreate` takes the memory from the current device whatever device its properties name (ROCm 7.1.1 and 10.1), so on a PC with two AMD GPUs a thread whose current device is the other one gets that one's memory.
   Fixed, it makes its device current first (`hip-physical-mem-device`).
+  Twenty-fourth, `hipModuleLoadDataEx` refuses a module the GPU has no room for with `hipErrorNoBinaryForGpu` (ROCm 10.1, an RX 9060 XT with every block of its memory taken), and the HIP adapter passed that on as a failed build.
+  The SYCL runtime keeps a failed build in its program cache and throws it again at every use of the program, so the kernels of a program first used while the GPU was full never ran in that process, also after the memory was free again (an image engine started beside a text model whose expert cache filled the VRAM failed every image job with "The program was built for 1 devices").
+  Out of device memory is not kept: the runtime drops its cache and builds the program again at the next use.
+  Fixed, a load refused for no binary or no memory while the device has less than 256 MiB and twice the binary free is reported as out of device memory (`hip-load-oom`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones and `amdgpu-global-offset-hostcall` only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch`, `l0-static-graph` and `offload-nordc-archive` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
