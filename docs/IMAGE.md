@@ -145,6 +145,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `timeout_s` | 3600 | The most seconds a job is waited for |
 | `reload` | `lazy` | A text model taken off by `unload` comes back at the next request (`lazy`) or right after the image (`eager`) |
 | `daemon_idle_s` | 1800 | The seconds an image engine no server is connected to waits before it ends |
+| `silence_s` | 900 | The most seconds the image engine may say nothing during a job. After that it is taken as stalled: it is ended, and the next job starts it again (0: wait for ever) |
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`xestrata-image.log`) |
 | `lora_bake` | `true` | The plain LoRAs on the DiT's blocks baked into the weights (`false`: the delta added to each product. [LoRA](#lora-adapters)) |
@@ -634,6 +635,7 @@ On the text model's GPU, before a job the engine says the VRAM the image needs (
 - After a job the image engine keeps its layers only with `keep` or on a GPU of its own, and VRAM to spare; otherwise it lets go of what it holds (waiting, the process alone, about 200 MiB).
 - The image engine starts at the first image and stays. Its kernels are prepared once, and the text state of the same prompt and the layers in VRAM stay for the next image.
 - The image engine is a process apart from the server, and stays when the text model is changed. It ends 30 minutes after the last server leaves (`daemon_idle_s`).
+- When the image engine says nothing for `silence_s` (900 s by default) during a job (no step, tile or loading line), it is taken as stalled and ended, and the job fails. The next job starts a new engine. After 3 stalls in an hour it is not started again until an hour has passed since the first. `/v1/status`'s `image_generation` shows how many times it stalled (`stalls`), the last one (`last_stall`), while it waits to start again the time it will (`held_until`), and during a job how long the engine has said nothing (`silent_s`).
 - The K and V cache of the reference images' tokens in a Qwen-Image-2.1 edit (about 2 GB for one 1024x1024 image) keeps what the VRAM cannot hold in pinned RAM and brings it over at each step.
 
 ### Choosing the GPU that makes it

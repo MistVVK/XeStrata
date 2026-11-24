@@ -15,7 +15,9 @@ the engine and gets its lines up to the answer (STEP lines before an IMAGE); STO
 its step; RESUME goes on with the client's running video after its YIELD (the engine waits there for it); QUIT closes
 the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers
 STOPPED once the engine is gone.  Without a client and a request for --idle seconds (default 1800)
-the daemon ends, and so it does when the engine ends.
+the daemon ends, and so it does when the engine ends.  A request the engine says nothing for in --silence seconds
+(default SILENCE_S; 0: wait for ever) has a stalled engine: the daemon stops listening, ends the engine, answers
+"ERROR stalled: ..." and ends, so the next request starts a new daemon and engine.
 """
 from __future__ import annotations
 
@@ -42,11 +44,21 @@ ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "W8": ("W8",
            "UPSVNEED": ("NEED",), "SEGV": ("SEGVIDEO",), "CONTROL": ("CONTROL",),
            "COLORMAP": ("COLORMAP",)}
 START_TIMEOUT_S = 600
+# A running request's engine silent this long is stalled, not slow: a step, a tile, a video's frame and a load's share
+# each print a line, and the slowest seen take minutes (a layer read from a slow SSD, HunyuanImage 3.0's step).  The
+# stall it is for (2026-11-24, RX 9060 XT on ROCm): a layer's copy that the driver kept waiting for 50 minutes while the
+# engine's queues were evicted, its thread spinning on the CPU; the job's own limit (timeout_s, 3600 s) then left the
+# engine as it was and every later job failed on it.
+SILENCE_S = 900
 
 
 class Daemon:
-    def __init__(self, cmd: list[str], idle: float, log):
-        self.cmd, self.idle, self.log = cmd, idle, log
+    def __init__(self, cmd: list[str], idle: float, log, silence: float = SILENCE_S):
+        self.cmd, self.idle, self.log, self.silence = cmd, idle, log, silence
+        self.srv: socket.socket | None = None
+        self.addr: str | None = None
+        self.ino: int | None = None              # the address file's, so that the daemon removes its own alone
+        self.resuming = False                   # a YIELD waits for the client's RESUME: not the engine's silence
         self.proc: subprocess.Popen | None = None
         self.lines: queue.Queue = queue.Queue()
         self.ready = ""
@@ -100,6 +112,7 @@ class Daemon:
             gone = False
             try:
                 self.send(line)
+                heard = time.monotonic()
                 while True:
                     if disconnected.is_set() and not gone:
                         gone = True
@@ -109,7 +122,15 @@ class Daemon:
                     try:
                         got = self.lines.get(timeout=0.25)
                     except queue.Empty:
+                        silent = time.monotonic() - heard
+                        if self.resuming:
+                            heard = time.monotonic()
+                        elif 0 < self.silence < silent:
+                            self.stalled(f, op, silent)
+                            return
                         continue
+                    heard = time.monotonic()
+                    self.resuming = got == "YIELD"
                     if got is None:
                         write(f, "ERROR the image engine ended")
                         self.done.set()
@@ -124,13 +145,36 @@ class Daemon:
                                     self.send("STOP")
                     if gone and got == "YIELD" and op not in ("IMG", "UPSV", "SEGV"):
                         # Requests without STOP still need to leave the yield.
+                        self.resuming = False
                         with contextlib.suppress(OSError, ValueError):
                             self.send("RESUME")
                     if got.split(" ", 1)[0] in ends or got.startswith("ERROR"):
                         return
             finally:
                 self.owner = None
+                self.resuming = False
                 self.last = time.monotonic()
+
+    def stalled(self, f, op: str, silent: float) -> None:
+        """The engine said nothing for --silence seconds in a request: no server finds this daemon again, the engine is
+        ended, the client told, and the daemon ends (the next request starts a new one)."""
+        why = f"the image engine said nothing for {silent:.0f} s during {op} (the config's silence_s)"
+        self.say(f"{why}: ending it")
+        self.retire()
+        line_process.end_gpu_process(self.proc)
+        with contextlib.suppress(OSError, ValueError):
+            write(f, f"ERROR stalled: {why}; it was ended")
+        self.done.set()
+
+    def retire(self) -> None:
+        """Stop listening and remove the address, when it is still this daemon's (a new daemon may have taken it)."""
+        srv, self.srv = self.srv, None
+        if srv is not None:
+            with contextlib.suppress(OSError):
+                srv.close()
+        with contextlib.suppress(OSError):
+            if self.addr is not None and os.stat(self.addr).st_ino == self.ino:
+                os.unlink(self.addr)
 
     def client(self, conn) -> None:
         with self.count_lock:
@@ -147,6 +191,8 @@ class Daemon:
                         line = raw.rstrip("\r\n")
                         if line in ("STOP", "RESUME"):
                             if self.owner is conn:
+                                if line == "RESUME":
+                                    self.resuming = False
                                 with contextlib.suppress(OSError, ValueError):
                                     self.send(line)
                             continue
@@ -217,12 +263,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--socket", required=True)
     ap.add_argument("--idle", type=float, default=1800)
+    ap.add_argument("--silence", type=float, default=SILENCE_S)
     ap.add_argument("--log")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     log = open(a.log, "a", encoding="utf-8", errors="replace") if a.log else sys.stderr
-    d = Daemon(cmd, a.idle, log)
+    d = Daemon(cmd, a.idle, log, a.silence)
     try:
         d.start()
     except (OSError, RuntimeError) as e:
@@ -231,6 +278,7 @@ def main() -> int:
         return 1
     srv, token = listen(a.socket)
     srv.settimeout(1.0)
+    d.srv, d.addr, d.ino = srv, a.socket, os.stat(a.socket).st_ino
     d.say(f"listening at {a.socket}")
 
     def accept():
@@ -265,11 +313,7 @@ def main() -> int:
     if not d.done.is_set():
         idle_watch.watch.add(1.0, check_idle, repeat=True)
         d.done.wait()
-    with contextlib.suppress(OSError):
-        srv.close()
-    if os.name != "nt" or token is not None:
-        with contextlib.suppress(OSError):
-            os.unlink(a.socket)
+    d.retire()
     d.stop()
     return 0
 
