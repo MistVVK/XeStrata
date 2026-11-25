@@ -527,6 +527,9 @@ if(STRATA_ENABLE_XE)
         # libcu++ told the objects are COFF's in the device compile too, whose nvptx target says ELF (else it asks
         # alignments COFF does not take)
         list(APPEND _strata_cutlass_flags -DCUTLASS_UINT128_NATIVE -D_LIBCUDACXX_OBJECT_FORMAT_COFF=1)
+        # and the C runtime the engine's other objects take (the DLL one, /MD: CMake adds it to its own compiles
+        # alone), else lld-link refuses the mix (/failifmismatch RuntimeLibrary)
+        list(APPEND _strata_cutlass_flags ${CMAKE_CXX_COMPILE_OPTIONS_MSVC_RUNTIME_LIBRARY_MultiThreadedDLL})
       else()
         list(APPEND _strata_cutlass_flags -fPIC)
       endif()
