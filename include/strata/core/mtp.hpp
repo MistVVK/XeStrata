@@ -235,6 +235,7 @@ private:
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     strata::gpu::Event* ev_chain_ = nullptr;
     strata::gpu::Event* ev_step_[8] = {};               ///< after each of the first n_early outputs
+    strata::gpu::Event* ev_draft_ = nullptr;            ///< draft(): after each launch, read by its wait (#78)
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};

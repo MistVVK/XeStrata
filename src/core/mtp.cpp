@@ -140,6 +140,7 @@ MtpDrafter::~MtpDrafter() {
     if (h_chist_) strata::gpu::free(h_chist_);
     if (ev_chain_) strata::gpu::event_destroy(ev_chain_);
     for (strata::gpu::Event* e : ev_step_) if (e) strata::gpu::event_destroy(e);
+    if (ev_draft_) strata::gpu::event_destroy(ev_draft_);
     if (h_force_) strata::gpu::free(h_force_);
     if (cs_) strata::gpu::stream_destroy(cs_);
     if (side_) strata::gpu::stream_destroy(side_);
@@ -196,6 +197,7 @@ void MtpDrafter::release_weights(bool keep_head) {
     if (ev_chain_) { strata::gpu::event_destroy(ev_chain_); ev_chain_ = nullptr; }
     for (strata::gpu::Event*& e : ev_step_)
         if (e) { strata::gpu::event_destroy(e); e = nullptr; }
+    if (ev_draft_) { strata::gpu::event_destroy(ev_draft_); ev_draft_ = nullptr; }
     int2_.reset();
     if (!keep_head) {
         subset_.reset();
@@ -1248,18 +1250,33 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         ss_->ple.table->prefetch_rows(rows16);
     };
     // each draft is read once its token reaches the mapped row (written after its probability), not after a stream
-    // sync: the next step starts sooner
+    // sync: the next step starts sooner.  Issue #78: the wait reads the event recorded after the launch, not
+    // stream_status (ext_oneapi_empty cannot report a banned queue, and this loop then spun without end), and gives
+    // up after 20 s as the verify windows' waits do.
+    auto mark = [&]() {
+        if ((ev_draft_ == nullptr && !strata::gpu::event_create(&ev_draft_)) ||
+            !strata::gpu::event_record(ev_draft_, cs_)) {
+            err = std::string("mtp draft: event record: ") + strata::gpu::last_error();
+            return false;
+        }
+        return true;
+    };
     auto wait_step = [&](int j) {
+        const Clock::time_point w0 = Clock::now();
         uint32_t spins = 0;
         while (((volatile int32_t*) h_out_)[j] < 0) {
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
-            const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+            const strata::gpu::Status st = strata::gpu::event_status(ev_draft_);
             if (st == strata::gpu::Status::Failed) {
                 err = std::string("mtp draft: ") + strata::gpu::last_error();
                 return false;
             }
             if (st == strata::gpu::Status::Done) break;
+            if (Clock::now() - w0 > std::chrono::seconds(20)) {
+                err = "mtp draft: timed out waiting for draft " + std::to_string(j);
+                return false;
+            }
         }
         return true;
     };
@@ -1267,6 +1284,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         err = std::string("mtp draft: ") + strata::gpu::last_error();
         return false;
     }
+    if (!mark()) return false;
     (void) strata::gpu::stream_idle(cs_);
     prefetch_ple(tokens[a]);
     progress_at("mtp draft: waiting for the GPU");   // upstream #2065: a stall here read as the verify window before it
@@ -1283,6 +1301,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
         }
+        if (!mark()) return false;
         (void) strata::gpu::stream_idle(cs_);
         prefetch_ple(drafts[j - 1]);
         if (!wait_step(j)) return false;
