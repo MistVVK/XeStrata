@@ -115,6 +115,11 @@ python3 "$src/tools/intel_llvm_build.py" --windows --xwin /build/xwin ${XESTRATA
 llvm_keep windows-sycl "$src/.tools/intel-llvm-win" "$wkey"
 lap intel-llvm
 sycl=$src/.tools/intel-llvm-win/install
+# the engine's zstd (src/artifact/strata_reader.cpp includes <zstd.h>): CMakeLists.txt finds it with find_library, and
+# the Windows cross toolchain (cmake/toolchain-windows-msvc.cmake) searches the libraries of its roots alone.  This
+# build made a Windows zstd for intel/llvm; its header goes where the toolchain's flags already look (the SYCL tree's
+# include) and its .lib is named to the engine's configure below, so the 7z carries zstd inside the engine.
+install -Dm644 "$src/.tools/intel-llvm-win/zstd/include/zstd.h" "$sycl/include/zstd.h"
 
 # oneMKL for Windows, unpacked from its wheels' Library/ folders: the headers, the import libraries and the CMake
 # package, and the DLLs, which oneMKL's CMake package checks are there (kept in /cache between builds)
@@ -142,7 +147,8 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_CUDA_PATH="$cuda_path" \
   -DSTRATA_CUDA_PTX= -DSTRATA_ONEMKL=ON -DMKL_ROOT=/build/mkl -DSTRATA_HIP_ARCHS="$hip_archs" -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" \
-  -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin
+  -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin \
+  -DSTRATA_ZSTD_LIB="$src/.tools/intel-llvm-win/zstd/lib/zstd_static.lib"
 targets="strata strata-device strata-image strata-vision onemath_backend_libs"   # CMake's targets keep upstream's names
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
