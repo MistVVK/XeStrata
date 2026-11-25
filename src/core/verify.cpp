@@ -450,6 +450,7 @@ Verifier::~Verifier() {
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
+    if (ev_batch_) strata::gpu::event_destroy(ev_batch_);
     if (prof_pin_) strata::gpu::free(prof_pin_);
     for (strata::gpu::Stream s : df_side_)
         if (s) strata::gpu::stream_destroy(s);
@@ -2461,6 +2462,15 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
 }
 
+bool Verifier::mark_batch(std::string& err) {
+    if ((ev_batch_ == nullptr && !strata::gpu::event_create(&ev_batch_)) ||
+        !strata::gpu::event_record(ev_batch_, cs_)) {
+        err = std::string("verify: batch event record: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
@@ -2473,6 +2483,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
         err = std::string("verify: batch launch: ") + strata::gpu::last_error();
         return false;
     }
+    if (!mark_batch(err)) return false;
     (void) strata::gpu::stream_idle(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
@@ -2668,6 +2679,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
         err = std::string("verify: batch launch: ") + strata::gpu::last_error();
         return false;
     }
+    if (!mark_batch(err)) return false;
     (void) strata::gpu::stream_idle(cs_);
     b_running_ = true;
     b_k_ = 0;
@@ -2729,7 +2741,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (win_.rung() < want) {
             const auto now = Clock::now();
             if (now - b_last_ > std::chrono::milliseconds(2)) {
-                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                const strata::gpu::Status st = strata::gpu::event_status(ev_batch_);
                 if (st == strata::gpu::Status::Failed) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) + ": " + strata::gpu::last_error();
                     b_running_ = false;
@@ -2755,7 +2767,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         b_last_ = Clock::now();
         ++b_k_;
     }
-    strata::gpu::Status st = strata::gpu::stream_status(cs_);
+    strata::gpu::Status st = strata::gpu::event_status(ev_batch_);
     if (st == strata::gpu::Status::Done) st = win_.copies_status();   // (the copies: no host function of this
     if (st == strata::gpu::Status::Failed) {                                         // window may raise flag B in the next)
         err = std::string("verify batch: the window's commit: ") + strata::gpu::last_error();
