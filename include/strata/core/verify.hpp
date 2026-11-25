@@ -495,6 +495,10 @@ private:
     int row_base_ = 0;                     ///< a batch window's first hand-off row (its slot group's base)
     // batch_launch / batch_poll
     bool b_running_ = false;
+    /// Recorded behind a batch window's graphs: batch_poll reads the device's loss from it, as service() reads ev_done_
+    /// (issue #78: stream_status cannot report a banned queue)
+    strata::gpu::Event* ev_batch_ = nullptr;
+    bool mark_batch(std::string& err);
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
     int32_t b_out_[strata::kernels::kWindowMaxT] = {};
