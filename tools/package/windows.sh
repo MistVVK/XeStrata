@@ -106,6 +106,7 @@ llvm_keep windows-contrib "$src/.tools/intel-llvm-contrib" "$key"
 # that name points: lld.real is the same binary, with --no-dependent-libraries for the ELF (amdgpu) links alone.
 lld=$src/.tools/intel-llvm-contrib/install/bin/lld
 mv "$lld" "$lld.real"
+# shellcheck disable=SC2016   # the wrapper's own $0 and $@, expanded when it runs
 printf '%s\n' '#!/bin/sh' \
   'case " $* " in *" elf64_amdgpu "*) exec "$(dirname "$0")/lld.real" "$@" --no-dependent-libraries ;; esac' \
   'exec "$(dirname "$0")/lld.real" "$@"' > "$lld"
@@ -164,10 +165,10 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
 # CUTLASS's uint128.h takes MSVC's _umul128/_udiv128 when _MSC_VER is set, but the clang that compiles it (the contrib
 # toolchain) has neither in its <intrin.h> (MSVC's has them): CUTLASS's own portable forms are used instead.  The file
 # comes from FetchContent at the configure above, so it is patched before the build reads it.
-cu128=/build/engine/_deps/strata_cutlass-src/include/cutlass/uint128.h
-sed -i 's|^#if defined(_MSC_VER) && defined(_M_AMD64)$|#if 0  /* strata: the contrib clang has no _umul128/_udiv128 */|' \
+cu128=$(find /build/engine/_deps -path '*_cutlass-src/include/cutlass/uint128.h')   # FetchContent's folder
+sed -i 's|^#if defined(_MSC_VER) && defined(_M_AMD64)$|#if 0  /* xestrata: the contrib clang has no _umul128/_udiv128 */|' \
   "$cu128"
-grep -q 'strata: the contrib clang has no _umul128' "$cu128" || {
+grep -q 'xestrata: the contrib clang has no _umul128' "$cu128" || {
   echo "cutlass uint128.h: the MSVC guard is not where this script expects it" >&2; exit 1; }
 
 targets="strata strata-device strata-image strata-vision onemath_backend_libs"   # CMake's targets keep upstream's names

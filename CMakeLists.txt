@@ -1334,7 +1334,8 @@ if(STRATA_ENABLE_XE)
                    ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc})
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
                    ${_strata_cudnn_cuda_inc})
-      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS CUDNN_FRONTEND_SKIP_JSON_LIB)
+      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                   CUDNN_FRONTEND_SKIP_JSON_LIB)
       if(WIN32)
         # cudnn-frontend's own loading takes only CUDA 13's runtime on Windows (v1.33.0's cudnn_frontend_shim.h stops
         # the build before it), so on Windows cuDNN and the CUDA runtime are linked by their import libraries
