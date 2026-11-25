@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # tools/package/reuse.sh - sourced by container.sh and windows.sh: what a build on this PC keeps in /cache (build.sh's
-# build/pkg-cache/<distro>/) for the next one, unless XESTRATA_PKG_CLEAN=1 (a release's builds: every one from nothing).
+# build/pkg-cache/<distro>/) for the next one, releases included, unless XESTRATA_PKG_CLEAN=1 asks for one from nothing.
 #
 # - the packages apt and dnf fetch (pkg_cache), which they check as they always do;
 # - intel/llvm's toolchains (llvm_restore, llvm_keep), one per name and key: the key hashes what decides the

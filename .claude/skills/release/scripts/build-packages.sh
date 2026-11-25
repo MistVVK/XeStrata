@@ -45,8 +45,8 @@ for t; do
   set -- $t
   n=$1-$2
   start=$(date +%s)
-  # a release's packages from nothing: no build tools or intel/llvm kept by earlier builds (tools/package/reuse.sh)
-  if ! XESTRATA_PKG_CLEAN=1 tools/package/build.sh "$1" "$2" "$tag" > "$out/logs/$n.log" 2>&1; then
+  # a release's packages use the same keyed reuse as any build: build tools and intel/llvm kept per distribution and toolchain (tools/package/reuse.sh)
+  if ! tools/package/build.sh "$1" "$2" "$tag" > "$out/logs/$n.log" 2>&1; then
     echo "$n FAILED after $(( ($(date +%s) - start) / 60 )) min (logs/$n.log)" >> "$summary"
     echo FAILED >> "$summary"
     exit 1

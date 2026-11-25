@@ -31,8 +31,10 @@
 # compilers differ; at most XESTRATA_CCACHE_MAX, default 30G), from which a package built after another of the same
 # distribution takes most of intel/llvm's and the engine's objects; and in build/pkg-cache/<distro>/, the packages apt
 # and dnf fetched and intel/llvm's finished toolchains, one per variant and what decides it (tools/package/reuse.sh).
-# XESTRATA_PKG_CLEAN=1 leaves out the second (a release's builds: .claude/skills/release/scripts/build-packages.sh):
-# the build tools are fetched and intel/llvm is built again.  Deleting a folder makes the next build start without it.
+# Every build uses the second too, a release's builds (.claude/skills/release/scripts/build-packages.sh) included:
+# the reuse is keyed per distribution and toolchain (tools/package/reuse.sh).  XESTRATA_PKG_CLEAN=1 is an explicit
+# opt-out that leaves it out, so the build tools are fetched and intel/llvm is built again.  Deleting a folder
+# makes the next build start without it.
 set -eu
 
 usage() {
