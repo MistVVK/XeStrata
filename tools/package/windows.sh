@@ -98,6 +98,16 @@ llvm_restore windows-contrib "$src/.tools/intel-llvm-contrib" "$key"
 host_reused=$llvm_reused
 python3 "$src/tools/intel_llvm_build.py" --contrib --yes ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
 llvm_keep windows-contrib "$src/.tools/intel-llvm-contrib" "$key"
+# the AMD device code's link: the MSVC and Windows SDK headers' #pragma comment(lib, ...) (msvcrt, msvcprt) reach the
+# device objects too, and this intel/llvm's lld refuses a library it cannot find there.  cmake/toolchain-windows-msvc.cmake
+# makes a wrapper for it, but the device link is a custom command that calls this lld by name, so the wrapper goes where
+# that name points: lld.real is the same binary, with --no-dependent-libraries for the ELF (amdgpu) links alone.
+lld=$src/.tools/intel-llvm-contrib/install/bin/lld
+mv "$lld" "$lld.real"
+printf '%s\n' '#!/bin/sh' \
+  'case " $* " in *" elf64_amdgpu "*) exec "$(dirname "$0")/lld.real" "$@" --no-dependent-libraries ;; esac' \
+  'exec "$(dirname "$0")/lld.real" "$@"' > "$lld"
+chmod 755 "$lld"
 
 # the MSVC CRT and the Windows SDK (not free software: Microsoft's license, accepted here; never in the 7z)
 mkdir -p /cache/xwin /build
