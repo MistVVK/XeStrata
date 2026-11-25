@@ -43,14 +43,16 @@ apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc
   opencl-headers patch xz-utils libamdhip64-dev rocm-device-libs-21 librocblas-dev libhipblaslt-dev \
   libhipblas-common-dev
 cuda_path=/usr/lib/cuda
-# cuDNN's headers (the same on Windows), for the image engine's attention, which opens cuDNN where the user installed
-# it (cudnn64_9.dll): from NVIDIA's redistributable archive, its SHA-256 checked, kept in /cache
-cudnn_tar="cudnn-linux-x86_64-9.27.0.42_cuda12-archive.tar.xz"
-[ -f "/cache/$cudnn_tar" ] || curl -fsSL -o "/cache/$cudnn_tar" \
-  "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/$cudnn_tar"
-echo "dc45f8c5fd44955c6e950c690ea92c28ea848ffb1fefbaabf3a9d175d961263a  /cache/$cudnn_tar" | sha256sum -c -
-mkdir -p /opt/cudnn
-tar -xJf "/cache/$cudnn_tar" -C /opt/cudnn --strip-components=1 --wildcards '*/include/*'
+# cuDNN's headers and its import library (cudnn.lib: the engine links cuDNN on Windows and loads cudnn64_9.dll where
+# the user installed it, CMakeLists.txt), for the image engine's attention: from NVIDIA's redistributable archive for
+# Windows, its SHA-256 checked, kept in /cache
+cudnn_zip="cudnn-windows-x86_64-9.27.0.42_cuda12-archive.zip"
+[ -f "/cache/$cudnn_zip" ] || curl -fsSL -o "/cache/$cudnn_zip" \
+  "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/$cudnn_zip"
+echo "93949680d6499ad0f17fc1abb131825c9dd41b460844513f608e840e0c8ce72b  /cache/$cudnn_zip" | sha256sum -c -
+mkdir -p /opt/cudnn/include /opt/cudnn/lib/x64
+unzip -q -j -o "/cache/$cudnn_zip" '*/include/*' -d /opt/cudnn/include
+unzip -q -j -o "/cache/$cudnn_zip" '*/lib/x64/cudnn.lib' -d /opt/cudnn/lib/x64
 # Windows' import libraries for cuBLAS, the CUDA runtime and the CUDA driver (oneMath's cuBLAS backend, which loads
 # cuBLAS where the user installed it): from NVIDIA's redistributable archives for CUDA 12.4, their SHA-256 checked
 mkdir -p /build/cudalib/include

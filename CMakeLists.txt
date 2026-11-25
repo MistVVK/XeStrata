@@ -1334,8 +1334,27 @@ if(STRATA_ENABLE_XE)
                    ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc})
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
                    ${_strata_cudnn_cuda_inc})
-      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
-                   NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
+      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS CUDNN_FRONTEND_SKIP_JSON_LIB)
+      if(WIN32)
+        # cudnn-frontend's own loading takes only CUDA 13's runtime on Windows (v1.33.0's cudnn_frontend_shim.h stops
+        # the build before it), so on Windows cuDNN and the CUDA runtime are linked by their import libraries
+        # (cuDNN's lib/x64, STRATA_CUDA_WINDOWS_LIBS) and loaded when cuDNN is first used (/DELAYLOAD): the engine
+        # starts without them, and open_cudnn loads them first, from where the user installed them.
+        find_library(_strata_cudnn_lib cudnn NO_CACHE NO_CMAKE_FIND_ROOT_PATH REQUIRED
+                     HINTS "${_strata_cudnn_inc}/../lib/x64" "${_strata_cudnn_inc}/../lib")
+        # the runtime's DLL is named by its major version (cudart64_12.dll), the one of the headers it is built with
+        file(STRINGS "${_strata_cudnn_cuda_inc}/cuda_runtime_api.h" _strata_cudart_ver
+             REGEX "^#define CUDART_VERSION +[0-9]+")
+        string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _strata_cudart_ver "${_strata_cudart_ver}")
+        math(EXPR _strata_cudart_major "${_strata_cudart_ver} / 1000")
+        target_link_libraries(strata_kernels PRIVATE ${_strata_cudnn_lib} "${STRATA_CUDA_WINDOWS_LIBS}/cudart.lib"
+                              delayimp)
+        target_link_options(strata_kernels INTERFACE "LINKER:/DELAYLOAD:cudnn64_9.dll"
+                            "LINKER:/DELAYLOAD:cudart64_${_strata_cudart_major}.dll")
+      else()
+        set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                     NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)
+      endif()
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
       set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
                    src/image/yolo_detect.cpp src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp

@@ -6,12 +6,17 @@
 // open_cudnn), on the queue's CUDA stream through a native command (a SYCL graph being recorded takes it), a cuDNN
 // graph built once a shape and kept.
 
-#include <cudnn_frontend.h>   // with its dynamic loading: windows.h on Windows
+#include <cudnn_frontend.h>   // with its dynamic loading on Linux
 #include <sycl/backend/cuda.hpp>
 #if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+
 #include <filesystem>
+// cuDNN and the CUDA runtime are linked and loaded at their first call (CMakeLists.txt: cudnn-frontend's
+// own loading takes only CUDA 13's runtime on Windows), after open_cudnn has loaded them from where the user put them
 namespace cudnn_frontend {
-HMODULE cudnn_dlhandle = nullptr;   // cudnn_frontend_shim.h's: cuDNN opened at the first attention
+HMODULE cudnn_dlhandle = nullptr;   // cuDNN opened at the first attention (this file's, as on Linux)
 }
 #else
 #include <dlfcn.h>
@@ -316,26 +321,27 @@ void open_cudnn(cudnnHandle_t& handle) {
         const fs::path pip = nvidia / "cudnn" / "bin" / "cudnn64_9.dll";
         if (fs::exists(pip, ec)) libs.push_back(pip.string());
     }
-    // cudnn-frontend opens the CUDA runtime by its Linux names: on Windows cudart64_12.dll, as the user installed it
-    // (the PATH, the CUDA toolkit's, the 7z's Python's nvidia-cuda-runtime-cu12), unless CUDNN_FRONTEND_CUDART_LIB_NAME
-    // names one
-    if (std::getenv("CUDNN_FRONTEND_CUDART_LIB_NAME") == nullptr) {
-        std::vector<fs::path> dirs;
-        if (const char* path = std::getenv("PATH")) {
-            for (std::string rest = path; !rest.empty();) {
-                const size_t k = rest.find(';');
-                if (k != 0) dirs.emplace_back(rest.substr(0, k));
-                rest = k == std::string::npos ? "" : rest.substr(k + 1);
-            }
+    // the CUDA runtime of the engine's CUDA version (cudart64_12.dll), as the user installed it (the PATH, the CUDA
+    // toolkit's, the 7z's Python's nvidia-cuda-runtime-cu12), loaded before the first call cudnn-frontend makes through
+    // it: a delay-loaded DLL that is missing would end the process at that call
+    const std::string cudart = "cudart64_" + std::to_string(CUDART_VERSION / 1000) + ".dll";
+    std::vector<fs::path> dirs;
+    if (const char* path = std::getenv("PATH")) {
+        for (std::string rest = path; !rest.empty();) {
+            const size_t k = rest.find(';');
+            if (k != 0) dirs.emplace_back(rest.substr(0, k));
+            rest = k == std::string::npos ? "" : rest.substr(k + 1);
         }
-        if (const char* c = std::getenv("CUDA_PATH")) dirs.push_back(fs::path(c) / "bin");
-        if (!nvidia.empty()) dirs.push_back(nvidia / "cuda_runtime" / "bin");
-        for (const fs::path& d : dirs)
-            if (fs::exists(d / "cudart64_12.dll", ec)) {
-                _putenv_s("CUDNN_FRONTEND_CUDART_LIB_NAME", (d / "cudart64_12.dll").string().c_str());
-                break;
-            }
     }
+    if (const char* c = std::getenv("CUDA_PATH")) dirs.push_back(fs::path(c) / "bin");
+    if (!nvidia.empty()) dirs.push_back(nvidia / "cuda_runtime" / "bin");
+    HMODULE rt = nullptr;
+    for (const fs::path& d : dirs)
+        if (fs::exists(d / cudart, ec) && (rt = LoadLibraryExA((d / cudart).string().c_str(), nullptr,
+                                                               LOAD_WITH_ALTERED_SEARCH_PATH)) != nullptr)
+            break;
+    if (rt == nullptr && (rt = LoadLibraryA(cudart.c_str())) == nullptr)
+        throw std::runtime_error(cudart + ": the CUDA runtime is not installed");
 #else
     libs.emplace_back("libcudnn.so.9");
     // cudnn-frontend opens the first of libcudart.so.12 and .13 it finds: the CUDA version the engine was built with
@@ -359,7 +365,14 @@ void open_cudnn(cudnnHandle_t& handle) {
 #endif
         if (h == nullptr) continue;
         fe::cudnn_dlhandle = h;
+#if defined(_WIN32)
+        // through this module's own entry: the delay-loaded imports bind once, to the cudnn64_9.dll loaded then, so
+        // they are first called after this one has made a handle (the one kept)
+        const auto create = reinterpret_cast<decltype(&cudnnCreate)>(GetProcAddress(h, "cudnnCreate"));
+        if (create != nullptr && create(&handle) == CUDNN_STATUS_SUCCESS) return;
+#else
         if (fe::detail::create_handle(&handle) == CUDNN_STATUS_SUCCESS) return;
+#endif
         why = lib + ": cudnnCreate failed";
 #if defined(_WIN32)
         FreeLibrary(h);
