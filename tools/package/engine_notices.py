@@ -74,7 +74,7 @@ ROWS: list[dict[str, Any]] = [
      "source": "https://github.com/uxlfoundation/oneDNN",
      "texts": ["src:third_party/main/oneDNN/LICENSE", "src:third_party/main/oneDNN/THIRD-PARTY-PROGRAMS"],
      "part": "onednn", "win": ["app/engine/dnnl.dll"]},
-    {"name": "cuDNN Frontend (compiled into the image engine)", "version": "1.32.2",
+    {"name": "cuDNN Frontend (compiled into the image engine)", "version": "1.33.0",
      "license": "Apache-2.0 (parts MIT)",
      "source": "https://github.com/NVIDIA/cudnn-frontend", "texts": ["src:third_party/main/cudnn-frontend/LICENSE.txt"],
      "part": "cudnn_frontend"},
