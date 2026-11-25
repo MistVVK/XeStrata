@@ -48,6 +48,25 @@ int main() {
     CHECK(default_share_memory_verdict(m).arm);
     m.avail_ram = kUnknown; m.inplace_bytes = 500 * G;
     CHECK(default_share_memory_verdict(m).arm);                                   // RAM unknown: never blocks
+    // the link rule: the two cards it was measured on, and what it must leave alone
+    {
+        LinkRuleIn in;
+        in.total = pairs; in.blob_mb = 1.747; in.pool_workers = 19;
+        in.link_gbps = 6.4; in.resident = 3802;            // RTX 4070: a 5.7 s floor, staged up to 6K tokens
+        LinkRule r = link_rule(in);
+        CHECK(r.arm && r.limit == 6144 && r.nt == kLinkNt);
+        in.pool_workers = 8;                               // a smaller pool takes less
+        CHECK(link_rule(in).limit < r.limit && link_rule(in).limit >= kShareLimitDefault);
+        in.pool_workers = 19; in.link_gbps = 28.2; in.resident = 14227;   // Arc Pro B70: a 0.64 s floor, unchanged
+        r = link_rule(in);
+        CHECK(!r.arm && r.limit == kShareLimitDefault && r.nt == 0);
+        in.link_gbps = 0.5; in.resident = 0;               // a very slow link: capped
+        CHECK(link_rule(in).limit == kShareLimitMax);
+        in.link_gbps = 0.0;                                // not probed
+        CHECK(!link_rule(in).arm && link_rule(in).limit == 0);
+        in.link_gbps = 6.4; in.resident = pairs;           // every expert on the card
+        CHECK(!link_rule(in).arm);
+    }
     if (failed == 0) std::printf("share_rules_test: ok\n");
     return failed ? 1 : 0;
 }

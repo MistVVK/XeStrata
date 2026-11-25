@@ -56,6 +56,10 @@ struct PrefillStats {
 void set_cpu_share(double share);
 /// The share in use: STRATA_PREFILL_CPU_SHARE's, else set_cpu_share's; -1 measured.
 double cpu_share_setting();
+/// The link rule's verdict (share_rules::link_rule) for the card the prompt path runs on: chunks up to `limit` tokens are
+/// staged and share (0: the plain 3,072), experts of up to `nt` tokens may go to the CPU (0: the pool's MAXT).  Before
+/// bytes_needed and init (the staged walk's buffers follow the limit).
+void set_cpu_share_rule(int64_t limit, int nt);
 
 /// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
 /// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
