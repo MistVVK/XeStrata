@@ -158,10 +158,16 @@ private:
 // The staged walk lets the CPU pool share missed experts up to 3072 rows.  Keep the existing
 // threshold until the staged walk has been measured against streaming on the target device.
 inline double cpu_share_env();
+// set_cpu_share_rule (share_rules::link_rule): on a slow link the staged walk with the share pays up to a longer chunk,
+// with wider experts on the CPU
+int64_t g_share_limit = 0;   // 0: the plain 3,072
+int g_share_nt = 0;          // 0: the pool's MAXT
 inline int64_t stream_all_min() {
     const int mode = strata::core::cpu_share_staged_3k_mode();
-    return cpu_share_env() != 0.0 && mode != 0 ? 3073 : 2048;
+    return cpu_share_env() != 0.0 && mode != 0 ? std::max<int64_t>(3073, g_share_limit + 1) : 2048;
 }
+// the most rows one expert may route and still be the CPU share's (a wider one runs as jobs of MAXT rows)
+inline int64_t share_nt() { return std::max<int64_t>(strata::kernels::cpu::MAXT, g_share_nt); }
 // XESTRATA_PREFILL_EQUAL (upstream 7104c8b8e, 51e5e7adc, idea own-prompt-plan): a prompt longer than its chunk is read
 // in n = ceil(tokens / chunk) chunks of equal size (the first n - 1 of ceil(tokens / n) tokens) instead of full chunks
 // and a remainder (20,931 tokens at 10,240: 3 x 6,977, not 10,240 + 10,240 + 451): the same number of chunks, and no
@@ -353,6 +359,10 @@ std::string fit_failure(const Alloc& o) {
 
 void set_cpu_share(double share) { g_cpu_share_fixed = share < 0.0 ? -1.0 : std::min(share, 1.0); }
 double cpu_share_setting() { return cpu_share_env(); }
+void set_cpu_share_rule(int64_t limit, int nt) {
+    g_share_limit = limit;
+    g_share_nt = nt;
+}
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
@@ -1205,6 +1215,47 @@ inline size_t MMQ_SLOT() { return ((size_t) MAXBLOB() + 255) & ~(size_t) 255; }
 // STRATA_MMQ_DIRECT; XeStrata's int8 products read no byte past a matrix, so no guard): it is no longer copied into
 // the group's buffer or ring slot first.  The same bytes are read, so the same answers.  STRATA_MMQ_TAB=0: copied, as
 // before.
+// The int8 products' launch takes its tile from the group's rows (iq_mmq's by_rows: 16 rows where no expert has more,
+// 64, or 128 where they average more than 64), and each of an expert's row tiles decodes its weights again; a group of
+// experts in id order mixes a 300-row expert with 20-row ones, whose work-groups past their rows are empty.  So a
+// layer with streamed experts takes its resident ones first, in falling row count (as a layer with none streamed
+// already did: MMQ_GROUP_SORT), and the streamed walk takes the stream a window at a time (stream_window_on).  Each
+// row's bits are the same whatever its group (no stream-k split).  B70, Qwen3.8-Flash-Next IQ3_XXS, a 3,560-token
+// chunk (13.4K of its 24.3K routed experts resident), read ms: 2,115 in id order, 2,018 with the resident ones sorted;
+// 14,243 tokens (the FP16 products) 6,008 / 6,009.  RTX 4070 (staged, the CPU share) 1K 1,851 / 1,863, 3.6K 4,006 /
+// 4,081 (within the runs' spread), 8K streamed 6,861 / 6,871.  XESTRATA_MMQ_GROUP_SORT_MIXED=0: id order.
+// Both only where the layer's experts average kSortMeanRows rows or fewer: the tiles are 64 and 128 rows, so larger
+// experts waste little of them, and a window's slots go back together, which holds the copy stream back where the
+// link is the limit (RTX 4070, read ms in id order / sorted and by windows: 7,999 tokens, 156 rows an expert, 6,865 /
+// 6,889; the 32K prompt's 16K-token chunks, 320 rows, 21,602 / 22,134; B70: 70 rows 2,115 / 1,934, 117 rows 3,209 /
+// 2,987).
+constexpr int64_t kSortMeanRows = 128;
+inline bool group_sort_mixed() {
+    static const bool on = [] {
+        const char* v = strata::env_get("MMQ_GROUP_SORT_MIXED");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+// The streamed walk's int8 layers a window at a time: half the ring's entries.  A window whose copies have all landed
+// when the layer's routing is read (the copy stream is ahead of the products: the B70's 28 GB/s link) has its routed
+// experts taken in falling row count, and the products read each expert where its copy landed, in its ring slot,
+// through the pointer table (as a resident expert in its cache slot: mmq_tab_on) - no gather into the group's buffer,
+// which was a device copy of every streamed expert (B70: 6 us an expert, 10.9K of them a 3.6K-token chunk).  Its
+// slots, the unrouted entries' too, go back with one event after its last group.  A window still on its way (the
+// link is the limit: the RTX 4070's 6.4 GB/s) is taken as before, an entry at a time in id order, gathered, a group's
+// slots back as it is gathered: waiting for a whole window's copies there cost the RTX 4070's 32K prompt 21,602 ->
+// 22,180 ms.  The groups end with the windows.  The same bytes are multiplied, so the same answers.  B70,
+// Qwen3.8-Flash-Next IQ3_XXS, read ms: 3,560 tokens 2,018 (the resident experts sorted) -> 1,934, 5,999 tokens 3,209
+// (id order) -> 2,987.  XESTRATA_PREFILL_STREAM_WINDOW=0: every window as before.
+inline bool stream_window_on() {
+    static const bool on = [] {
+        const char* v = strata::env_get("PREFILL_STREAM_WINDOW");
+        const char* g = strata::env_get("PREFILL_GROUP_GATHER");
+        return (v == nullptr || std::strtol(v, nullptr, 10) != 0) && (g == nullptr || std::strtol(g, nullptr, 10) != 0);
+    }();
+    return on;
+}
 inline bool mmq_tab_on() {
     static const bool on = [] {
         const char* v = strata::env_get("MMQ_TAB");
@@ -2446,12 +2497,18 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "hc read: inject", "hc read: mix"};
 struct PfTimer {
     bool on = env_on("PREFILL_TIMING");
+    // XESTRATA_PREFILL_TIMING=2: the experts' four phases (wait copy, dequant, gemm gate/up, gemm down) as one, under
+    // 'dequant'.  Where a mark is a kernel of its own (Level Zero has no timestamp command: a B70's 4K chunk took
+    // 4,118 ms with the ~600 marks a layer of =1 against 2,081 ms without, 2026-11-25), the experts' groups keep
+    // their launches back to back and the other phases' times are the untimed run's.
+    bool coarse = [] { const char* v = strata::env_get("PREFILL_TIMING"); return v != nullptr && v[0] == '2'; }();
     std::vector<strata::gpu::Event*> ev;
     std::vector<int> ph;
     size_t used = 0;
     double ms[kPfCount] = {};
     void mark(int phase, strata::gpu::Stream s) {
         if (!on) return;
+        if (coarse && (phase == kPfWaitCopy || phase == kPfGemmGU || phase == kPfGemmD)) phase = kPfDequant;
         // a mark in the phase already running adds nothing to the totals (the gaps are charged to the earlier mark's
         // phase either way), but every event record is a submission of its own under WDDM (~80 us on a 6900 XT,
         // Windows 11): compute() marks "dequant" once per expert, which put ~16 records per MMQ group on the stream
@@ -3440,7 +3497,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (cpu_maybe) {   // the rows buffer, once, at its largest for this chunk
                         const size_t cap = (size_t) (strata::core::cpu_share_batched(T, true) ? T * K :
-                            std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert)) * N;
+                            std::min<int64_t>(T * K, share_nt() * m.g->n_expert)) * N;
                         if (m.cpu_rows_n < cap) {
                             cpu_cold = true;
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
@@ -3523,7 +3580,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 [&](int32_t e) {
                                     return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                 },
-                                helped, strata::core::cpu_share_batched(T, true) ? T : strata::kernels::cpu::MAXT);
+                                helped, strata::core::cpu_share_batched(T, true) ? T : share_nt());
                             const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
                             n_stream = cc.missed;
                             // how many: core's rule (the share measured on this prompt's layers; the gate's arm without
@@ -3594,12 +3651,66 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const char* v = strata::env_get("MMQ_GROUP_SORT");
                             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
                         }();
+                        // (a layer with streamed experts: only where the experts average kSortMeanRows rows or fewer)
+                        int64_t order_rows = 0;
+                        for (const int32_t e : order) order_rows += m.cnt[(size_t) e];
+                        const bool few_rows = order_rows <= kSortMeanRows * (int64_t) order.size();
                         if (group_sort && use_mmq && nf == 0 && m.host_res && m.cache && order.size() > (size_t) MMQ_GROUP &&
-                            std::all_of(order.begin(), order.end(), [&](int32_t e) {
+                            ((group_sort_mixed() && few_rows) || std::all_of(order.begin(), order.end(), [&](int32_t e) {
                                 return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            }))
-                            std::stable_sort(order.begin(), order.end(),
+                            }))) {
+                            const auto streamed_from = std::stable_partition(order.begin(), order.end(), [&](int32_t e) {
+                                return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            });
+                            std::stable_sort(order.begin(), streamed_from,
                                              [&](int32_t a, int32_t b) { return m.cnt[(size_t) a] > m.cnt[(size_t) b]; });
+                        }
+                        // stream_window_on: the streamed experts by the stream's windows, each in falling row count;
+                        // stream_k[j]: order[j]'s entry of the stream (-1: resident), grp_cut[j]: a group ends before j
+                        const bool window_walk = stream_all && use_mmq && m.mring == nullptr && !bih3_own && nf == 0 &&
+                                                 few_rows && stream_window_on() && m.host_res && m.cache;
+                        const size_t win_entries = (size_t) std::max(m.ring / 2, 1);
+                        std::vector<int64_t> stream_k;
+                        std::vector<char> grp_cut, win_landed;   // win_landed[w]: window w's copies had landed here
+                        if (window_walk) {
+                            const auto streamed_from = std::stable_partition(order.begin(), order.end(), [&](int32_t e) {
+                                return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            });
+                            const size_t n_res = (size_t) (streamed_from - order.begin());
+                            std::vector<char> routed_gpu((size_t) m.g->n_expert, 0);
+                            for (size_t j = n_res; j < order.size(); ++j) routed_gpu[(size_t) order[j]] = 1;
+                            stream_k.assign(order.size(), -1);
+                            grp_cut.assign(order.size(), 0);
+                            const size_t k0 = seq_start[(size_t) l], k1 = seq_start[(size_t) l + 1];
+                            size_t j = n_res;
+                            for (size_t w0 = k0; w0 < k1; w0 += win_entries) {
+                                const size_t jw = j;
+                                for (size_t kk = w0; kk < std::min(k1, w0 + win_entries); ++kk)
+                                    if (routed_gpu[(size_t) seq[kk].e]) {
+                                        order[j] = seq[kk].e;
+                                        stream_k[j++] = (int64_t) kk;
+                                    }
+                                if (j > jw && jw > 0) grp_cut[jw] = 1;
+                                // its last copy issued (the copy queue is in order) and done
+                                const size_t klast = std::min(k1, w0 + win_entries) - 1;
+                                const bool landed = (threaded_issue ? a_issued.load(std::memory_order_acquire) > klast
+                                                                    : klast < issued) &&
+                                                    strata::gpu::event_query(m.copied[klast % (size_t) m.ring]);
+                                win_landed.push_back((char) landed);
+                                if (!landed) continue;
+                                // (order and stream_k together: the pairs sorted by the rows, the stream's order kept)
+                                std::vector<size_t> idx(j - jw);
+                                for (size_t i = 0; i < idx.size(); ++i) idx[i] = jw + i;
+                                std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                                    return m.cnt[(size_t) order[a]] > m.cnt[(size_t) order[b]];
+                                });
+                                std::vector<int32_t> oe(idx.size());
+                                std::vector<int64_t> ok(idx.size());
+                                for (size_t i = 0; i < idx.size(); ++i) { oe[i] = order[idx[i]]; ok[i] = stream_k[idx[i]]; }
+                                for (size_t i = 0; i < idx.size(); ++i) { order[jw + i] = oe[i]; stream_k[jw + i] = ok[i]; }
+                            }
+                            if (j != order.size()) { err = "prefill: a streamed expert is not in the chunk's stream"; return false; }
+                        }
                         {
                             int32_t at = 0;
                             for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
@@ -3831,7 +3942,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0, rows = 0; j < n; ++j) {
                                 const int64_t c = m.cnt[(size_t) order[j]];
                                 if (m.grp_start.empty() || j - (size_t) m.grp_start.back() >= (size_t) MMQ_GROUP ||
-                                    (int64_t) rows + c > cap) {
+                                    (int64_t) rows + c > cap || (window_walk && grp_cut[j])) {
                                     m.grp_start.push_back((int32_t) j);
                                     rows = 0;
                                 }
@@ -3968,6 +4079,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
                                 const uint8_t* gu = s >= 0 ? m.cache->device_slot(s) : nullptr;
                                 const uint8_t* dn = nullptr;
+                                if (gu == nullptr && window_walk &&
+                                    win_landed[((size_t) stream_k[j] - seq_start[(size_t) l]) / win_entries])
+                                    gu = m.stage_dev[(size_t) stream_k[j] % (size_t) m.ring];
                                 direct[j] = (char) (gu != nullptr && ((uintptr_t) gu | f.down_off) % 16 == 0);
                                 if (direct[j]) {
                                     dn = gu + f.down_off;
@@ -4036,6 +4150,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }();
                         const bool group_gather = group_env && stream_all && use_mmq && !mmq_direct;
                         mmq::GatherGroup gg;
+                        bool ring_in_place = false;   // a landed window's (stream_window_on): its slots are the walk's
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;            // ring slots gathered by the next flush
                         size_t gg_consumed = consumed;   // what the issuer may have back after the next flush
@@ -4107,7 +4222,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else if (group_gather) {
                                     gg.blob[q] = in_place ? nullptr : blob_dev;
                                     gg.n = (int) q + 1;
-                                    if (slot >= 0) gg_slots[gg_nslots++] = slot;
+                                    if (slot >= 0 && !ring_in_place) gg_slots[gg_nslots++] = slot;
                                     if (!last_of_group) return true;
                                     flush();
                                     gg = mmq::GatherGroup{};
@@ -4235,6 +4350,63 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!compute(j, slot_ptr(stage_of[j]), stage_of[j])) return false;
                                 }
                             }
+                        } else if (window_walk) {
+                            // the resident experts, then the stream a window at a time (stream_window_on)
+                            size_t j = 0;
+                            for (; j < order.size() && stream_k[j] < 0; ++j) {
+                                ++stats_.experts_resident;
+                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + order[j]]), -1))
+                                    return false;
+                            }
+                            const size_t kend = seq_start[(size_t) l + 1];
+                            size_t wi = 0;
+                            for (size_t w0 = seq_start[(size_t) l]; w0 < kend; w0 += win_entries, ++wi) {
+                                const size_t w1 = std::min(kend, w0 + win_entries);
+                                if (!win_landed[wi]) {
+                                    // still on its way: an entry at a time in id order, gathered, as before
+                                    size_t k = w0;
+                                    auto skip_to = [&](size_t kstop) {   // unrouted entries only give their slots back
+                                        if (k < kstop) flush();
+                                        while (k < kstop) {
+                                            strata::gpu::event_record(m.used[k % (size_t) m.ring], m.cs);
+                                            m.used_of[k % (size_t) m.ring] = (int) (k % (size_t) m.ring);
+                                            consumed = ++k;
+                                            give_back(consumed);
+                                        }
+                                    };
+                                    for (; j < order.size() && (size_t) stream_k[j] < w1; ++j) {
+                                        const size_t kk = (size_t) stream_k[j];
+                                        skip_to(kk);
+                                        pt.mark(kPfWaitCopy, cs);
+                                        wait_issued(kk);
+                                        gg_consumed = kk + 1;   // given back by the flush that gathers it
+                                        const int sl = (int) (kk % (size_t) m.ring);
+                                        if (!compute(j, m.stage_dev[sl], sl)) return false;
+                                        k = kk + 1;
+                                    }
+                                    skip_to(w1);
+                                    continue;
+                                }
+                                ring_in_place = true;
+                                if (j < order.size() && (size_t) stream_k[j] < w1) {
+                                    // the window's last copy (the copy queue is in order), once for its groups
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_issued(w1 - 1);
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[(w1 - 1) % (size_t) m.ring]);
+                                    for (; j < order.size() && (size_t) stream_k[j] < w1; ++j) {
+                                        const int sl = (int) ((size_t) stream_k[j] % (size_t) m.ring);
+                                        if (!compute(j, m.stage_dev[sl], sl)) return false;
+                                    }
+                                }
+                                ring_in_place = false;
+                                // its groups are launched (a group ends with its window): every slot of it goes back,
+                                // on its last entry's event (recorded again only once the entry a ring later is issued)
+                                const int rel = (int) ((w1 - 1) % (size_t) m.ring);
+                                strata::gpu::event_record(m.used[rel], m.cs);
+                                for (size_t kk = w0; kk < w1; ++kk) m.used_of[kk % (size_t) m.ring] = rel;
+                                consumed = w1;
+                                give_back(consumed);
+                            }
                         } else {
                             // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
                             // pick only gives its slot back
@@ -4249,10 +4421,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     give_back(consumed);
                                 }
                             };
-                            for (size_t j = nf; j < order.size(); ++j) {   // from nf on: id order again
+                            for (size_t j = nf; j < order.size(); ++j) {   // from nf on: the streamed ones in id order
                                 const int32_t e = order[j];
-                                release_to(e);
-                                if (k < kend && seq[k].e == e) {
+                                const bool streamed = !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
+                                if (streamed) release_to(e);
+                                if (streamed && k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
                                     pt.mark(kPfWaitCopy, cs);
                                     wait_issued(k);

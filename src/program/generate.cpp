@@ -2280,6 +2280,53 @@ static bool cpu_share_default_ok(const strata::core::ModelGeometry& g, const str
     return true;
 }
 
+// The link rule (share_rules::link_rule, upstream's BW-H) for the prompt path on one discrete card whose link was
+// probed: on a slow link (the RTX 4070's 6.4 GB/s with 3.6K of 24.6K experts resident) chunks up to its limit are
+// staged and share, wider experts go to the CPU.  Hardware independent: the probe, the cache and the pool, never the
+// card's name.  XESTRATA_PREFILL_CPU_SHARE_AUTO=0 turns it off, and an explicit XESTRATA_PREFILL_CPU_SHARE leaves the
+// limit as it was (the share's own setting); XESTRATA_PREFILL_CPU_SHARE_MAX and XESTRATA_PREFILL_CPU_SHARE_NT set
+// the two numbers by hand and win (upstream's switches).  Before Prefill::init.
+static void arm_share_rule(double link_gbps, const strata::core::ModelGeometry& g, int64_t resident, int pool_workers,
+                           const char* who) {
+    namespace sr = strata::prefill::share_rules;
+    const char* ev = strata::env_get("PREFILL_CPU_SHARE_AUTO");
+    const char* e_max = strata::env_get("PREFILL_CPU_SHARE_MAX");
+    const char* e_nt = strata::env_get("PREFILL_CPU_SHARE_NT");
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    sr::LinkRuleIn in;
+    sr::LinkRule r;
+    if (!(ev != nullptr && std::strcmp(ev, "0") == 0) && strata::env_get("PREFILL_CPU_SHARE") == nullptr &&
+        !strata::core::device_info(strata::core::current_device()).integrated && lay.native && g.n_layers > 0) {
+        double blob = 0.0;
+        for (int64_t l = 0; l < g.n_layers; ++l) blob += (double) lay.blob_bytes(l);
+        in.link_gbps = link_gbps;
+        in.pool_workers = pool_workers;
+        in.resident = resident;
+        in.total = g.n_layers * g.n_expert;
+        in.blob_mb = blob / (double) g.n_layers / 1e6;
+        r = sr::link_rule(in);
+    }
+    if (e_max != nullptr || e_nt != nullptr) {
+        if (e_max != nullptr) r.limit = std::max<int64_t>(sr::kShareLimitDefault, std::strtoll(e_max, nullptr, 10));
+        if (e_nt != nullptr) r.nt = (int) std::max(0l, std::strtol(e_nt, nullptr, 10));
+        strata::prefill::set_cpu_share_rule(r.limit, r.nt);
+        std::fprintf(stderr, "xestrata %s: CPU share rule, set by hand: chunks up to %lld tokens take the share, experts "
+                             "of up to %d tokens go to the CPU\n",
+                     who, (long long) std::max<int64_t>(r.limit, sr::kShareLimitDefault),
+                     std::max(r.nt, (int) strata::kernels::cpu::MAXT));
+        return;
+    }
+    if (!r.arm) return;
+    strata::prefill::set_cpu_share_rule(r.limit, r.nt);
+    std::fprintf(stderr, "xestrata %s: CPU share rule: the link reads %.1f GB/s and %lld of %lld experts are not on the "
+                         "card (%.1f GB, a stream floor of %.0f ms), %d pool workers: chunks up to %lld tokens take the "
+                         "share, experts of up to %d tokens go to the CPU (XESTRATA_PREFILL_CPU_SHARE_AUTO=0 keeps 3,072 "
+                         "and %d)\n",
+                 who, link_gbps, (long long) (in.total - resident), (long long) in.total,
+                 (double) (in.total - resident) * in.blob_mb / 1000.0, r.floor_ms, pool_workers, (long long) r.limit,
+                 r.nt, (int) strata::kernels::cpu::MAXT);
+}
+
 // #1425 #1549 #1629 (upstream 30017336): --ple-io direct (the default) does unbuffered random reads of the n-gram
 // table; on some drives (DRAM-less NVMe) they run at 34 MB/s and a prompt reads layer 1 for minutes.  Rows per second
 // of a short cold probe: a few batches of random rows through the same batched reader a prompt chunk uses, stopped
@@ -7849,8 +7896,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata serve: XESTRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU "
                                  "pool beside the %lld batch slots, for a read with no slot decoding\n", (long long) o.batch);
         if (!multi_gpu && (o.batch <= 0 || prefill_cpu_share_batch()) && !o.no_pool &&
-            cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+            cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr)) {
             sp.set_cpu_pool(&pool);
+            arm_share_rule(link_gbps, g, (int64_t) xcache.slots(), pool.workers(), "serve");
+        }
         mem_mark("before the prompt path init");
         if (df2_loaded) sp.set_taps(df2.tap_layers(), 0, 2048);   // tap_first set per request (the prompt's length)
         // a DFlash2 measured at the start: the measurement's short prompts need a small staging; the window's 2048
@@ -14683,8 +14732,10 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "xestrata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+        if (!multi_gpu && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr)) {
             prefill.set_cpu_pool(&pool);
+            arm_share_rule(link_gbps, g, (int64_t) xcache.slots(), pool.workers(), "generate");
+        }
         if (df2_loaded) prefill.set_taps(df2.tap_layers(), std::max<int64_t>(0, (int64_t) o.tokens.size() - 2047), 2048);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
