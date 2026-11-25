@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import queue
 import secrets
@@ -36,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from serve import line_process  # noqa: E402
 from serve import idle_watch  # noqa: E402
+from serve import disk_watch  # noqa: E402
 
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "W8": ("W8",), "FIT": ("BUDGET",),
            "BUDGET": ("BUDGET",), "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",),
@@ -265,11 +267,18 @@ def main() -> int:
     ap.add_argument("--idle", type=float, default=1800)
     ap.add_argument("--silence", type=float, default=SILENCE_S)
     ap.add_argument("--log")
+    ap.add_argument("--disk-paths", default="[]", help="JSON [[label, path], ...] from the image engine's config")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     log = open(a.log, "a", encoding="utf-8", errors="replace") if a.log else sys.stderr
     d = Daemon(cmd, a.idle, log, a.silence)
+    try:
+        given = json.loads(a.disk_paths)
+        disk_paths = [(str(label), Path(p)) for label, p in given if isinstance(p, str)]
+    except (ValueError, TypeError):
+        disk_paths = []                         # a bad argument must not stop the engine
+    disk_watch.start(disk_paths, say=lambda line: d.say(f"{disk_watch.severity(line)}: {line}"))
     try:
         d.start()
     except (OSError, RuntimeError) as e:

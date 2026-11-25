@@ -1103,5 +1103,9 @@
   "trn.more": "Contexte et glossaire",
   "trn.placeholder": "Texte à traduire",
   "trn.swap": "Échanger les langues et les textes",
-  "trn.to": "Vers"
+  "trn.to": "Vers",
+  "disk.warn": "Le disque est presque plein",
+  "disk.danger": "Le disque est dangereusement plein",
+  "disk.detail": "{free} GiB libres sur {total} GiB pour {volume}.",
+  "disk.recovered": "Espace disque récupéré"
 }

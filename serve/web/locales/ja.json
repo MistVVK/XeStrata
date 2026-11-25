@@ -1088,5 +1088,9 @@
   "trn.more": "文脈と用語集",
   "trn.placeholder": "翻訳する文章",
   "trn.swap": "言語と文章を入れ替える",
-  "trn.to": "翻訳先"
+  "trn.to": "翻訳先",
+  "disk.warn": "ディスクの空きが少なくなっています",
+  "disk.danger": "ディスクの空きが危険域です",
+  "disk.detail": "{volume} に {total} GiB 中 {free} GiB の空きがあります。",
+  "disk.recovered": "ディスクの空きが回復しました"
 }

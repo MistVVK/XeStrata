@@ -58,6 +58,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
   <div class="pill-pop" id="pill-pop" role="dialog" aria-label="What is running" data-i18n-label="pill.open" hidden></div>
 </header>
 
+<!-- a disk that is filling up: the server watches it even when a text engine has died; /metrics fills this in -->
+<div class="st-disk-note" id="disk-note" role="status" aria-live="polite" hidden></div>
+
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
