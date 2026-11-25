@@ -1351,10 +1351,13 @@ if(STRATA_ENABLE_XE)
              REGEX "^#define CUDART_VERSION +[0-9]+")
         string(REGEX REPLACE ".* ([0-9]+)$" "\\1" _strata_cudart_ver "${_strata_cudart_ver}")
         math(EXPR _strata_cudart_major "${_strata_cudart_ver} / 1000")
+        # and NVRTC, which only cudnn-frontend's experimental engines call (Sm100RmsNormSiluEngine: no graph of the
+        # engine's), so its DLL (nvrtc64_120_0.dll) is never loaded
         target_link_libraries(strata_kernels PRIVATE ${_strata_cudnn_lib} "${STRATA_CUDA_WINDOWS_LIBS}/cudart.lib"
-                              delayimp)
+                              "${STRATA_CUDA_WINDOWS_LIBS}/nvrtc.lib" delayimp)
         target_link_options(strata_kernels INTERFACE "LINKER:/DELAYLOAD:cudnn64_9.dll"
-                            "LINKER:/DELAYLOAD:cudart64_${_strata_cudart_major}.dll")
+                            "LINKER:/DELAYLOAD:cudart64_${_strata_cudart_major}.dll"
+                            "LINKER:/DELAYLOAD:nvrtc64_${_strata_cudart_major}0_0.dll")
       else()
         set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                      NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING)

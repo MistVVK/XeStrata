@@ -54,19 +54,23 @@ mkdir -p /opt/cudnn/include /opt/cudnn/lib/x64
 unzip -q -j -o "/cache/$cudnn_zip" '*/include/*' -d /opt/cudnn/include
 unzip -q -j -o "/cache/$cudnn_zip" '*/lib/x64/cudnn.lib' -d /opt/cudnn/lib/x64
 # Windows' import libraries for cuBLAS, the CUDA runtime and the CUDA driver (oneMath's cuBLAS backend, which loads
-# cuBLAS where the user installed it): from NVIDIA's redistributable archives for CUDA 12.4, their SHA-256 checked
+# cuBLAS where the user installed it) and NVRTC (cudnn-frontend's, CMakeLists.txt): from NVIDIA's redistributable
+# archives for CUDA 12.4, their SHA-256 checked
 mkdir -p /build/cudalib/include
 cuda_lib() {   # archive path, its SHA-256
   f=/cache/$(basename "$1")
   [ -f "$f" ] || curl -fsSL -o "$f" "https://developer.download.nvidia.com/compute/cuda/redist/$1"
   echo "$2  $f" | sha256sum -c -
-  unzip -q -j -o "$f" '*/lib/x64/cublas.lib' '*/lib/x64/cudart.lib' '*/lib/x64/cuda.lib' -d /build/cudalib || true
+  unzip -q -j -o "$f" '*/lib/x64/cublas.lib' '*/lib/x64/cudart.lib' '*/lib/x64/cuda.lib' '*/lib/x64/nvrtc.lib' \
+    -d /build/cudalib || true
 }
 cuda_lib cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip \
   6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb
 cuda_lib libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip \
   698140f12da055a3709eee2e022fcfe7bc8edf31f30115e3f7a5c877a9491de5
-for l in cublas cudart cuda; do [ -f "/build/cudalib/$l.lib" ] || { echo "no $l.lib" >&2; exit 1; }; done
+cuda_lib cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.4.127-archive.zip \
+  f140545e06d0d10780c1382a577db2e2c242db7a2d94970f0e6026b2d01aeb1b
+for l in cublas cudart cuda nvrtc; do [ -f "/build/cudalib/$l.lib" ] || { echo "no $l.lib" >&2; exit 1; }; done
 # and the headers, those of the same toolkit (the same on Windows), apart from the C library's that Ubuntu's toolkit
 # has its own among
 dpkg -L nvidia-cuda-dev libcu++-dev | sed -n 's|^/usr/include/||p' |
