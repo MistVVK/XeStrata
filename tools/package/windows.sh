@@ -132,7 +132,7 @@ sycl=$src/.tools/intel-llvm-win/install
 # the Windows cross toolchain (cmake/toolchain-windows-msvc.cmake) searches the libraries of its roots alone.  This
 # build made a Windows zstd for intel/llvm; its header goes where the toolchain's flags already look (the SYCL tree's
 # include) and its .lib is named to the engine's configure below, so the 7z carries zstd inside the engine.
-install -Dm644 "$src/.tools/intel-llvm-win/zstd/include/zstd.h" "$sycl/include/zstd.h"
+install -m644 "$src/.tools/intel-llvm-win/zstd/include/"*.h "$sycl/include/"   # zstd.h includes zstd_errors.h
 
 # oneMKL for Windows, unpacked from its wheels' Library/ folders: the headers, the import libraries and the CMake
 # package, and the DLLs, which oneMKL's CMake package checks are there (kept in /cache between builds)
