@@ -13,6 +13,10 @@ from serve import envvars
 FILTERS = ("ONEAPI_DEVICE_SELECTOR", "SYCL_DEVICE_FILTER", "SYCL_DEVICE_ALLOWLIST", "CUDA_VISIBLE_DEVICES",
            "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "ZE_AFFINITY_MASK")
 BACKENDS = {"Level Zero": "level_zero", "CUDA": "cuda", "HIP": "hip"}
+# Issue #41: a Level Zero runtime that fails as the GPUs are listed stops SYCL's whole listing (the CUDA and HIP GPUs
+# with it), and only a selector set before the runtime starts keeps its adapter out.  setup writes this one into the
+# run config's "env" when its own listing needed it (setup.py engine_tool).
+L0_OFF = "!level_zero:*"
 _SELECTORS: dict[tuple[str, int, str, str, str], list[dict]] = {}
 _LOCK = threading.Lock()
 
@@ -24,6 +28,11 @@ def _list(exe: str, env: dict, flag: str) -> list[dict]:
         return [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         raise ValueError(f"cannot list GPU selectors with {tool}: {e}") from e
+
+
+def without_level_zero(env: dict) -> bool:
+    """The environment leaves Level Zero out (L0_OFF)."""
+    return env.get("ONEAPI_DEVICE_SELECTOR") == L0_OFF
 
 
 def selected_pci(exe: str, env: dict) -> str:
@@ -67,6 +76,15 @@ def scope(exe: str, env: dict, pci: str) -> dict:
     """The child's environment for `pci`, checked against an unfiltered SYCL list and a filtered one."""
     pci = str(pci).lower()
     raw = unfiltered(env)
+    if without_level_zero(env):
+        # the unfiltered list, which the selector indices come from, fails with Level Zero in it: the card by its PCI
+        # address alone (the engine takes it first), the other backends' cards still listed to the child
+        out = dict(raw, ONEAPI_DEVICE_SELECTOR=L0_OFF)
+        envvars.put(out, "GPU_PCI", pci)
+        check = _list(exe, out, "--list-devices")
+        if not check or str(check[0].get("pci") or "").lower() != pci:
+            raise ValueError(f"GPU {pci}: not the first GPU listed without Level Zero")
+        return out
     rows = selectors(exe, env)
     if not rows:
         tool = Path(exe).parent / "xestrata-device"

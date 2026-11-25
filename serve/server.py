@@ -4396,9 +4396,13 @@ def card_env(cfg: dict, env: dict, pci: str, what: str, who: str) -> tuple[dict,
     if want == helper_card_for(cfg, want):        # the text engine's helper card, handed over for the engine's work
         text.discard(want)
     args = [str(a) for a in cfg.get("args") or []]
+    from serve import gpu_select
+    # issue #41: leaving Level Zero out (setup's selector where it failed the listing) hides no card of the others
+    narrow = [k for k in SELECT_ENV
+              if env.get(k) and not (k == "ONEAPI_DEVICE_SELECTOR" and gpu_select.without_level_zero(env))]
     why = ("a helper GPU (--expert-cache-device1..3) is named by its device number" if any(
         a.startswith("--expert-cache-device") for a in args) else
-           f"{next(k for k in SELECT_ENV if env.get(k))} narrows the GPUs" if any(env.get(k) for k in SELECT_ENV)
+           f"{narrow[0]} narrows the GPUs" if narrow
            else "the text model takes it" if want in text else
            "no text card is named (the engine takes the first)" if not text else gpu_files_missing(want))
     if why:

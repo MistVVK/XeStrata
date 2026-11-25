@@ -366,9 +366,13 @@ def devices(svc, *, fresh: bool = False) -> list[dict]:
     if not fresh and got is not None and time.monotonic() - got[0] < DEVICES_CACHE_S:
         return got[1]
     out: list[dict] = []
+    env = dict(os.environ)
+    from serve import gpu_select
+    if gpu_select.without_level_zero(images.default.engine.env or {}):   # issue #41: the run config's selector
+        env["ONEAPI_DEVICE_SELECTOR"] = gpu_select.L0_OFF
     if Path(exe).is_file():
         try:
-            r = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, timeout=60)
+            r = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, timeout=60, env=env)
             for line in r.stdout.splitlines():
                 with contextlib.suppress(ValueError):
                     d = json.loads(line)

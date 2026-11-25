@@ -77,7 +77,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
 from serve import download as download_core
-from serve import envvars, hardware, kernel_check, model_terms, places, release_check, settings
+from serve import envvars, gpu_select, hardware, kernel_check, model_terms, places, release_check, settings
 from serve import sync_models
 from serve import autotune
 from serve import option_values as OV
@@ -5531,14 +5531,57 @@ def packaged_engine_dir() -> Path:
     return ROOT / PACKAGED["engine"] if PACKAGED else ROOT / "engine"
 
 
+# Issue #41: what the GPU listing needed (engine_tool) - None: not listed yet, "": nothing, else the
+# ONEAPI_DEVICE_SELECTOR that put_listing_selector writes into the run config for every engine serve starts
+LISTING_SELECTOR: str | None = None
+
+
 def engine_tool(*args: str) -> str:
     """xestrata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
-    the engine reports the GPUs and the CPU itself."""
+    the engine reports the GPUs and the CPU itself.
+    Issue #41: a Level Zero runtime that fails as the GPUs are listed (UR_RESULT_ERROR_UNINITIALIZED on a Windows PC
+    with an RTX 2060 and no usable Intel GPU) stops SYCL's whole listing, the CUDA and HIP GPUs with it, and the engine
+    cannot list again without it in the same process: the runtime reads ONEAPI_DEVICE_SELECTOR once, as it starts.  So
+    the listing is run once more with Level Zero left out (gpu_select.L0_OFF) when the user set no selector; when that
+    lists, setup's later programs (this process's environment) and the run config (put_listing_selector) keep it."""
+    global LISTING_SELECTOR
     exe = packaged_engine_dir() / ("xestrata-device.exe" if WIN else "xestrata-device")
-    r = subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
+
+    def run():
+        return subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
+    r = run()
+    if (r.returncode != 0 and LISTING_SELECTOR is None and "ONEAPI_DEVICE_SELECTOR" not in os.environ
+            and "level_zero backend failed" in r.stderr + r.stdout):
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = gpu_select.L0_OFF
+        again = run()
+        if again.returncode == 0:
+            LISTING_SELECTOR = gpu_select.L0_OFF
+            warn("Intel's GPU runtime (Level Zero) failed to list the GPUs, which hid the others too: they are used "
+                 f"without it (ONEAPI_DEVICE_SELECTOR={gpu_select.L0_OFF}, kept in the run config). An Intel GPU "
+                 "needs its driver repaired or updated first")
+            r = again
+        else:
+            del os.environ["ONEAPI_DEVICE_SELECTOR"]
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
+    if LISTING_SELECTOR is None and "--list-devices" in args:
+        LISTING_SELECTOR = ""
     return r.stdout
+
+
+def put_listing_selector(cfg: dict) -> None:
+    """Issue #41: the selector the GPU listing needed (engine_tool) into the run config's "env", which serve gives the
+    engine, the image engine and xestrata-device (serve/gpu_select.py); a selector the config already names is the
+    user's and stays.  A listing that needed none drops an earlier run's, so a Level Zero that lists again is used."""
+    if LISTING_SELECTOR is None:
+        return
+    env = dict(cfg.get("env") or {})
+    if LISTING_SELECTOR:
+        env.setdefault("ONEAPI_DEVICE_SELECTOR", LISTING_SELECTOR)
+    elif env.get("ONEAPI_DEVICE_SELECTOR") == gpu_select.L0_OFF:
+        del env["ONEAPI_DEVICE_SELECTOR"]
+    if env or "env" in cfg:
+        cfg["env"] = env
 
 
 def packaged_engine() -> dict:
@@ -9062,6 +9105,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gp
         if not isinstance(old, dict):
             old = None
     kept = carry_over(old, cfg, gpus_chosen) if old is not None else []
+    put_listing_selector(cfg)
     for k, v in (defaults or {}).items():
         if k not in cfg:
             cfg[k] = v
