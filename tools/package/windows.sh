@@ -159,6 +159,15 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" \
   -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin \
   -DSTRATA_ZSTD_LIB="$src/.tools/intel-llvm-win/zstd/lib/zstd_static.lib"
+# CUTLASS's uint128.h takes MSVC's _umul128/_udiv128 when _MSC_VER is set, but the clang that compiles it (the contrib
+# toolchain) has neither in its <intrin.h> (MSVC's has them): CUTLASS's own portable forms are used instead.  The file
+# comes from FetchContent at the configure above, so it is patched before the build reads it.
+cu128=/build/engine/_deps/strata_cutlass-src/include/cutlass/uint128.h
+sed -i 's|^#if defined(_MSC_VER) && defined(_M_AMD64)$|#if 0  /* strata: the contrib clang has no _umul128/_udiv128 */|' \
+  "$cu128"
+grep -q 'strata: the contrib clang has no _umul128' "$cu128" || {
+  echo "cutlass uint128.h: the MSVC guard is not where this script expects it" >&2; exit 1; }
+
 targets="strata strata-device strata-image strata-vision onemath_backend_libs"   # CMake's targets keep upstream's names
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
