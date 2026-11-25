@@ -27,6 +27,9 @@ case $set_ in
 esac
 cd "$(git rev-parse --show-toplevel)" || exit 1
 git rev-parse --verify -q "$tag^{commit}" >/dev/null || { echo "no tag $tag" >&2; exit 1; }
+# The host's persistent ccache is shared by every build; pass it to every variant (build.sh mounts it directly).
+: "${XESTRATA_PKG_CCACHE_DIR:?set XESTRATA_PKG_CCACHE_DIR to the persistent host ccache folder}"
+export XESTRATA_PKG_CCACHE_DIR
 out=build/release/$tag
 mkdir -p "$out/logs"
 summary=$out/summary-$set_.txt

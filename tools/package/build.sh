@@ -74,12 +74,16 @@ out=build/pkg/$distro-$variant
 rm -rf "$out"
 mkdir -p "$out"
 
-cache=build/pkg-ccache/$distro
+# One persistent ccache for every build (host, packages, cross): the caller names its host-side folder in
+# XESTRATA_PKG_CCACHE_DIR.  The container is still disposable; only this content-keyed cache is shared.
+: "${XESTRATA_PKG_CCACHE_DIR:?set XESTRATA_PKG_CCACHE_DIR to the persistent host ccache folder}"
+case $XESTRATA_PKG_CCACHE_DIR in
+  /*) cache=$XESTRATA_PKG_CCACHE_DIR ;;
+  *) cache=$PWD/$XESTRATA_PKG_CCACHE_DIR ;;
+esac
 script=container.sh
 downloads=build/pkg-cache/$distro
 if [ "$distro" = windows ]; then
-  # built in Ubuntu 26.04 with the same compilers as its packages: their cache
-  cache=build/pkg-ccache/ubuntu26.04
   script=windows.sh
 fi
 [ "$variant" = gui ] && script=gui.sh
@@ -87,8 +91,11 @@ mkdir -p "$cache" "$downloads"
 
 echo "building $distro $variant from $rev in $image ..."
 git archive --format=tar "$rev" | podman run --rm -i --pull=missing \
-  -v "$PWD/$out:/out:Z" -v "$PWD/$cache:/ccache:Z" -v "$PWD/$downloads:/cache:Z" -e CCACHE_DIR=/ccache \
+  -v "$PWD/$out:/out:Z" -v "$cache:/ccache:Z" -v "$PWD/$downloads:/cache:Z" -e CCACHE_DIR=/ccache \
   -e CCACHE_MAXSIZE="${XESTRATA_CCACHE_MAX:-30G}" \
+  -e CCACHE_COMPILERCHECK="${XESTRATA_CCACHE_COMPILERCHECK:-content}" \
+  -e CCACHE_BASEDIR="${XESTRATA_CCACHE_BASEDIR:-/src}" \
+  -e CCACHE_NOHASHDIR="${XESTRATA_CCACHE_NOHASHDIR:-1}" \
   -e XESTRATA_DISTRO="$distro" -e XESTRATA_VARIANT="$variant" -e XESTRATA_COMMIT="$rev" \
   -e XESTRATA_IMAGE="$image" -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \
   -e XESTRATA_PKG_CLEAN="${XESTRATA_PKG_CLEAN:-}" \
